@@ -31,6 +31,7 @@ mod quic_transport;
 pub mod shared_input;
 #[cfg(target_os = "windows")]
 pub mod windows_drag;
+mod windows_drag_overlay;
 #[cfg(target_os = "windows")]
 pub mod windows_drop_catcher;
 #[cfg(target_os = "windows")]

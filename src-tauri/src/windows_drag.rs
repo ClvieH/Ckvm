@@ -22,8 +22,9 @@
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::{implement, PCWSTR};
 use windows::Win32::Foundation::{
@@ -74,6 +75,33 @@ fn active_session() -> Option<Arc<DragSession>> {
     session_slot().lock().ok().and_then(|slot| slot.clone())
 }
 
+/// Dropped sessions whose target still extracts asynchronously: their files
+/// keep streaming into these buffers after `DoDragDrop` returned.
+static FINISHING: Mutex<Vec<Arc<DragSession>>> = Mutex::new(Vec::new());
+
+/// The dragging or finishing session that owns `transfer_id`.
+fn session_for(transfer_id: &str) -> Option<Arc<DragSession>> {
+    active_session()
+        .filter(|session| session.by_transfer_id.contains_key(transfer_id))
+        .or_else(|| {
+            FINISHING.lock().ok().and_then(|finishing| {
+                finishing
+                    .iter()
+                    .find(|session| session.by_transfer_id.contains_key(transfer_id))
+                    .cloned()
+            })
+        })
+}
+
+/// Clears the slot only if it still holds `session` (a newer drag may own it).
+fn clear_session(session: &Arc<DragSession>) {
+    if let Ok(mut slot) = session_slot().lock() {
+        if slot.as_ref().is_some_and(|active| Arc::ptr_eq(active, session)) {
+            *slot = None;
+        }
+    }
+}
+
 struct DragSession {
     order: Vec<Arc<FileBuffer>>,
     by_transfer_id: HashMap<String, Arc<FileBuffer>>,
@@ -85,9 +113,38 @@ struct DragSession {
     // Escape/button and no synthetic button bracket is injected. False = the
     // original injected/remote drag driven by signal_drop/cancel_session.
     physical: bool,
+    // The drop target extracts on its own thread (StartOperation) and reports
+    // the end (EndOperation), after DoDragDrop has already returned.
+    async_started: AtomicBool,
+    operation_done: AtomicBool,
+    // Start or last file bytes; a drag with nothing happening is abandoned.
+    last_activity: Mutex<Instant>,
 }
 
 impl DragSession {
+    fn touch(&self) {
+        if let Ok(mut last) = self.last_activity.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_activity
+            .lock()
+            .map(|last| last.elapsed())
+            .unwrap_or_default()
+    }
+
+    /// Fraction of all file bytes received so far.
+    fn progress(&self) -> f32 {
+        let total: u64 = self.order.iter().map(|file| file.size).sum();
+        if total == 0 {
+            return 1.0;
+        }
+        let received: u64 = self.order.iter().map(|file| file.received()).sum();
+        (received as f64 / total as f64).min(1.0) as f32
+    }
+
     fn is_released(&self) -> bool {
         self.released.lock().map(|v| *v).unwrap_or(true)
     }
@@ -148,6 +205,13 @@ impl FileBuffer {
         self.cond.notify_all();
     }
 
+    fn received(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| if state.complete { self.size } else { state.data.len() as u64 })
+            .unwrap_or(0)
+    }
+
     /// Copy up to `out.len()` bytes starting at `pos`, blocking until that many
     /// bytes exist, the file is complete, or the session aborts. Returns the
     /// number of bytes copied (0 = end of stream). `Err` means aborted/stalled.
@@ -191,30 +255,30 @@ impl FileBuffer {
 /// True while `transfer_id` belongs to the active drag session, so the transfer
 /// handler feeds its bytes here instead of writing them to disk.
 pub fn session_wants(transfer_id: &str) -> bool {
-    active_session()
-        .map(|session| session.by_transfer_id.contains_key(transfer_id))
-        .unwrap_or(false)
+    session_for(transfer_id).is_some()
 }
 
 pub fn feed_chunk(transfer_id: &str, data: &[u8]) -> bool {
-    let Some(session) = active_session() else {
+    let Some(session) = session_for(transfer_id) else {
         return false;
     };
     let Some(buffer) = session.by_transfer_id.get(transfer_id) else {
         return false;
     };
     buffer.append(data);
+    session.touch();
     true
 }
 
 pub fn finish_file(transfer_id: &str) -> bool {
-    let Some(session) = active_session() else {
+    let Some(session) = session_for(transfer_id) else {
         return false;
     };
     let Some(buffer) = session.by_transfer_id.get(transfer_id) else {
         return false;
     };
     buffer.finish();
+    session.touch();
     true
 }
 
@@ -251,10 +315,24 @@ pub fn start_drag_session(files: Vec<DragFileMeta>) -> bool {
     if files.is_empty() {
         return false;
     }
+    // One drag at a time, and the controller starts one only after the last
+    // ended, so a session still here is stale (its drop or cancel never came).
+    // Refusing the new drag kept the stale one's synthetic button down, which
+    // broke this machine's own drags and sent every later file to the
+    // transfers folder. End it instead.
+    if active_session().is_some() {
+        log::warn!("native drag: ending a session that never finished");
+        cancel_session();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active_session().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     let Ok(mut slot) = session_slot().lock() else {
         return false;
     };
     if slot.is_some() {
+        log::warn!("native drag: the previous session did not end; refusing a new one");
         return false;
     }
 
@@ -277,15 +355,30 @@ pub fn start_drag_session(files: Vec<DragFileMeta>) -> bool {
         released: Mutex::new(false),
         cancelled: Mutex::new(false),
         physical,
+        async_started: AtomicBool::new(false),
+        operation_done: AtomicBool::new(false),
+        last_activity: Mutex::new(Instant::now()),
     });
     *slot = Some(Arc::clone(&session));
     drop(slot);
 
-    // Injected drags need a synthetic left button so DoDragDrop treats them as
-    // a live drag; a physical drag already has the user's real button.
-    if !physical {
-        inject_left_button(true);
-    }
+    // Nothing for a minute while still dragging (the controller vanished, or
+    // its drop/cancel was lost): cancel, which also lifts the synthetic button.
+    let watched = Arc::clone(&session);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let dragging = active_session().is_some_and(|active| Arc::ptr_eq(&active, &watched))
+            && !watched.is_released()
+            && !watched.is_cancelled();
+        if !dragging {
+            break;
+        }
+        if watched.idle_for() > Duration::from_secs(60) {
+            log::warn!("native drag: no drop or cancel for a minute; cancelling");
+            cancel_session();
+            break;
+        }
+    });
     log::info!(
         "native drag session started ({} button)",
         if physical { "physical" } else { "synthetic" }
@@ -295,12 +388,6 @@ pub fn start_drag_session(files: Vec<DragFileMeta>) -> bool {
         run_drag_thread(session);
     });
     true
-}
-
-fn clear_session() {
-    if let Ok(mut slot) = session_slot().lock() {
-        *slot = None;
-    }
 }
 
 // --- the DoDragDrop thread -------------------------------------------------
@@ -319,6 +406,7 @@ fn run_drag_thread(session: Arc<DragSession>) {
         let data_object: IDataObject = DragDataObject {
             files: session.order.clone(),
             streams,
+            session: Arc::clone(&session),
         }
         .into();
         let drop_source: IDropSource = DragDropSource {
@@ -326,8 +414,18 @@ fn run_drag_thread(session: Arc<DragSession>) {
         }
         .into();
 
+        let progress_session = Arc::clone(&session);
+        let overlay = crate::windows_drag_overlay::start(
+            session.order.first().map(|file| file.name.as_str()).unwrap_or(""),
+            Arc::new(move || progress_session.progress()),
+        );
+
         let mut effect = DROPEFFECT::default();
-        let result = DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect);
+        let result = if session.physical {
+            DoDragDrop(&data_object, &drop_source, DROPEFFECT_COPY, &mut effect)
+        } else {
+            drag_from_window_under_cursor(&data_object, &drop_source, &mut effect)
+        };
         // The single most useful line when a drag "does nothing" on real
         // hardware: DRAGDROP_S_DROP means a target took it, DRAGDROP_S_CANCEL
         // means the loop ended without one, anything else is an OLE failure.
@@ -346,16 +444,124 @@ fn run_drag_thread(session: Arc<DragSession>) {
 
         // Release the synthetic button (injected drags only — a physical drag's
         // button belongs to the user and is already up, which is why DoDragDrop
-        // returned). Then clear state.
+        // returned).
         if !session.physical {
             inject_left_button(false);
+        }
+        // An asynchronous target (Explorer) extracts after DoDragDrop returns.
+        // Aborting the buffers here failed that copy, and the bytes still in
+        // flight found no session and landed in the transfers folder: keep
+        // feeding it until it reports the end, showing progress meanwhile.
+        if result == DRAGDROP_S_DROP && session.async_started.load(Ordering::Relaxed) {
+            overlay.dock();
+            finish_async_drop(&session);
         }
         for buffer in &session.order {
             buffer.abort();
         }
-        clear_session();
+        clear_session(&session);
+        drop(overlay);
         OleUninitialize();
     }
+}
+
+/// Park a dropped session in FINISHING (freeing the slot for the next drag)
+/// until its target reports EndOperation, or nothing has moved for a minute.
+fn finish_async_drop(session: &Arc<DragSession>) {
+    clear_session(session);
+    if let Ok(mut finishing) = FINISHING.lock() {
+        finishing.push(Arc::clone(session));
+    }
+    let started = Instant::now();
+    while !session.operation_done.load(Ordering::Relaxed)
+        && !session.is_cancelled()
+        && session.idle_for() < Duration::from_secs(60)
+        && started.elapsed() < Duration::from_secs(30 * 60)
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if let Ok(mut finishing) = FINISHING.lock() {
+        finishing.retain(|other| !Arc::ptr_eq(other, session));
+    }
+}
+
+/// OLE's drag loop follows the mouse through capture, which a thread only gets
+/// for a press that lands on one of its own windows. Called from a thread with
+/// no window under the cursor, DoDragDrop never followed the injected pointer
+/// and the drag went nowhere. Put a tiny window of this thread under the
+/// cursor, let the synthetic press land on it (which also keeps the press off
+/// whatever app sits at the crossing edge), then start the drag.
+unsafe fn drag_from_window_under_cursor(
+    data_object: &IDataObject,
+    drop_source: &IDropSource,
+    effect: &mut DROPEFFECT,
+) -> windows::core::HRESULT {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+        MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, ShowWindow, MSG, PM_REMOVE,
+        QS_ALLINPUT, SW_HIDE, SW_SHOWNOACTIVATE, WM_LBUTTONDOWN, WNDCLASSW, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    };
+
+    let instance = GetModuleHandleW(std::ptr::null());
+    let class: Vec<u16> = "MyKVMDragSource".encode_utf16().chain(Some(0)).collect();
+    let window_class = WNDCLASSW {
+        lpfnWndProc: Some(DefWindowProcW),
+        hInstance: instance,
+        lpszClassName: class.as_ptr(),
+        ..std::mem::zeroed()
+    };
+    RegisterClassW(&window_class); // Fails harmlessly once already registered.
+    let mut cursor = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut cursor);
+    let hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        class.as_ptr(),
+        std::ptr::null(),
+        WS_POPUP,
+        cursor.x - 4,
+        cursor.y - 4,
+        8,
+        8,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        instance,
+        std::ptr::null(),
+    );
+    if !hwnd.is_null() {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    inject_left_button(true);
+
+    // Wait (pumping this thread's queue) for the press to reach the window.
+    let mut pressed = hwnd.is_null();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut message: MSG = std::mem::zeroed();
+    while !pressed && Instant::now() < deadline {
+        while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            if message.message == WM_LBUTTONDOWN && message.hwnd == hwnd {
+                pressed = true;
+            }
+            DispatchMessageW(&message);
+        }
+        if !pressed {
+            MsgWaitForMultipleObjects(0, std::ptr::null(), 0, 10, QS_ALLINPUT);
+        }
+    }
+    if !pressed {
+        log::warn!("native drag: the synthetic press missed the drag window");
+    }
+    // Hidden, it can no longer shadow the drop target under the cursor.
+    if !hwnd.is_null() {
+        ShowWindow(hwnd, SW_HIDE);
+    }
+    let result = DoDragDrop(data_object, drop_source, DROPEFFECT_COPY, effect);
+    if !hwnd.is_null() {
+        DestroyWindow(hwnd);
+    }
+    result
 }
 
 // --- clipboard formats -----------------------------------------------------
@@ -555,6 +761,7 @@ impl IStream_Impl for FileReadStream_Impl {
 struct DragDataObject {
     files: Vec<Arc<FileBuffer>>,
     streams: Vec<IStream>,
+    session: Arc<DragSession>,
 }
 
 impl DragDataObject_Impl {
@@ -717,19 +924,24 @@ impl IDataObjectAsyncCapability_Impl for DragDataObject_Impl {
         &self,
         _pbcreserved: windows::core::Ref<'_, IBindCtx>,
     ) -> windows::core::Result<()> {
+        self.session.async_started.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     fn InOperation(&self) -> windows::core::Result<windows::core::BOOL> {
-        Ok(true.into())
+        let running = self.session.async_started.load(Ordering::Relaxed)
+            && !self.session.operation_done.load(Ordering::Relaxed);
+        Ok(running.into())
     }
 
     fn EndOperation(
         &self,
-        _hresult: windows::core::HRESULT,
+        hresult: windows::core::HRESULT,
         _pbcreserved: windows::core::Ref<'_, IBindCtx>,
         _dweffects: u32,
     ) -> windows::core::Result<()> {
+        log::info!("native drag: drop target finished extracting (hr=0x{:08X})", hresult.0);
+        self.session.operation_done.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
