@@ -3802,7 +3802,7 @@ fn handle_macos_event(
                 &context.layout_state,
                 &context.input_events,
             ) {
-                repin_macos_cursor_while_remote(context);
+                return_to_local_after_send_failure_macos(context, event_type);
                 return CallbackResult::Drop;
             }
             mark_mouse_move_sent(&context.last_mouse_move_sent);
@@ -3837,24 +3837,35 @@ fn handle_macos_event(
                 }
                 sent
             } else {
-                false
+                // No Windows equivalent for this key: nothing to send.
+                true
             }
         }
         CGEventType::FlagsChanged => {
             send_modifier_changes(context, &target, event);
             true
         }
-        _ => false,
+        _ => true,
     };
 
-    repin_macos_cursor_while_remote(context);
     if !sent {
-        log::debug!(
-            "remote-active local event {:?} was dropped after remote send miss",
-            event_type
-        );
+        return_to_local_after_send_failure_macos(context, event_type);
+        return CallbackResult::Drop;
     }
+    repin_macos_cursor_while_remote(context);
     CallbackResult::Drop
+}
+
+/// The peer stopped taking input (connection gone, send refused). Only mouse
+/// moves used to notice; clicks and keys were swallowed into the dead session
+/// with the local cursor still hidden and detached (#33). Hand control back.
+#[cfg(target_os = "macos")]
+fn return_to_local_after_send_failure_macos(
+    context: &MacCaptureContext,
+    event_type: core_graphics::event::CGEventType,
+) {
+    log::warn!("remote send failed for {event_type:?}; returning control to the local machine");
+    return_to_local_macos(context);
 }
 
 #[cfg(target_os = "macos")]

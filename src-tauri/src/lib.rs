@@ -70,6 +70,8 @@ const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
+/// Prefix of a drag-control send error: the peer never opened a drag session.
+const DRAG_CONTROL_FAILED: &str = "拖放控制失败";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
@@ -1652,7 +1654,12 @@ fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo
                 "stopped"
             }
         ),
-        format!("local: {} / {}", local_peer.name, local_peer.ip),
+        format!(
+            "local: {} / {} (all IPv4: {})",
+            local_peer.name,
+            local_peer.ip,
+            local_ip_list().unwrap_or_default()
+        ),
         format!(
             "ports: discovery UDP {}, QUIC {}",
             runtime.discovery.port, local_peer.quic_port
@@ -3213,9 +3220,20 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 let handle = app.handle().clone();
+                // A drag whose native start the peer refused (e.g. a client too
+                // old for drag control) is delivered as a plain transfer when the
+                // button is released over it, instead of being lost (#33).
+                let refused_drag: Arc<Mutex<Option<(String, Vec<String>)>>> = Arc::default();
                 input::set_edge_drag_sender(Box::new(move |event| {
                     let handle = handle.clone();
+                    let refused_drag = Arc::clone(&refused_drag);
                     thread::spawn(move || {
+                        let take_refused = |device_id: &str| {
+                            refused_drag
+                                .lock()
+                                .ok()
+                                .and_then(|mut refused| refused.take_if(|(id, _)| id == device_id))
+                        };
                         let state = handle.state::<AppRuntime>();
                         let state = state.inner();
                         let to_paths = |files: Vec<std::path::PathBuf>| -> Vec<String> {
@@ -3226,20 +3244,47 @@ pub fn run() {
                         };
                         match event {
                             input::EdgeDragEvent::StartOle { device_id, files } => {
-                                match send_ole_drag_start(state, &device_id, &to_paths(files)) {
+                                let paths = to_paths(files);
+                                match send_ole_drag_start(state, &device_id, &paths) {
                                     Ok(count) => log::info!(
                                         "native drag start sent: {count} file(s) streamed to {device_id}"
                                     ),
-                                    Err(error) => log::warn!("native drag start failed: {error}"),
+                                    Err(error) => {
+                                        log::warn!("native drag start failed: {error}");
+                                        if error.starts_with(DRAG_CONTROL_FAILED) {
+                                            if let Ok(mut refused) = refused_drag.lock() {
+                                                *refused = Some((device_id, paths));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             input::EdgeDragEvent::DropOle { device_id } => {
+                                if let Some((_, paths)) = take_refused(&device_id) {
+                                    match send_files_to_device_inner(
+                                        state,
+                                        &device_id,
+                                        &paths,
+                                        DropMode::Desktop,
+                                    ) {
+                                        Ok(summary) => log::info!(
+                                            "native drag refused by {device_id}; delivered {} file(s) to its Desktop instead",
+                                            summary.file_count
+                                        ),
+                                        Err(error) => log::warn!("edge drag-drop fallback failed: {error}"),
+                                    }
+                                    return;
+                                }
                                 match send_ole_drag_signal(state, &device_id, "drop") {
                                     Ok(()) => log::info!("native drag drop sent to {device_id}"),
                                     Err(error) => log::warn!("native drag drop failed: {error}"),
                                 }
                             }
                             input::EdgeDragEvent::CancelOle { device_id } => {
+                                // The peer never opened a session for a refused start.
+                                if take_refused(&device_id).is_some() {
+                                    return;
+                                }
                                 if let Err(error) = send_ole_drag_signal(state, &device_id, "cancel")
                                 {
                                     log::warn!("native drag cancel failed: {error}");
@@ -5198,12 +5243,27 @@ fn read_hostname() -> Option<String> {
 }
 
 fn local_host_label() -> String {
-    match (hostname(), local_ip_address()) {
-        (Some(name), Some(ip)) => format!("{name} / {ip}"),
+    match (hostname(), local_ip_list()) {
+        (Some(name), Some(ips)) => format!("{name} / {ips}"),
         (Some(name), None) => name,
-        (None, Some(ip)) => ip,
+        (None, Some(ips)) => ips,
         (None, None) => "localhost".into(),
     }
+}
+
+/// The default-route address first, then every other usable IPv4, so a
+/// direct-cable or Thunderbolt-bridge address is visible for manual pairing
+/// instead of only the Wi-Fi one (#33).
+fn local_ip_list() -> Option<String> {
+    let primary = local_ip_address();
+    let mut ips: Vec<String> = primary.iter().cloned().collect();
+    ips.extend(
+        local_ipv4_addresses()
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .filter(|ip| Some(ip) != primary.as_ref()),
+    );
+    (!ips.is_empty()).then(|| ips.join(", "))
 }
 
 fn local_ip_address() -> Option<String> {
@@ -6467,7 +6527,7 @@ fn send_ole_drag_start(
     );
     quic_transport
         .send_stream_expect_ack(peer, payload)
-        .map_err(|error| format!("拖放控制失败: {error}"))?;
+        .map_err(|error| format!("{DRAG_CONTROL_FAILED}: {error}"))?;
 
     let total = with_ids.len();
     for (index, (transfer_id, file)) in with_ids.iter().enumerate() {
@@ -6521,7 +6581,7 @@ fn send_ole_drag_signal(state: &AppRuntime, device_id: &str, kind: &str) -> Resu
     );
     quic_transport
         .send_stream_expect_ack(peer, payload)
-        .map_err(|error| format!("拖放控制失败: {error}"))
+        .map_err(|error| format!("{DRAG_CONTROL_FAILED}: {error}"))
 }
 
 /// Controller (either platform): ask the controlled machine to hand its
