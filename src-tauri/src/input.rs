@@ -2384,7 +2384,18 @@ fn dispatch_input_command(command: InputCommand) -> bool {
                 Err(error) => note_windows_helper_unavailable(&error),
             }
         }
-        inject_input_command(command);
+        // Windows refuses local injection (ERROR_ACCESS_DENIED) when the
+        // foreground window outranks this process: the UAC consent prompt on
+        // the normal desktop at "notify without dimming" (#28), Task Manager or
+        // an elevated app (#9). The SYSTEM helper can reach those, and a refused
+        // SendInput inserts nothing, so the retry cannot double an event.
+        if crate::windows_input::inject_command_without_tracking(&command)
+            == Err(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED)
+        {
+            if let Err(error) = windows_pipe_dispatcher().send(&command) {
+                note_windows_helper_unavailable(&error);
+            }
+        }
         return true;
     }
 
@@ -7422,17 +7433,17 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
 
 #[cfg(target_os = "windows")]
 fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
-    crate::windows_input::inject_mouse_button(button, down, x, y);
+    let _ = crate::windows_input::inject_mouse_button(button, down, x, y);
 }
 
 #[cfg(target_os = "windows")]
 fn inject_scroll(delta_x: i32, delta_y: i32) {
-    crate::windows_input::inject_scroll(delta_x, delta_y);
+    let _ = crate::windows_input::inject_scroll(delta_x, delta_y);
 }
 
 #[cfg(target_os = "windows")]
 fn inject_key(key_code: u16, down: bool) {
-    crate::windows_input::inject_key(key_code, down);
+    let _ = crate::windows_input::inject_key(key_code, down);
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

@@ -73,6 +73,7 @@ const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
 /// Prefix of a drag-control send error: the peer never opened a drag session.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DRAG_CONTROL_FAILED: &str = "拖放控制失败";
 const FILE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const FILE_TRANSFER_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
