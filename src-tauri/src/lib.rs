@@ -1241,6 +1241,13 @@ impl AppRuntime {
         input::set_macos_app_nap_suppressed(
             statuses.0.state == "ready" || statuses.1.state == "ready",
         );
+        // These were only shown in the window, so a startup failure left no
+        // trace in the log once the window was closed.
+        for (stage, status) in [("capture", &statuses.0), ("inject", &statuses.1)] {
+            if status.state == "error" {
+                log::warn!("input {stage} unavailable: {}", status.detail);
+            }
+        }
         statuses
     }
 
@@ -2631,9 +2638,57 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool, String> {
             .disable()
             .map_err(|error| format!("failed to disable launch at startup: {error}"))?;
     }
-    manager
+    let enabled = manager
         .is_enabled()
-        .map_err(|error| format!("failed to read launch-at-startup state: {error}"))
+        .map_err(|error| format!("failed to read launch-at-startup state: {error}"))?;
+    #[cfg(target_os = "macos")]
+    macos_set_relaunch_on_login(!enabled);
+    Ok(enabled)
+}
+
+/// macOS "Reopen windows when logging back in" relaunches a running app at
+/// login. With launch at startup on, our LaunchAgent starts it as well, and
+/// the two race for the instance lock: the restored copy won (window shown,
+/// not silent) and the autostart copy bounced off it. While the LaunchAgent
+/// owns login launches, opt out of the restore relaunch as AppKit recommends
+/// for launchd-launched apps.
+#[cfg(target_os = "macos")]
+fn macos_set_relaunch_on_login(relaunch: bool) {
+    use std::ffi::c_void;
+    use std::os::raw::c_char;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    // The two AppKit calls nest like a counter; keep at most one disable.
+    static DISABLED: AtomicBool = AtomicBool::new(false);
+    if DISABLED.swap(!relaunch, Ordering::Relaxed) == !relaunch {
+        return;
+    }
+    let selector: &[u8] = if relaunch {
+        b"enableRelaunchOnLogin\0"
+    } else {
+        b"disableRelaunchOnLogin\0"
+    };
+    unsafe {
+        let app_class = objc_getClass(b"NSApplication\0".as_ptr() as *const c_char);
+        if app_class.is_null() {
+            return;
+        }
+        let msg: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let ns_app = msg(
+            app_class,
+            sel_registerName(b"sharedApplication\0".as_ptr() as *const c_char),
+        );
+        if !ns_app.is_null() {
+            msg(ns_app, sel_registerName(selector.as_ptr() as *const c_char));
+        }
+    }
 }
 
 #[tauri::command]
@@ -2935,7 +2990,7 @@ fn should_allow_app_exit_request(code: Option<i32>, explicit_quit: bool) -> bool
     code == Some(tauri::RESTART_EXIT_CODE) || explicit_quit
 }
 
-fn launched_from_autostart() -> bool {
+pub fn launched_from_autostart() -> bool {
     args_contain_autostart(env::args())
 }
 
@@ -3098,14 +3153,55 @@ fn setup_macos_window_visibility_watcher(app: &tauri::App) {
 fn setup_macos_display_watcher(app: &tauri::App) {
     let app_handle = app.handle().clone();
     thread::spawn(move || {
+        // Empty so the first stable reading re-checks what startup detected.
+        let mut applied = Vec::new();
+        let mut pending = None;
         loop {
             thread::sleep(Duration::from_millis(1500));
+            let now = macos_display_fingerprint();
+            if now == applied {
+                pending = None;
+                continue;
+            }
+            // Wake and lid changes arrive as bursts (4 flips in 5 s were seen
+            // on wake); act once the set has held still for a tick.
+            if pending.as_ref() != Some(&now) {
+                pending = Some(now);
+                continue;
+            }
+            applied = now;
+            pending = None;
             let handle = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
                 refresh_local_screens(&handle);
             });
         }
     });
+}
+
+/// CoreGraphics display ids and bounds: thread-safe and cheap, unlike the
+/// NSScreen enumeration behind `detect_local_screens`, which needs the main
+/// thread. Bounds catch resolution and arrangement changes as well.
+#[cfg(target_os = "macos")]
+fn macos_display_fingerprint() -> Vec<(u32, i64, i64, i64, i64)> {
+    use core_graphics::display::CGDisplay;
+
+    let mut displays: Vec<_> = CGDisplay::active_displays()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            let bounds = CGDisplay::new(id).bounds();
+            (
+                id,
+                bounds.origin.x as i64,
+                bounds.origin.y as i64,
+                bounds.size.width as i64,
+                bounds.size.height as i64,
+            )
+        })
+        .collect();
+    displays.sort_unstable();
+    displays
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3140,6 +3236,11 @@ pub fn run() {
         })
         .setup(|app| {
             let silent_launch = launched_from_autostart();
+            #[cfg(target_os = "macos")]
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                macos_set_relaunch_on_login(!app.autolaunch().is_enabled().unwrap_or(false));
+            }
             if let Err(error) = app
                 .handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())
@@ -4970,9 +5071,13 @@ fn refresh_local_screens(app: &AppHandle) {
         }
         // Capture also caches native cursor geometry. Rebuild it on a real
         // display change; the live QUIC receiver reads the same native layout.
-        if let Err(error) = restart_runtime_if_running(state) {
-            log::warn!("failed to refresh input after display change: {error}");
-        }
+        // Off the main thread: the restart sleeps and waits for the event tap.
+        let app = app.clone();
+        thread::spawn(move || {
+            if let Err(error) = restart_runtime_if_running(app.state::<AppRuntime>().inner()) {
+                log::warn!("failed to refresh input after display change: {error}");
+            }
+        });
     }
 }
 
