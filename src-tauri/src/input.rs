@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Mutex, OnceLock, TryLockError,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -15,7 +15,7 @@ use crate::{
     quic_transport,
     shared_input::{
         button_from_mask, mouse_button_mask, InputCommand, InputEvent, MouseButton,
-        LEFT_BUTTON_MASK, MIDDLE_BUTTON_MASK, RIGHT_BUTTON_MASK,
+        LEFT_BUTTON_MASK,
     },
     Device, LayoutState, NativeStageStatus, Screen,
 };
@@ -218,6 +218,9 @@ struct InputTarget {
     layout_local_screen: Screen,
     remote_screen: Screen,
     edge: Edge,
+    /// The modifier remap for this target, captured with the target so key
+    /// events never need the layout lock. `None` when no remap applies.
+    modifier_map: Option<crate::ModifierMap>,
 }
 
 #[derive(Debug, Clone)]
@@ -1300,6 +1303,7 @@ fn build_input_targets(layout: &LayoutState, native_layout: &LayoutState) -> Vec
                         layout_local_screen: layout_local_screen.clone(),
                         remote_screen: remote_screen.clone(),
                         edge,
+                        modifier_map: target_modifier_map(layout, &device.platform),
                     });
                 }
             }
@@ -1436,7 +1440,7 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
-    let mut packet_context = input_packet_context(target, event, layout_state);
+    let mut packet_context = input_packet_context(target, event);
     let Some(peer) = packet_context.peer.take() else {
         return false;
     };
@@ -1573,114 +1577,42 @@ struct InputPacketContext {
     event: InputEvent,
 }
 
-fn input_packet_context(
-    target: &InputTarget,
-    event: InputEvent,
-    layout_state: &Arc<Mutex<LayoutState>>,
-) -> InputPacketContext {
-    let fallback_peer = || quic_transport::PeerEndpoint {
-        addr: target.target_addr.clone(),
-        public_key: target.transport_public_key.clone(),
-        protocol_version: target.protocol_version,
-    };
-
-    let fallback_context = |event| InputPacketContext {
+fn input_packet_context(target: &InputTarget, event: InputEvent) -> InputPacketContext {
+    // Every event uses the context cached on the target at build time (at most
+    // INPUT_TARGETS_TTL stale): no layout lock, no origin re-derivation. Keys
+    // used to consult the live layout for the modifier remap and fell back to
+    // no remap when the lock was busy, so a key could go down remapped and come
+    // up raw (Ctrl held forever on the controlled machine); they also dropped
+    // while the device briefly read offline between a disk merge and presence
+    // sync. The remap now travels with the target.
+    InputPacketContext {
         origin_device_id: target.origin_device_id.clone(),
         cluster_id: target.cluster_id.clone(),
         pair_secret: target.pair_secret.clone(),
-        peer: Some(fallback_peer()),
-        event,
-    };
-
-    // Mouse events — essentially every packet — always use the context cached
-    // on the target at build time: it is at most INPUT_TARGETS_TTL stale and
-    // needs no layout lock, no origin re-derivation and no address formatting.
-    // Key events still consult the live layout for the modifier remap; they
-    // arrive at typing rate, not at mouse rate.
-    if !matches!(event, InputEvent::Key { .. }) {
-        return fallback_context(event);
-    }
-
-    let layout = match layout_state.try_lock() {
-        Ok(layout) => layout,
-        Err(TryLockError::WouldBlock) => return fallback_context(event),
-        Err(TryLockError::Poisoned(_)) => return fallback_context(event),
-    };
-
-    let origin_device_id = origin_peer_id(&layout);
-    let peer = layout
-        .devices
-        .iter()
-        .find(|device| device.id == target.device_id)
-        .and_then(|device| {
-            (device.online && device.input_ready).then(|| quic_transport::PeerEndpoint {
-                addr: format!(
-                    "{}:{}",
-                    device.host,
-                    normalize_quic_port(device.transport_port, device.quic_port)
-                ),
-                public_key: device.transport_public_key.clone(),
-                protocol_version: device.protocol_version,
-            })
-        });
-    let event = remap_event_for_target_layout(event, target, &layout);
-
-    InputPacketContext {
-        origin_device_id,
-        cluster_id: layout.cluster_id.clone(),
-        pair_secret: layout.pair_secret.clone(),
-        peer,
-        event,
+        peer: Some(quic_transport::PeerEndpoint {
+            addr: target.target_addr.clone(),
+            public_key: target.transport_public_key.clone(),
+            protocol_version: target.protocol_version,
+        }),
+        event: remap_event_for_target(event, target),
     }
 }
 
-/// Rewrites modifier keys on key events when the controlling machine and the
-/// target run different operating systems, so platform shortcut conventions
-/// line up (default: Ctrl <-> Cmd). Non-key events and same-platform targets
-/// pass through untouched. The wire format is always Windows virtual-key codes.
-fn remap_event_for_target_layout(
-    event: InputEvent,
-    target: &InputTarget,
-    layout: &LayoutState,
-) -> InputEvent {
-    let InputEvent::Key { key_code, down } = event else {
+/// The modifier remap for a target on `target_platform`: only between macOS
+/// and Windows, only when enabled.
+fn target_modifier_map(layout: &LayoutState, target_platform: &str) -> Option<crate::ModifierMap> {
+    let cross_platform = matches!(target_platform, "macos" | "windows")
+        && target_platform != crate::current_platform();
+    (cross_platform && layout.modifier_remap).then(|| layout.modifier_map.clone())
+}
+
+fn remap_event_for_target(event: InputEvent, target: &InputTarget) -> InputEvent {
+    let (InputEvent::Key { key_code, down }, Some(map)) = (&event, &target.modifier_map) else {
         return event;
     };
-
-    let target_platform = target.target_platform.as_str();
-    if target_platform != "macos" && target_platform != "windows" {
-        return InputEvent::Key { key_code, down };
-    }
-    if target_platform == crate::current_platform() {
-        return InputEvent::Key { key_code, down };
-    }
-
-    let remapped = if layout.modifier_remap {
-        remap_modifier_vk(
-            key_code,
-            &layout.modifier_map.control,
-            &layout.modifier_map.alt,
-            &layout.modifier_map.meta,
-        )
-    } else {
-        key_code
-    };
-
     InputEvent::Key {
-        key_code: remapped,
-        down,
-    }
-}
-
-#[cfg(test)]
-fn remap_event_for_target(
-    event: InputEvent,
-    target: &InputTarget,
-    layout_state: &Arc<Mutex<LayoutState>>,
-) -> InputEvent {
-    match layout_state.lock() {
-        Ok(layout) => remap_event_for_target_layout(event, target, &layout),
-        Err(_) => event,
+        key_code: remap_modifier_vk(*key_code, &map.control, &map.alt, &map.meta),
+        down: *down,
     }
 }
 
@@ -2819,12 +2751,14 @@ fn release_remote_buttons(
     input_events: &Arc<AtomicU64>,
 ) {
     let bits = mask.swap(0, Ordering::Relaxed);
-    for (bit, button) in [
-        (LEFT_BUTTON_MASK, MouseButton::Left),
-        (RIGHT_BUTTON_MASK, MouseButton::Right),
-        (MIDDLE_BUTTON_MASK, MouseButton::Middle),
+    for button in [
+        MouseButton::Left,
+        MouseButton::Right,
+        MouseButton::Middle,
+        MouseButton::Back,
+        MouseButton::Forward,
     ] {
-        if bits & bit != 0 {
+        if bits & mouse_button_mask(button) != 0 {
             send_packet(
                 quic_transport,
                 target,
@@ -7494,6 +7428,7 @@ mod tests {
                 1440,
             ),
             edge: Edge::Right,
+            modifier_map: None,
         }
     }
 
@@ -7611,6 +7546,7 @@ mod tests {
             layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
             remote_screen: entry.clone(),
             edge: Edge::Right,
+            modifier_map: None,
         };
         let mut current_screen = entry.clone();
         current_screen.id = "scr-1".into();
@@ -7665,6 +7601,7 @@ mod tests {
             layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
             remote_screen: entry.clone(),
             edge: Edge::Right,
+            modifier_map: None,
         };
         let mut current_screen = entry.clone();
         current_screen.id = "local-display-1".into();
@@ -7712,6 +7649,7 @@ mod tests {
             layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
             remote_screen: entry.clone(),
             edge: Edge::Right,
+            modifier_map: None,
         };
         let mut current_screen = entry.clone();
         current_screen.id = "local-display-1".into();
@@ -8083,6 +8021,7 @@ mod tests {
                 layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
                 remote_screen: entry.clone(),
                 edge,
+                modifier_map: None,
             };
             let mut current_screen = entry.clone();
             current_screen.id = "local-display-1".into();
@@ -8278,63 +8217,56 @@ mod tests {
     fn input_packet_context_uses_stable_peer_origin_id() {
         let layout = layout_for_target_tests();
         let expected_origin_id = crate::local_peer_from_layout(&layout).id;
-        let layout_state = Arc::new(Mutex::new(layout));
-        let target = target_for_coordinate_tests();
+        let target = build_input_targets(&layout, &layout)
+            .into_iter()
+            .next()
+            .expect("one target");
+        assert_ne!(expected_origin_id, "local-device");
 
-        // Key events consult the live layout and must resolve the stable id.
-        let context = input_packet_context(
-            &target,
+        for event in [
             InputEvent::Key {
                 key_code: 0x41,
                 down: true,
             },
-            &layout_state,
-        );
-        assert_ne!(expected_origin_id, "local-device");
-        assert_eq!(context.origin_device_id, expected_origin_id);
-
-        // Mouse events take the hot path: the context cached on the target at
-        // build time, which carries the same stable id without a layout lock.
-        let context = input_packet_context(
-            &target,
             InputEvent::MouseMove {
                 screen_id: "local-display-1".into(),
                 x: 10,
                 y: 20,
             },
-            &layout_state,
-        );
-        assert_eq!(context.origin_device_id, target.origin_device_id);
+        ] {
+            let context = input_packet_context(&target, event);
+            assert_eq!(context.origin_device_id, expected_origin_id);
+            assert!(context.peer.is_some());
+        }
     }
 
     #[test]
-    fn input_packet_context_uses_cached_target_when_layout_lock_is_busy() {
+    fn key_down_and_up_share_the_remap_while_the_layout_is_locked() {
+        // The old key path skipped the remap when the layout lock was busy, so
+        // Ctrl could go down as Cmd and come up as Ctrl (Cmd stuck on the far
+        // side). The remap now travels with the target.
         let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
         let _held_layout = layout_state.lock().expect("hold layout lock");
-        let target = target_for_coordinate_tests();
-        let layout_state_for_thread = Arc::clone(&layout_state);
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        thread::spawn(move || {
-            let context = input_packet_context(
-                &target,
-                InputEvent::MouseMove {
-                    screen_id: "local-display-1".into(),
-                    x: 10,
-                    y: 20,
-                },
-                &layout_state_for_thread,
-            );
-            tx.send(context).expect("send packet context");
+        let mut target = target_for_coordinate_tests();
+        target.modifier_map = Some(crate::ModifierMap {
+            control: "meta".into(),
+            alt: "same".into(),
+            meta: "control".into(),
         });
-
-        let context = rx
-            .recv_timeout(Duration::from_millis(50))
-            .expect("packet context should not block on the layout lock");
-        assert_eq!(context.origin_device_id, "peer-local-192-168-66-92");
-        assert_eq!(context.cluster_id, "cluster-test");
-        assert_eq!(context.pair_secret, "secret-test");
-        assert!(context.peer.is_some());
+        let sent = |down| match input_packet_context(
+            &target,
+            InputEvent::Key {
+                key_code: 0x11,
+                down,
+            },
+        )
+        .event
+        {
+            InputEvent::Key { key_code, .. } => key_code,
+            _ => unreachable!(),
+        };
+        assert_ne!(sent(true), 0x11);
+        assert_eq!(sent(true), sent(false));
     }
 
     #[test]
@@ -8696,6 +8628,7 @@ mod tests {
                 1117,
             ),
             edge: Edge::Right,
+            modifier_map: None,
         };
 
         assert!(crossing_layout_point(&target, 1918.0, 600.0, 5.0, 0.0).is_none());
@@ -8732,6 +8665,7 @@ mod tests {
                 1117,
             ),
             edge: Edge::Right,
+            modifier_map: None,
         };
 
         assert!(crossing_layout_point(&target, 3838.0, 1200.0, 900.0, 0.0).is_none());
@@ -8865,13 +8799,15 @@ mod tests {
         // configured map, so we cannot accidentally mangle keys for peers we
         // cannot classify.
         target.target_platform = "unknown".into();
+        target.modifier_map =
+            target_modifier_map(&layout.lock().expect("layout lock"), &target.target_platform);
+        assert!(target.modifier_map.is_none());
         let event = remap_event_for_target(
             InputEvent::Key {
                 key_code: 0x11,
                 down: true,
             },
             &target,
-            &layout,
         );
         match event {
             InputEvent::Key { key_code, .. } => assert_eq!(key_code, 0x11),
@@ -8896,7 +8832,6 @@ mod tests {
                 delta_y: -2,
             },
             &target,
-            &layout,
         );
         assert!(matches!(
             event,
