@@ -583,6 +583,11 @@ fn tuned_transport_config() -> quinn::TransportConfig {
     if let Ok(timeout) = quinn::IdleTimeout::try_from(Duration::from_secs(10)) {
         transport.max_idle_timeout(Some(timeout));
     }
+    // Input datagrams are stale within a second. quinn's 1 MiB default queued
+    // thousands of old moves (and clicks) during a Wi-Fi stall and replayed
+    // them afterwards; a small queue drops the oldest instead.
+    transport.datagram_send_buffer_size(16 * 1024);
+    transport.datagram_receive_buffer_size(Some(64 * 1024));
     transport
 }
 
