@@ -3349,60 +3349,81 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 let handle = app.handle().clone();
-                // A drag whose native start the peer refused (e.g. a client too
-                // old for drag control) is delivered as a plain transfer when the
-                // button is released over it, instead of being lost (#33).
-                let refused_drag: Arc<Mutex<Option<(String, Vec<String>)>>> = Arc::default();
+                // One worker, so control messages reach the peer in order: with a
+                // thread per event a cancel could overtake its start, leaving the
+                // Windows drag session open with a synthetic button held down.
+                // File bytes stream on their own threads, so a drop is not held
+                // back behind a large file.
+                let (edge_drag_tx, edge_drag_rx) = std::sync::mpsc::channel::<input::EdgeDragEvent>();
                 input::set_edge_drag_sender(Box::new(move |event| {
-                    let handle = handle.clone();
-                    let refused_drag = Arc::clone(&refused_drag);
-                    thread::spawn(move || {
-                        let take_refused = |device_id: &str| {
-                            refused_drag
-                                .lock()
-                                .ok()
-                                .and_then(|mut refused| refused.take_if(|(id, _)| id == device_id))
-                        };
+                    let _ = edge_drag_tx.send(event);
+                }));
+                thread::spawn(move || {
+                    let to_paths = |files: Vec<std::path::PathBuf>| -> Vec<String> {
+                        files
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect()
+                    };
+                    let deliver_to_desktop = |device_id: String, paths: Vec<String>, what: &'static str| {
+                        let handle = handle.clone();
+                        thread::spawn(move || {
+                            let state = handle.state::<AppRuntime>();
+                            match send_files_to_device_inner(
+                                state.inner(),
+                                &device_id,
+                                &paths,
+                                DropMode::Desktop,
+                            ) {
+                                Ok(summary) => log::info!(
+                                    "{what}: delivered {} file(s) ({}) to {}'s Desktop",
+                                    summary.file_count,
+                                    format_bytes(summary.byte_count),
+                                    summary.target_name
+                                ),
+                                Err(error) => log::warn!("{what} failed: {error}"),
+                            }
+                        });
+                    };
+                    // A drag whose native start the peer refused (e.g. a client too
+                    // old for drag control) is delivered as a plain transfer when the
+                    // button is released over it, instead of being lost (#33).
+                    let mut refused: Option<(String, Vec<String>)> = None;
+                    for event in edge_drag_rx {
                         let state = handle.state::<AppRuntime>();
                         let state = state.inner();
-                        let to_paths = |files: Vec<std::path::PathBuf>| -> Vec<String> {
-                            files
-                                .iter()
-                                .map(|path| path.to_string_lossy().into_owned())
-                                .collect()
-                        };
                         match event {
                             input::EdgeDragEvent::StartOle { device_id, files } => {
                                 let paths = to_paths(files);
                                 match send_ole_drag_start(state, &device_id, &paths) {
-                                    Ok(count) => log::info!(
-                                        "native drag start sent: {count} file(s) streamed to {device_id}"
-                                    ),
+                                    Ok(stream) => {
+                                        let handle = handle.clone();
+                                        thread::spawn(move || {
+                                            let state = handle.state::<AppRuntime>();
+                                            match stream_ole_drag_files(state.inner(), stream) {
+                                                Ok(count) => log::info!(
+                                                    "native drag streamed {count} file(s) to {device_id}"
+                                                ),
+                                                Err(error) => {
+                                                    log::warn!("native drag stream failed: {error}")
+                                                }
+                                            }
+                                        });
+                                    }
                                     Err(error) => {
                                         log::warn!("native drag start failed: {error}");
                                         if error.starts_with(DRAG_CONTROL_FAILED) {
-                                            if let Ok(mut refused) = refused_drag.lock() {
-                                                *refused = Some((device_id, paths));
-                                            }
+                                            refused = Some((device_id, paths));
                                         }
                                     }
                                 }
                             }
                             input::EdgeDragEvent::DropOle { device_id } => {
-                                if let Some((_, paths)) = take_refused(&device_id) {
-                                    match send_files_to_device_inner(
-                                        state,
-                                        &device_id,
-                                        &paths,
-                                        DropMode::Desktop,
-                                    ) {
-                                        Ok(summary) => log::info!(
-                                            "native drag refused by {device_id}; delivered {} file(s) to its Desktop instead",
-                                            summary.file_count
-                                        ),
-                                        Err(error) => log::warn!("edge drag-drop fallback failed: {error}"),
-                                    }
-                                    return;
+                                if let Some((device_id, paths)) =
+                                    refused.take_if(|(id, _)| *id == device_id)
+                                {
+                                    deliver_to_desktop(device_id, paths, "refused native drag");
+                                    continue;
                                 }
                                 match send_ole_drag_signal(state, &device_id, "drop") {
                                     Ok(()) => log::info!("native drag drop sent to {device_id}"),
@@ -3411,8 +3432,8 @@ pub fn run() {
                             }
                             input::EdgeDragEvent::CancelOle { device_id } => {
                                 // The peer never opened a session for a refused start.
-                                if take_refused(&device_id).is_some() {
-                                    return;
+                                if refused.take_if(|(id, _)| *id == device_id).is_some() {
+                                    continue;
                                 }
                                 if let Err(error) = send_ole_drag_signal(state, &device_id, "cancel")
                                 {
@@ -3420,24 +3441,11 @@ pub fn run() {
                                 }
                             }
                             input::EdgeDragEvent::Transfer { device_id, files } => {
-                                match send_files_to_device_inner(
-                                    state,
-                                    &device_id,
-                                    &to_paths(files),
-                                    DropMode::Desktop,
-                                ) {
-                                    Ok(summary) => log::info!(
-                                        "edge drag-drop delivered {} file(s) ({}) to {}",
-                                        summary.file_count,
-                                        format_bytes(summary.byte_count),
-                                        summary.target_name
-                                    ),
-                                    Err(error) => log::warn!("edge drag-drop failed: {error}"),
-                                }
+                                deliver_to_desktop(device_id, to_paths(files), "edge drag-drop");
                             }
                         }
-                    });
-                }));
+                    }
+                });
             }
 
             // The other direction: this Windows machine is the controller and
@@ -6604,15 +6612,25 @@ struct DragControlFile {
     size: u64,
 }
 
-/// Windows target: open the OLE drag session and stream the files (used by the
-/// edge drag-drop path). Returns the number of files started. Only the macOS
-/// capture path originates edge drags, so this is a controller-side helper.
+/// Windows target: what a sent drag start still has to stream (edge drag-drop
+/// path, macOS controller only): each file under the transfer
+/// id announced in the start, so the peer feeds it to its drag session.
+#[cfg(target_os = "macos")]
+struct OleDragStream {
+    quic_transport: quic_transport::TransportHandle,
+    origin_id: String,
+    target: FileTransferTarget,
+    files: Vec<(String, TransferFile)>,
+}
+
+/// Announce a native drag to `device_id` (acknowledged before returning), so
+/// that a drop or cancel sent afterwards can never overtake it.
 #[cfg(target_os = "macos")]
 fn send_ole_drag_start(
     state: &AppRuntime,
     device_id: &str,
     paths: &[String],
-) -> Result<usize, String> {
+) -> Result<OleDragStream, String> {
     state.start_discovery()?;
     let layout = state.layout_snapshot();
     if !layout.file_transfer_enabled {
@@ -6662,6 +6680,22 @@ fn send_ole_drag_start(
         .send_stream_expect_ack(peer, payload)
         .map_err(|error| format!("{DRAG_CONTROL_FAILED}: {error}"))?;
 
+    Ok(OleDragStream {
+        quic_transport,
+        origin_id: local_peer.id,
+        target,
+        files: with_ids,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn stream_ole_drag_files(state: &AppRuntime, stream: OleDragStream) -> Result<usize, String> {
+    let OleDragStream {
+        quic_transport,
+        origin_id,
+        target,
+        files: with_ids,
+    } = stream;
     let total = with_ids.len();
     for (index, (transfer_id, file)) in with_ids.iter().enumerate() {
         let reporter = FileTransferProgressReporter {
@@ -6672,7 +6706,7 @@ fn send_ole_drag_start(
         };
         let packet_count = send_transfer_file(
             &quic_transport,
-            &local_peer.id,
+            &origin_id,
             &target,
             file,
             transfer_id,
