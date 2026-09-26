@@ -684,7 +684,13 @@ impl AppRuntime {
     }
 
     fn runtime_status_for_layout(&self, layout: &LayoutState) -> RuntimeStatus {
-        let mut runtime = self.runtime.lock().unwrap().clone();
+        // Status reads are polled by the UI; a panic elsewhere that poisoned
+        // the lock must not turn every poll into another panic.
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         runtime.discovery = self.discovery_status_for_layout(layout);
         runtime.clipboard = self.clipboard_status(layout);
         runtime.pairing = self.pairing_status_for_layout(layout);
@@ -706,7 +712,12 @@ impl AppRuntime {
         local_peer.input_ready =
             advertised_input_ready(layout, self.input_receive_enabled.load(Ordering::Relaxed));
         let peers = active_peers(&self.peers, &local_peer.id);
-        let state = if self.discovery_stop.lock().unwrap().is_some() {
+        let running = self
+            .discovery_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        let state = if running {
             "ready"
         } else {
             "idle"
