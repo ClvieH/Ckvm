@@ -3269,8 +3269,10 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
             &context.input_events,
         ) {
             track_forwarded_key(&context.pressed_keys, key_code, down);
-            return 1;
+        } else {
+            return_to_local_after_send_failure_windows(&context, "key");
         }
+        return 1;
     }
 
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
@@ -3751,21 +3753,33 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
         &context.layout_state,
         &context.input_events,
     ) {
-        return false;
+        return_to_local_after_send_failure_windows(context, "mouse button");
+        return true;
     }
     mark_mouse_move_sent(&context.last_mouse_move_sent);
 
-    let sent = send_packet(
+    if send_packet(
         &context.quic_transport,
         &active_target.target,
         InputEvent::MouseButton { button, down },
         &context.layout_state,
         &context.input_events,
-    );
-    if sent {
+    ) {
         update_remote_button_mask(&context.remote_button_mask, button, down);
+    } else {
+        return_to_local_after_send_failure_windows(context, "mouse button");
     }
-    sent
+    true
+}
+
+/// The peer stopped taking input. Clicks, scrolls and keys used to fall
+/// through to this machine while its cursor sat pinned at the crossing edge:
+/// a stray click on whatever is at the edge, keys typed into the local app.
+/// Hand control back and swallow the event that was meant for the other side.
+#[cfg(target_os = "windows")]
+fn return_to_local_after_send_failure_windows(context: &WindowsCaptureContext, what: &str) {
+    log::warn!("remote send failed for {what}; returning control to the local machine");
+    release_windows_remote_control(context, false);
 }
 
 /// Precision touchpads and smooth wheels report fractions of the 120-unit
@@ -3808,23 +3822,25 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
         return false;
     };
 
-    if !send_remote_mouse_move(
+    let sent = send_remote_mouse_move(
         &context.quic_transport,
         &active_target,
         &context.layout_state,
         &context.input_events,
-    ) {
-        return false;
+    ) && {
+        mark_mouse_move_sent(&context.last_mouse_move_sent);
+        send_packet(
+            &context.quic_transport,
+            &active_target.target,
+            InputEvent::Scroll { delta_x, delta_y },
+            &context.layout_state,
+            &context.input_events,
+        )
+    };
+    if !sent {
+        return_to_local_after_send_failure_windows(context, "scroll");
     }
-    mark_mouse_move_sent(&context.last_mouse_move_sent);
-
-    send_packet(
-        &context.quic_transport,
-        &active_target.target,
-        InputEvent::Scroll { delta_x, delta_y },
-        &context.layout_state,
-        &context.input_events,
-    )
+    true
 }
 
 #[cfg(target_os = "windows")]
