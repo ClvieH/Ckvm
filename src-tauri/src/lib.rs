@@ -1149,11 +1149,25 @@ impl AppRuntime {
 
         let service = query_windows_input_service_status()?;
         let owns_network = windows_input_service_owns_network_ports()?;
-        if owns_network && !service.running {
-            start_windows_input_service()?;
-            if let Some(file) = acquire_windows_input_service_network_lease()? {
-                *lease = Some(file);
-                return Ok(true);
+        if service.installed && !service.running {
+            // Revive a stopped lock-screen service even when it predates the
+            // network takeover: without it the lock screen gets no input (#27).
+            match start_windows_input_service() {
+                Ok(()) => {
+                    if let Some(file) = acquire_windows_input_service_network_lease()? {
+                        *lease = Some(file);
+                        return Ok(true);
+                    }
+                }
+                Err(error) if owns_network => return Err(error),
+                // An older install may only be startable by an administrator;
+                // that must not block discovery.
+                Err(error) => {
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        log::warn!("could not start the stopped input service: {error}");
+                    }
+                }
             }
         }
         if owns_network {
