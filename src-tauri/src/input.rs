@@ -562,7 +562,9 @@ fn screen_switch_hotkey_matches_vk(
     key_code: u16,
     modifiers: HotkeyModifiers,
 ) -> bool {
-    let Ok(layout) = layout_state.lock() else {
+    // Called from the event tap / low-level hook: never wait on a layout lock
+    // a save may hold across a disk write (Windows drops a slow hook).
+    let Ok(layout) = layout_state.try_lock() else {
         return false;
     };
     if layout.machine_role != "server" {
@@ -1287,7 +1289,7 @@ fn start_platform_capture(
             *current = Some(Arc::clone(&context));
         }
 
-        let mouse_hook = unsafe {
+        let mut mouse_hook = unsafe {
             SetWindowsHookExW(
                 WH_MOUSE_LL,
                 Some(windows_mouse_proc),
@@ -1303,7 +1305,7 @@ fn start_platform_capture(
             return;
         }
 
-        let keyboard_hook = unsafe {
+        let mut keyboard_hook = unsafe {
             SetWindowsHookExW(
                 WH_KEYBOARD_LL,
                 Some(windows_keyboard_proc),
@@ -1325,7 +1327,46 @@ fn start_platform_capture(
         let _ = ready_tx.send(Ok(()));
         let mut message = MSG::default();
         let mut last_desktop_check = Instant::now() - Duration::from_millis(200);
+        let mut last_hook_check = Instant::now();
+        let mut last_hook_reinstall: Option<Instant> = None;
         while !stop.load(Ordering::Relaxed) {
+            if last_hook_check.elapsed() >= Duration::from_secs(1) {
+                last_hook_check = Instant::now();
+                // Hooks see nothing on the secure desktop, so only judge them
+                // on the normal one, and at most every five seconds.
+                if cached_windows_input_desktop_is_default()
+                    && last_hook_reinstall.is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
+                    && windows_hooks_look_removed()
+                {
+                    last_hook_reinstall = Some(Instant::now());
+                    log::warn!(
+                        "Windows removed MyKVM's input hooks (a callback overran \
+                         LowLevelHooksTimeout); reinstalling them"
+                    );
+                    release_windows_remote_control(&context, false);
+                    unsafe {
+                        let _ = UnhookWindowsHookEx(mouse_hook);
+                        let _ = UnhookWindowsHookEx(keyboard_hook);
+                        mouse_hook = SetWindowsHookExW(
+                            WH_MOUSE_LL,
+                            Some(windows_mouse_proc),
+                            std::ptr::null_mut(),
+                            0,
+                        );
+                        keyboard_hook = SetWindowsHookExW(
+                            WH_KEYBOARD_LL,
+                            Some(windows_keyboard_proc),
+                            std::ptr::null_mut(),
+                            0,
+                        );
+                    }
+                    if mouse_hook.is_null() || keyboard_hook.is_null() {
+                        log::error!("failed to reinstall the Windows input hooks");
+                    }
+                    // Wait for a fresh hook event before judging again.
+                    LAST_HOOK_EVENT_TICK.store(0, Ordering::Relaxed);
+                }
+            }
             if last_desktop_check.elapsed() >= Duration::from_millis(100) {
                 last_desktop_check = Instant::now();
                 if !refresh_windows_input_desktop_cache() {
@@ -1877,7 +1918,8 @@ fn mark_target_offline(
     target: &InputTarget,
     _reason: &str,
 ) {
-    let Ok(mut layout) = layout_state.lock() else {
+    // Best effort from the send path inside the tap/hook: never block there.
+    let Ok(mut layout) = layout_state.try_lock() else {
         return;
     };
     let Some(device) = layout
@@ -3192,6 +3234,29 @@ fn set_control_clipboard_target(
     );
 }
 
+/// Tick (GetTickCount base) of the last input event our low-level hooks saw.
+#[cfg(target_os = "windows")]
+static LAST_HOOK_EVENT_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Windows silently removes a low-level hook whose callback overran
+/// LowLevelHooksTimeout, after which input simply stops being captured until
+/// a restart. The system still records input then (GetLastInputInfo) while
+/// our hooks see none; two seconds of that means the hooks are gone.
+#[cfg(target_os = "windows")]
+fn windows_hooks_look_removed() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut info) } == 0 {
+        return false;
+    }
+    let last_hook = LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed);
+    last_hook != 0 && info.dwTime.wrapping_sub(last_hook) as i32 > 2_000
+}
+
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -3213,6 +3278,7 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
     }
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
+    LAST_HOOK_EVENT_TICK.store(event.time, Ordering::Relaxed);
     let message = wparam as u32;
     let handled = match message {
         WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
@@ -3265,6 +3331,7 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
 
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
         let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
+        LAST_HOOK_EVENT_TICK.store(event.time, Ordering::Relaxed);
         let key_code = event.vkCode as u16;
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
@@ -3294,11 +3361,19 @@ fn windows_event_matches_screen_switch_hotkey(
     context: &WindowsCaptureContext,
     key_code: u16,
 ) -> bool {
-    screen_switch_hotkey_matches_vk(
-        &context.layout_state,
-        key_code,
-        windows_current_hotkey_modifiers(),
-    )
+    // While remote, modifiers are forwarded and swallowed, so they never reach
+    // this machine's key state and GetAsyncKeyState reads them as up: the
+    // return hotkey could not match from the controlled side. Count the
+    // forwarded ones as well.
+    let mut modifiers = windows_current_hotkey_modifiers();
+    if let Ok(pressed) = context.pressed_keys.lock() {
+        let held = |codes: &[u16]| codes.iter().any(|code| pressed.contains(code));
+        modifiers.ctrl |= held(&[0x11, 0xA2, 0xA3]);
+        modifiers.alt |= held(&[0x12, 0xA4, 0xA5]);
+        modifiers.shift |= held(&[0x10, 0xA0, 0xA1]);
+        modifiers.meta |= held(&[0x5B, 0x5C]);
+    }
+    screen_switch_hotkey_matches_vk(&context.layout_state, key_code, modifiers)
 }
 
 #[cfg(target_os = "windows")]
@@ -4976,8 +5051,11 @@ fn update_active_remote_screen(
         return false;
     }
 
+    // Runs per move while the cursor pushes an outer edge: never block the
+    // tap/hook on the layout lock. Without the screens this event only
+    // clamps; the next one roams, and returning to local does not need them.
     let screens = layout_state
-        .lock()
+        .try_lock()
         .map(|layout| remote_device_screens(&layout, &active.target.device_id))
         .unwrap_or_default();
 
