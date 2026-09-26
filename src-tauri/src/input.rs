@@ -273,6 +273,8 @@ struct InputPacketRef<'a> {
     #[serde(skip_serializing_if = "str_ref_is_empty")]
     pair_secret: &'a str,
     event: &'a InputEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    held: Option<&'a HeldInputs>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -294,6 +296,180 @@ struct InputPacket {
     #[serde(default)]
     pair_secret: String,
     event: InputEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    held: Option<HeldInputs>,
+}
+
+/// Keys (as sent, after the remap) and mouse buttons the controller is holding
+/// down on the controlled machine. Rides on a packet at most every
+/// `HELD_REFRESH` so the receiver can release anything whose "up" datagram was
+/// lost. Optional on the wire; older peers ignore it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HeldInputs {
+    #[serde(default)]
+    keys: Vec<u16>,
+    #[serde(default)]
+    buttons: u64,
+}
+
+impl HeldInputs {
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.buttons == 0
+    }
+}
+
+const HELD_REFRESH: Duration = Duration::from_millis(250);
+/// A heartbeat-capable controller that has gone quiet this long while keys or
+/// buttons are down is gone; release them rather than leave them stuck.
+const HELD_SILENCE: Duration = Duration::from_secs(1);
+const ALL_MOUSE_BUTTONS: [MouseButton; 5] = [
+    MouseButton::Left,
+    MouseButton::Right,
+    MouseButton::Middle,
+    MouseButton::Back,
+    MouseButton::Forward,
+];
+
+/// Controller side: what the controlled machine should currently hold.
+struct SenderHeld {
+    held: HeldInputs,
+    last_attached: Option<Instant>,
+}
+
+impl SenderHeld {
+    /// Record the desired state after `event` (whether or not its send
+    /// succeeds: a key released locally must end up released remotely) and
+    /// return the block to attach when one is due.
+    fn track(&mut self, event: &InputEvent, now: Instant) -> Option<HeldInputs> {
+        match *event {
+            InputEvent::Key { key_code, down } => {
+                self.held.keys.retain(|key| *key != key_code);
+                if down {
+                    self.held.keys.push(key_code);
+                }
+            }
+            InputEvent::MouseButton { button, down } => {
+                let bit = mouse_button_mask(button);
+                if down {
+                    self.held.buttons |= bit;
+                } else {
+                    self.held.buttons &= !bit;
+                }
+            }
+            _ => {}
+        }
+        self.due(now).then(|| {
+            self.last_attached = Some(now);
+            self.held.clone()
+        })
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.last_attached
+            .is_none_or(|last| now.saturating_duration_since(last) >= HELD_REFRESH)
+    }
+}
+
+static SENDER_HELD: Mutex<SenderHeld> = Mutex::new(SenderHeld {
+    held: HeldInputs {
+        keys: Vec::new(),
+        buttons: 0,
+    },
+    last_attached: None,
+});
+
+/// Controlled side: keys this machine injected down on a controller's behalf.
+/// Buttons live in `REMOTE_MOUSE_BUTTONS`.
+struct ReceivedHeld {
+    keys: Vec<u16>,
+    /// The controller sends `held`; only then may silence release anything
+    /// (an older controller sends nothing while a modifier is simply held).
+    heartbeats: bool,
+    last_packet: Option<Instant>,
+}
+
+impl ReceivedHeld {
+    fn track(&mut self, command: &InputCommand, now: Instant) {
+        self.last_packet = Some(now);
+        if let InputCommand::Key { key_code, down } = *command {
+            self.keys.retain(|key| *key != key_code);
+            if down {
+                self.keys.push(key_code);
+            }
+        }
+    }
+
+    /// Keys held here that the controller no longer holds.
+    fn take_stale_keys(&mut self, held: &HeldInputs) -> Vec<u16> {
+        self.heartbeats = true;
+        let (stale, keep) = self.keys.iter().partition(|key| !held.keys.contains(key));
+        self.keys = keep;
+        stale
+    }
+
+    fn silent(&self, buttons: u64, now: Instant) -> bool {
+        self.heartbeats
+            && (!self.keys.is_empty() || buttons != 0)
+            && self
+                .last_packet
+                .is_some_and(|last| now.saturating_duration_since(last) >= HELD_SILENCE)
+    }
+}
+
+static RECEIVED_HELD: Mutex<ReceivedHeld> = Mutex::new(ReceivedHeld {
+    keys: Vec::new(),
+    heartbeats: false,
+    last_packet: None,
+});
+
+/// Release whatever this machine holds that `held` does not list.
+fn reconcile_received_held(held: &HeldInputs, sink: &dyn Fn(InputCommand) -> bool) {
+    let stale_keys = RECEIVED_HELD
+        .lock()
+        .map(|mut state| state.take_stale_keys(held))
+        .unwrap_or_default();
+    for key_code in stale_keys {
+        sink(InputCommand::Key {
+            key_code,
+            down: false,
+        });
+    }
+    let stale_buttons = REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed) & !held.buttons;
+    for button in ALL_MOUSE_BUTTONS {
+        if stale_buttons & mouse_button_mask(button) != 0 {
+            let (x, y) = update_remote_mouse_button(button, false);
+            sink(InputCommand::MouseButton {
+                button,
+                down: false,
+                x,
+                y,
+            });
+        }
+    }
+}
+
+/// Release everything a heartbeat-capable controller left held when it went
+/// silent (crash, network loss). One thread per process, started with the
+/// process's injection path the first time input arrives.
+pub(crate) fn start_held_input_watchdog(sink: fn(InputCommand) -> bool) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = thread::Builder::new()
+            .name("mykvm-held-watchdog".into())
+            .spawn(move || loop {
+                thread::sleep(HELD_REFRESH);
+                let now = Instant::now();
+                let silent = RECEIVED_HELD
+                    .lock()
+                    .map(|state| state.silent(REMOTE_MOUSE_BUTTONS.load(Ordering::Relaxed), now))
+                    .unwrap_or(false);
+                if silent {
+                    log::info!("controller went silent with input held; releasing it");
+                    reconcile_received_held(&HeldInputs::default(), &sink);
+                }
+            });
+    });
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1002,6 +1178,16 @@ fn start_platform_capture(
             let is_remote_active = context.remote_active.load(Ordering::Relaxed);
             if is_remote_active {
                 repin_macos_cursor_while_remote(&context);
+                if held_heartbeat_due() {
+                    if let Some(active) = context.active.lock().ok().and_then(|a| a.clone()) {
+                        send_remote_mouse_move(
+                            &context.quic_transport,
+                            &active,
+                            &context.layout_state,
+                            &context.input_events,
+                        );
+                    }
+                }
             }
         }
 
@@ -1136,6 +1322,16 @@ fn start_platform_capture(
                 }
             }
             drain_switch_request_windows(&context);
+            if context.remote_active.load(Ordering::Relaxed) && held_heartbeat_due() {
+                if let Some(active) = context.active.lock().ok().and_then(|a| a.clone()) {
+                    send_remote_mouse_move(
+                        &context.quic_transport,
+                        &active,
+                        &context.layout_state,
+                        &context.input_events,
+                    );
+                }
+            }
             // Low-level hook callbacks are dispatched only while this thread
             // services its message queue. Blocking on the queue (with a short
             // timeout for the desktop/switch checks above) instead of sleeping
@@ -1441,6 +1637,10 @@ fn send_packet(
     input_events: &Arc<AtomicU64>,
 ) -> bool {
     let mut packet_context = input_packet_context(target, event);
+    let held = SENDER_HELD
+        .lock()
+        .ok()
+        .and_then(|mut state| state.track(&packet_context.event, Instant::now()));
     let Some(peer) = packet_context.peer.take() else {
         return false;
     };
@@ -1476,6 +1676,7 @@ fn send_packet(
             ""
         },
         event: &packet_context.event,
+        held: held.as_ref(),
     };
 
     let payload = match rmp_serde::to_vec_named(&packet) {
@@ -1689,6 +1890,7 @@ pub fn handle_input_datagram(
     input_events: &Arc<AtomicU64>,
     clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
 ) -> bool {
+    start_held_input_watchdog(dispatch_input_command);
     handle_input_datagram_with_sink(
         layout_state,
         native_layout,
@@ -1712,10 +1914,12 @@ pub(crate) fn handle_input_datagram_with_sink(
     clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
     sink: &dyn Fn(InputCommand) -> bool,
 ) -> bool {
-    if let Some(packet) = decode_input_packet(payload) {
+    if let Some(mut packet) = decode_input_packet(payload) {
         if packet.protocol != INPUT_PROTOCOL {
             return false;
         }
+        let held = packet.held.take();
+        let position_before = REMOTE_MOUSE_POSITION.load(Ordering::Relaxed);
         // Steady-state datagrams omit the pairing block (it rides ~once per
         // INPUT_FULL_CRED_REFRESH). A credentialled packet is authorized in
         // full and (re)authorizes this source; a credential-less one is
@@ -1750,8 +1954,19 @@ pub(crate) fn handle_input_datagram_with_sink(
         let Some(command) = command else {
             return true;
         };
-        if sink(command) {
+        if let Ok(mut state) = RECEIVED_HELD.lock() {
+            state.track(&command, Instant::now());
+        }
+        // An idle controller's heartbeat re-sends the current position; don't
+        // inject a move that goes nowhere.
+        let heartbeat_repeat = held.is_some()
+            && matches!(command, InputCommand::MouseMove { x, y, .. }
+                if pack_remote_position(x, y) == position_before);
+        if !heartbeat_repeat && sink(command) {
             input_events.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(held) = held {
+            reconcile_received_held(&held, sink);
         }
         return true;
     }
@@ -4865,6 +5080,17 @@ fn local_hotkey_return_point(
     recorded_point: Option<(f64, f64)>,
 ) -> (f64, f64) {
     recorded_point.unwrap_or_else(|| local_center_point(active))
+}
+
+/// While keys or buttons are held and nothing carried `held` for
+/// `HELD_REFRESH`, the capture loop re-sends the current position (which
+/// attaches it), so a receiver that releases held input after a silent second
+/// keeps a genuine hold. Cheap enough to ask every loop tick.
+fn held_heartbeat_due() -> bool {
+    SENDER_HELD
+        .lock()
+        .map(|state| !state.held.is_empty() && state.due(Instant::now()))
+        .unwrap_or(false)
 }
 
 fn send_remote_mouse_move(
@@ -8060,6 +8286,7 @@ mod tests {
                 x: 320,
                 y: 240,
             },
+            held: None,
         };
         let payload = rmp_serde::to_vec_named(&packet).expect("encode input packet");
         let decoded = decode_input_packet(&payload).expect("decode input packet");
@@ -8117,6 +8344,7 @@ mod tests {
                 x: 320,
                 y: 240,
             },
+            held: None,
         };
         let mirror = InputPacketRef {
             protocol: &packet.protocol,
@@ -8128,6 +8356,7 @@ mod tests {
             cluster_id: &packet.cluster_id,
             pair_secret: &packet.pair_secret,
             event: &packet.event,
+            held: None,
         };
 
         assert_eq!(
@@ -8155,6 +8384,7 @@ mod tests {
             cluster_id: "cluster-test",
             pair_secret: "secret-test",
             event: &event,
+            held: None,
         };
         let lean = InputPacketRef {
             protocol: INPUT_PROTOCOL,
@@ -8166,6 +8396,7 @@ mod tests {
             cluster_id: "",
             pair_secret: "",
             event: &event,
+            held: None,
         };
 
         let full_bytes = rmp_serde::to_vec_named(&full).expect("encode full");
@@ -8241,6 +8472,112 @@ mod tests {
     }
 
     #[test]
+    fn sender_held_tracks_desired_state_and_attaches_every_refresh() {
+        let t0 = Instant::now();
+        let mut state = SenderHeld {
+            held: HeldInputs::default(),
+            last_attached: None,
+        };
+        let key = |key_code, down| InputEvent::Key { key_code, down };
+        assert_eq!(
+            state.track(&key(0x10, true), t0),
+            Some(HeldInputs {
+                keys: vec![0x10],
+                buttons: 0
+            })
+        );
+        // Tracked but not attached again inside the refresh window.
+        let left = InputEvent::MouseButton {
+            button: MouseButton::Left,
+            down: true,
+        };
+        assert_eq!(state.track(&left, t0 + Duration::from_millis(10)), None);
+        // Auto-repeat does not duplicate; a release clears even if unsent.
+        state.track(&key(0x10, true), t0 + Duration::from_millis(20));
+        state.track(&key(0x10, false), t0 + Duration::from_millis(30));
+        let moved = InputEvent::MouseMove {
+            screen_id: "s".into(),
+            x: 1,
+            y: 2,
+        };
+        assert_eq!(
+            state.track(&moved, t0 + HELD_REFRESH),
+            Some(HeldInputs {
+                keys: Vec::new(),
+                buttons: LEFT_BUTTON_MASK
+            })
+        );
+    }
+
+    #[test]
+    fn received_held_releases_only_what_the_controller_dropped() {
+        let t0 = Instant::now();
+        let mut state = ReceivedHeld {
+            keys: Vec::new(),
+            heartbeats: false,
+            last_packet: None,
+        };
+        for key_code in [0x10, 0x41] {
+            state.track(
+                &InputCommand::Key {
+                    key_code,
+                    down: true,
+                },
+                t0,
+            );
+        }
+        // An older controller never sends `held`: silence must not release.
+        assert!(!state.silent(0, t0 + HELD_SILENCE * 10));
+        let stale = state.take_stale_keys(&HeldInputs {
+            keys: vec![0x10],
+            buttons: 0,
+        });
+        assert_eq!(stale, vec![0x41]);
+        assert_eq!(state.keys, vec![0x10]);
+        assert!(!state.silent(0, t0 + HELD_SILENCE - Duration::from_millis(1)));
+        assert!(state.silent(0, t0 + HELD_SILENCE));
+    }
+
+    #[test]
+    fn held_block_is_optional_on_the_wire_both_ways() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        #[serde(rename_all = "camelCase")]
+        struct OlderInputPacket {
+            protocol: String,
+            event: InputEvent,
+        }
+        let event = InputEvent::Key {
+            key_code: 0x41,
+            down: true,
+        };
+        let held = HeldInputs {
+            keys: vec![0x10],
+            buttons: LEFT_BUTTON_MASK,
+        };
+        let packet = |held| InputPacketRef {
+            protocol: INPUT_PROTOCOL,
+            target_device_id: "t",
+            origin_device_id: "",
+            origin_port: 1,
+            origin_transport_public_key: "",
+            origin_protocol_version: 1,
+            cluster_id: "",
+            pair_secret: "",
+            event: &event,
+            held,
+        };
+        let with = rmp_serde::to_vec_named(&packet(Some(&held))).expect("encode");
+        let without = rmp_serde::to_vec_named(&packet(None)).expect("encode");
+
+        // An older receiver ignores the new field.
+        assert!(rmp_serde::from_slice::<OlderInputPacket>(&with).is_ok());
+        // This version reads it, and reads an older sender's packet as None.
+        assert_eq!(decode_input_packet(&with).expect("decode").held, Some(held));
+        assert_eq!(decode_input_packet(&without).expect("decode").held, None);
+    }
+
+    #[test]
     fn key_down_and_up_share_the_remap_while_the_layout_is_locked() {
         // The old key path skipped the remap when the layout lock was busy, so
         // Ctrl could go down as Cmd and come up as Ctrl (Cmd stuck on the far
@@ -8297,6 +8634,7 @@ mod tests {
                 x: 1,
                 y: 1,
             },
+            held: None,
         };
 
         assert!(!packet_authorized(&layout, &packet));
@@ -8338,6 +8676,7 @@ mod tests {
                 x: 1,
                 y: 1,
             },
+            held: None,
         };
 
         assert!(packet_authorized(&layout, &packet));
@@ -8414,6 +8753,7 @@ mod tests {
                 x: 100,
                 y: 200,
             },
+            held: None,
         })
         .unwrap();
         let native = Arc::new(Mutex::new(layout.clone()));

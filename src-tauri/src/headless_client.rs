@@ -68,6 +68,7 @@ pub fn start(config_path: PathBuf) -> Result<Option<HeadlessClientHandle>, Strin
     let layout_for_input = Arc::clone(&layout_state);
     let events_for_input = Arc::clone(&input_events);
     let clipboard_for_input = Arc::clone(&clipboard_target);
+    input::start_held_input_watchdog(input::dispatch_input_command_to_windows_helper);
     let on_datagram = Arc::new(move |payload: Vec<u8>, source| {
         let sink = |command| input::dispatch_input_command_to_windows_helper(command);
         let _ = input::handle_input_datagram_with_sink(
