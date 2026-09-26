@@ -16,6 +16,18 @@ release will reuse them).
 
 ### Fixed
 
+- Controlling another machine no longer drops you back to local control when that machine refuses a clipboard sync (for example clipboard sync is off there, or it runs an older version). The keyboard/mouse connection stays up, refused content is not re-sent every 2 seconds, and large clipboard images get enough time to be acknowledged.
+- After a Wi-Fi stall the controlled machine no longer replays seconds of stale mouse movement and clicks.
+- macOS: pushing the cursor against the bottom of a display no longer jumps into a machine arranged above it (#34).
+- macOS: when the controlled machine stops accepting input, clicks and keys now hand control back to the Mac instead of freezing the trackpad and mouse until MyKVM is force-quit. A file drag that an older client refuses is delivered to that machine's Desktop instead (#33).
+- The device list and diagnostics show every IPv4 address of this machine, so a direct-cable or Thunderbolt-bridge address is visible for manual pairing, not just the Wi-Fi one (#33).
+- Windows: MyKVM starts a stopped lock-screen input service from an older install, so clicks work on the lock screen again (#27).
+- macOS: launch at startup opens MyKVM once and silently, instead of racing macOS "Reopen windows when logging back in" and showing the window. Display changes on wake are applied once instead of several times, without blocking the app, and input-capture errors are now written to the log.
+- macOS: returning to the Mac after a long session with the window hidden no longer stalls while the hidden cursor is restored.
+- Mouse movement keeps a steady 125 Hz instead of dropping to about 62 Hz when input callbacks jitter.
+- Windows: precision touchpads and smooth scroll wheels now scroll the controlled machine.
+- Windows: a clipboard held open by another app no longer drops a synced copy.
+- Updates: a stalled update check gives up after 20 seconds with a clear message, and .deb/.rpm installs are offered their own update package instead of the AppImage.
 - Background input: blocking clipboard/file handlers no longer occupy QUIC workers; reconnecting input stays local until the transport is ready and retries with full pairing credentials.
 - Clipboard images are encoded once, so a 4K screenshot fits the stream limit. Unchanged clipboard contents use the OS change counter instead of repeatedly reading and encoding the image.
 - macOS: display changes refresh both saved placement and native input coordinates. Same-resolution displays keep separate placements, and active sharing stays responsive to input while the window is hidden, including receive-only mode.
