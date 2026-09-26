@@ -1073,6 +1073,7 @@ fn start_platform_capture(
                 macos_appkit::change_count(),
             ),
             pending_edge_drop: Mutex::new(None),
+            local_left_held: AtomicBool::new(false),
         });
         let callback_context = Arc::clone(&context);
         let event_types = vec![
@@ -2780,6 +2781,9 @@ struct MacCaptureContext {
     // its files are captured here and sent when the button releases remotely.
     drag_count_at_left_down: std::sync::atomic::AtomicI64,
     pending_edge_drop: Mutex<Option<PendingEdgeDrop>>,
+    /// The left button went down on this Mac before the pointer crossed; its
+    /// release happens over the remote and must reach this Mac too.
+    local_left_held: AtomicBool,
 }
 
 #[cfg(target_os = "macos")]
@@ -4095,6 +4099,9 @@ fn handle_macos_event(
         CGEventType::LeftMouseUp => {
             // Releasing the drag over the controlled machine: this is the drop.
             fire_pending_edge_drop(context);
+            if context.local_left_held.swap(false, Ordering::Relaxed) {
+                post_marked_left_mouse_up();
+            }
             send_macos_mouse_button(context, &active_target, MouseButton::Left, false)
         }
         CGEventType::RightMouseDown => {
@@ -4392,6 +4399,7 @@ fn handle_macos_mouse_move(
             *anchor_state = Some(anchor);
         }
         context.just_crossed.store(true, Ordering::Relaxed);
+        context.local_left_held.store(left_drag, Ordering::Relaxed);
         if left_drag {
             // The crossing happened mid-left-drag: if a drag session started
             // during this button hold and it carries files, arm an edge drop.
@@ -4498,6 +4506,29 @@ fn post_marked_escape_key() {
             );
             event.post(CGEventTapLocation::HID);
         }
+    }
+}
+
+/// A left button pressed on this Mac before the pointer crossed is released
+/// over the remote, and the tap forwards that release instead of delivering
+/// it here, so this Mac kept the button logically down: back on this screen
+/// the pointer was still dragging. Post a marked release where it is pinned.
+#[cfg(target_os = "macos")]
+fn post_marked_left_mouse_up() {
+    use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton, EventField};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    let Some(location) = macos_current_cursor_location() else {
+        return;
+    };
+    let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        return;
+    };
+    if let Ok(event) =
+        CGEvent::new_mouse_event(source, CGEventType::LeftMouseUp, location, CGMouseButton::Left)
+    {
+        event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MACOS_SELF_EVENT_MARKER);
+        event.post(CGEventTapLocation::HID);
     }
 }
 
