@@ -1058,6 +1058,7 @@ fn start_platform_capture(
             last_cursor_repin: Mutex::new(None),
             last_return: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
+            move_pending: AtomicBool::new(false),
             pressed_modifiers: Mutex::new(Vec::new()),
             pressed_keys: Mutex::new(Vec::new()),
             tap_disabled: AtomicBool::new(false),
@@ -1178,6 +1179,15 @@ fn start_platform_capture(
             let is_remote_active = context.remote_active.load(Ordering::Relaxed);
             if is_remote_active {
                 repin_macos_cursor_while_remote(&context);
+                flush_pending_mouse_move(
+                    &context.move_pending,
+                    &context.last_mouse_move_sent,
+                    &context.remote_button_mask,
+                    &context.active,
+                    &context.quic_transport,
+                    &context.layout_state,
+                    &context.input_events,
+                );
                 if held_heartbeat_due() {
                     if let Some(active) = context.active.lock().ok().and_then(|a| a.clone()) {
                         send_remote_mouse_move(
@@ -1264,6 +1274,7 @@ fn start_platform_capture(
             last_point: Mutex::new(None),
             last_mouse_move_sent: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
+            move_pending: AtomicBool::new(false),
             pressed_keys: Mutex::new(Vec::new()),
             cursor_hide_calls: Mutex::new(0),
             just_crossed: AtomicBool::new(false),
@@ -1322,6 +1333,17 @@ fn start_platform_capture(
                 }
             }
             drain_switch_request_windows(&context);
+            if context.remote_active.load(Ordering::Relaxed) {
+                flush_pending_mouse_move(
+                    &context.move_pending,
+                    &context.last_mouse_move_sent,
+                    &context.remote_button_mask,
+                    &context.active,
+                    &context.quic_transport,
+                    &context.layout_state,
+                    &context.input_events,
+                );
+            }
             if context.remote_active.load(Ordering::Relaxed) && held_heartbeat_due() {
                 if let Some(active) = context.active.lock().ok().and_then(|a| a.clone()) {
                     send_remote_mouse_move(
@@ -2686,6 +2708,9 @@ struct MacCaptureContext {
     // the cooldown window we refuse to cross, letting the user's slide settle.
     last_return: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
+    /// A move the pacing gate held back; the capture loop sends the latest
+    /// position so the remote cursor does not stop short of where it ended.
+    move_pending: AtomicBool,
     pressed_modifiers: Mutex<Vec<u16>>,
     // Regular (non-modifier) keys we have forwarded as held, so they can be
     // released if the cursor crosses back to local while a key is still down.
@@ -2858,6 +2883,9 @@ struct WindowsCaptureContext {
     last_point: Mutex<Option<(f64, f64)>>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
+    /// A move the pacing gate held back; the capture loop sends the latest
+    /// position so the remote cursor does not stop short of where it ended.
+    move_pending: AtomicBool,
     pressed_keys: Mutex<Vec<u16>>,
     cursor_hide_calls: Mutex<u8>,
     // Swallow the first post-crossing delta so a fast flick across the edge
@@ -3548,7 +3576,9 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             .y
             .clamp(0.0, (active_target.current_screen.height - 1) as f64);
         let dragging = remote_button_is_down(&context.remote_button_mask);
-        if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
+        let due = should_send_mouse_move(&context.last_mouse_move_sent, dragging);
+        context.move_pending.store(!due, Ordering::Relaxed);
+        if due {
             if !send_remote_mouse_move(
                 &context.quic_transport,
                 active_target,
@@ -4161,7 +4191,9 @@ fn handle_macos_mouse_move(
                 .y
                 .clamp(0.0, (active_target.current_screen.height - 1) as f64);
             let dragging = remote_button_is_down(&context.remote_button_mask);
-            if should_send_mouse_move(&context.last_mouse_move_sent, dragging) {
+            let due = should_send_mouse_move(&context.last_mouse_move_sent, dragging);
+            context.move_pending.store(!due, Ordering::Relaxed);
+            if due {
                 if !send_remote_mouse_move(
                     &context.quic_transport,
                     active_target,
@@ -5080,6 +5112,28 @@ fn local_hotkey_return_point(
     recorded_point: Option<(f64, f64)>,
 ) -> (f64, f64) {
     recorded_point.unwrap_or_else(|| local_center_point(active))
+}
+
+/// Send the position a paced-out move left behind, once the pacing allows.
+/// Runs on the capture thread, the same thread as the event callbacks.
+fn flush_pending_mouse_move(
+    move_pending: &AtomicBool,
+    last_mouse_move_sent: &Mutex<Option<Instant>>,
+    remote_button_mask: &AtomicU64,
+    active: &Mutex<Option<ActiveTarget>>,
+    quic_transport: &quic_transport::TransportHandle,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) {
+    if !move_pending.load(Ordering::Relaxed)
+        || !should_send_mouse_move(last_mouse_move_sent, remote_button_is_down(remote_button_mask))
+    {
+        return;
+    }
+    move_pending.store(false, Ordering::Relaxed);
+    if let Some(active) = active.lock().ok().and_then(|active| active.clone()) {
+        send_remote_mouse_move(quic_transport, &active, layout_state, input_events);
+    }
 }
 
 /// While keys or buttons are held and nothing carried `held` for
