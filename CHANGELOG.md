@@ -10,11 +10,19 @@ release will reuse them).
 
 ### Added
 
+- Manually added peers keep their selected connection IP, including after pairing, rediscovery, and address changes (#26).
 - Drag-and-drop files across machines (ShareMouse-style, experimental): drag files on the machine that owns the keyboard and mouse onto a controlled machine. Controlling Windows → Mac: drag files toward the screen edge that borders the Mac — a document icon follows the cursor onto the Mac, and releasing over an open Finder folder drops the files there (otherwise the Desktop). Controlling Mac → Windows client is also in. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
 - Drag files the other way too — from a controlled machine back to the controller. While controlling a Mac from Windows, grab a file on the Mac and drag it back across the edge onto Windows: it becomes a real native drag on Windows that you can drop into any folder, app, or field. Requires both sides on this version or newer.
 
 ### Fixed
 
+- Background input: blocking clipboard/file handlers no longer occupy QUIC workers; reconnecting input stays local until the transport is ready and retries with full pairing credentials.
+- Clipboard images are encoded once, so a 4K screenshot fits the stream limit. Unchanged clipboard contents use the OS change counter instead of repeatedly reading and encoding the image.
+- macOS: display changes refresh both saved placement and native input coordinates. Same-resolution displays keep separate placements, and active sharing stays responsive to input while the window is hidden, including receive-only mode.
+- Windows input service: installation/repair configures automatic recovery after failures; status files are refreshed at most once per second unless state changes, and new input is skipped if attaching the current desktop fails.
+- LAN discovery cannot replace a paired device's transport certificate; an identity change now requires re-pairing.
+- Linux reports its unavailable input backend explicitly instead of advertising input readiness.
+- Preserve the saved display layout when no displays are temporarily available during sleep or startup, instead of replacing it with a 1×1 placeholder (#30).
 - macOS: remote Caps Lock now switches the input source reliably. It switches the source directly (via Carbon TIS) instead of injecting the ⌃Space hotkey, which a Chinese IME such as WeType would swallow so nothing changed. Caps now toggles between English and the input method you last used, and no longer wedges when a key-up packet is dropped (which is what forced you to press it several times).
 - macOS: closing the MacBook lid (or unplugging a monitor) now removes that display from the layout instead of leaving a phantom screen. The Mac re-checks its displays when the configuration changes and re-announces, instead of advertising the list it captured at startup. Re-opening the lid (or replugging) now restores the display to the exact spot you had arranged it — it's matched by resolution and remembered across the disconnect, so the controller can reach it again instead of the screen coming back in the wrong place (or not at all).
 

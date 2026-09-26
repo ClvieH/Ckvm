@@ -35,6 +35,9 @@
 !macro MYKVM_DELETE_INPUT_SERVICE
   DetailPrint "Removing MyKVM input service..."
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$svc=Get-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue; if ($svc) { Stop-Service -Name ''MyKVMInputService'' -Force -ErrorAction SilentlyContinue }; sc.exe delete MyKVMInputService"'
+  Delete /REBOOTOK "$PROGRAMFILES64\MyKVM\mykvm-input-helper.exe"
+  Delete /REBOOTOK "$PROGRAMFILES64\MyKVM\mykvm-input-helper.exe.installing"
+  RMDir "$PROGRAMFILES64\MyKVM"
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL
@@ -60,4 +63,5 @@
 !macro NSIS_HOOK_POSTUNINSTALL
   ; Remove the firewall rule we added during install.
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="MyKVM (UDP-In)"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="MyKVM Headless Input (UDP-In)"'
 !macroend

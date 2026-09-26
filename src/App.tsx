@@ -129,6 +129,8 @@ type InputServiceAction = "install" | "uninstall";
 interface ServerPairingState {
   peer: LanPeer;
   host: string;
+  manual: boolean;
+  alias: string;
 }
 
 interface DragState {
@@ -425,8 +427,11 @@ function App() {
           nextSnapshot.layout.machineRole === "client" &&
           !localStorage.getItem("mykvm.clientAutostartInit")
         ) {
-          localStorage.setItem("mykvm.clientAutostartInit", "1");
-          void setAutostart(true).catch(() => {});
+          void setAutostart(true)
+            .then(() =>
+              localStorage.setItem("mykvm.clientAutostartInit", "1"),
+            )
+            .catch(() => {});
         }
         if (
           active &&
@@ -1686,13 +1691,14 @@ function App() {
         return;
       }
 
-      if (peer.pairingRequired) {
-        await beginPairing(host);
+      if (peer.pairingRequired || !layout?.devices.some((device) =>
+        device.transportPublicKey.length > 0 && device.transportPublicKey === peer.transportPublicKey)) {
+        await beginPairing(host, true, manualDeviceName.trim());
         return;
       }
 
       updateLayout((layoutState) =>
-        upsertPeerDevice(layoutState, peer, manualDeviceName.trim()),
+        upsertPeerDevice(layoutState, peer, manualDeviceName.trim(), true),
       );
       setManualDeviceName("");
       setManualDeviceHost("");
@@ -1713,7 +1719,8 @@ function App() {
       return;
     }
 
-    if (peer.pairingRequired) {
+    if (peer.pairingRequired || !layout?.devices.some((device) =>
+      device.transportPublicKey.length > 0 && device.transportPublicKey === peer.transportPublicKey)) {
       void beginPairing(peer.ip || peer.host);
       return;
     }
@@ -1723,7 +1730,7 @@ function App() {
     });
   }
 
-  async function beginPairing(hostInput: string) {
+  async function beginPairing(hostInput: string, manual = false, alias = "") {
     const host = hostInput.trim();
     if (!host) {
       setErrorMessage(ui.errors.manualHostRequired);
@@ -1735,7 +1742,7 @@ function App() {
 
     try {
       const challengePeer = await requestLanPairing(host);
-      setServerPairing({ peer: challengePeer, host });
+      setServerPairing({ peer: challengePeer, host, manual, alias });
       setServerPairingCode("");
       setServerPairingError(null);
     } catch (error: unknown) {
@@ -1754,7 +1761,7 @@ function App() {
       setErrorMessage(ui.errors.manualHostRequired);
       return;
     }
-    await beginPairing(host);
+    await beginPairing(host, device.source === "manual");
   }
 
   async function confirmPairing(event: FormEvent<HTMLFormElement>) {
@@ -1780,7 +1787,7 @@ function App() {
         );
         return;
       }
-      updateLayout((layoutState) => upsertPeerDevice(layoutState, pairedPeer));
+      updateLayout((layoutState) => upsertPeerDevice(layoutState, pairedPeer, serverPairing.alias, serverPairing.manual));
       setServerPairing(null);
       setServerPairingCode("");
       setServerPairingError(null);
@@ -2429,11 +2436,13 @@ function App() {
               >
                 <input
                   value={manualDeviceName}
+                  aria-label={ui.devices.deviceNamePlaceholder}
                   onChange={(event) => setManualDeviceName(event.target.value)}
                   placeholder={ui.devices.deviceNamePlaceholder}
                 />
                 <input
                   value={manualDeviceHost}
+                  aria-label={ui.devices.hostPlaceholder}
                   onChange={(event) => setManualDeviceHost(event.target.value)}
                   placeholder={ui.devices.hostPlaceholder}
                 />
@@ -2952,7 +2961,7 @@ function App() {
                           : ui.settings.restartAsAdmin}
                       </button>
                     ) : null}
-                    {canManageInputService && !inputServiceInstalled ? (
+                    {canManageInputService ? (
                       <button
                         type="button"
                         className="primary-button compact-button"
@@ -2961,7 +2970,9 @@ function App() {
                       >
                         {isInputServicePending
                           ? ui.common.pending
-                          : ui.settings.installInputService}
+                          : inputServiceInstalled
+                            ? ui.settings.reinstallInputService
+                            : ui.settings.installInputService}
                       </button>
                     ) : null}
                     {canManageInputService && runtime.inputService.installed ? (
@@ -3712,7 +3723,7 @@ function applyPeerPresence(layout: LayoutState, peers: LanPeer[]): LayoutState {
         ...device,
         online: true,
         inputReady: peer.inputReady,
-        host: peer.ip || peer.host || device.host,
+        host: device.source === "manual" ? device.host : peer.ip || peer.host || device.host,
         transportPort: peer.transportPort,
         quicPort: peer.quicPort,
         transportPublicKey: peer.transportPublicKey,
@@ -3729,6 +3740,7 @@ function upsertPeerDevice(
   layout: LayoutState,
   peer: LanPeer,
   alias = "",
+  manual = false,
 ): LayoutState {
   const existingIndex = layout.devices.findIndex(
     (device) =>
@@ -3738,7 +3750,7 @@ function upsertPeerDevice(
   );
   const existingDevice =
     existingIndex >= 0 ? layout.devices[existingIndex] : undefined;
-  const nextDevice = createDeviceFromPeer(layout, peer, alias, existingDevice);
+  const nextDevice = createDeviceFromPeer(layout, peer, alias, existingDevice, manual);
   const devices =
     existingIndex >= 0
       ? layout.devices.map((device, index) =>
@@ -3760,14 +3772,15 @@ function createDeviceFromPeer(
   peer: LanPeer,
   alias = "",
   existingDevice?: Device,
+  manual = false,
 ): Device {
-  const id = peerDeviceId(peer);
+  const id = existingDevice?.id ?? peerDeviceId(peer);
 
   return {
     id,
     name: alias || existingDevice?.name || peer.name,
     platform: normalizePlatform(peer.platform),
-    host: peer.ip || peer.host,
+    host: !manual && existingDevice?.source === "manual" ? existingDevice.host : peer.ip || peer.host,
     transportPort: peer.transportPort,
     quicPort: peer.quicPort,
     transportPublicKey: peer.transportPublicKey,
@@ -3776,7 +3789,7 @@ function createDeviceFromPeer(
     online: true,
     inputReady: peer.inputReady,
     role: "client",
-    source: "detected",
+    source: manual || existingDevice?.source === "manual" ? "manual" : "detected",
     screens: createScreensFromPeer(layout, id, peer.screens, existingDevice),
   };
 }
@@ -3957,10 +3970,11 @@ function findPeerDevice(layout: LayoutState, peer: LanPeer) {
 }
 
 function deviceMatchesPeer(layout: LayoutState, device: Device, peer: LanPeer) {
+  if (device.transportPublicKey.trim().length > 0) {
+    return device.transportPublicKey === peer.transportPublicKey;
+  }
   return (
     device.id === peerDeviceId(peer) ||
-    (device.transportPublicKey.trim().length > 0 &&
-      device.transportPublicKey === peer.transportPublicKey) ||
     sameClusterHost(layout, device, peer)
   );
 }

@@ -126,6 +126,7 @@ pub struct TransportHandle {
     port: u16,
     public_key: String,
     peer_health: HealthMap,
+    connections: ConnectionMap,
 }
 
 impl TransportHandle {
@@ -145,7 +146,9 @@ impl TransportHandle {
         }
     }
 
-    pub fn send_datagram(&self, peer: PeerEndpoint, payload: Vec<u8>) -> Result<(), String> {
+    /// Returns false while warming a connection, so capture keeps input local
+    /// instead of treating connection startup as an input send.
+    pub fn send_datagram(&self, peer: PeerEndpoint, payload: Vec<u8>) -> Result<bool, String> {
         if payload.len() > MAX_DATAGRAM_BYTES {
             return Err(format!(
                 "QUIC datagram is too large: {} bytes",
@@ -161,9 +164,20 @@ impl TransportHandle {
             ));
         }
 
+        // Do not resolve DNS from the native input callback. The connection
+        // loop resolves endpoints while warming them.
+        let ready = self.connections.lock()
+            .map_err(|_| "QUIC connection map is poisoned".to_string())?
+            .iter()
+            .any(|(key, slot)| key.requested_addr == peer.addr && key.public_key == peer.public_key
+                && matches!(slot, ConnectionSlot::Ready(connection) if connection.close_reason().is_none()));
         self.commands
-            .send(TransportCommand::SendDatagram { peer, payload })
-            .map_err(|_| "QUIC transport is stopped".to_string())
+            .send(TransportCommand::SendDatagram {
+                peer,
+                payload: if ready { payload } else { Vec::new() },
+            })
+            .map_err(|_| "QUIC transport is stopped".to_string())?;
+        Ok(ready)
     }
 
     pub fn send_stream_expect_ack(
@@ -193,12 +207,22 @@ impl TransportHandle {
             })
             .map_err(|_| "QUIC transport is stopped".to_string())?;
         result_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(6))
             .map_err(|_| "QUIC stream send timed out".to_string())?
     }
 
     pub fn shutdown(&self) {
-        let _ = self.commands.send(TransportCommand::Shutdown);
+        let _ = self.stop_and_wait();
+    }
+
+    pub fn stop_and_wait(&self) -> Result<(), String> {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.commands
+            .send(TransportCommand::Shutdown { ack: ack_tx })
+            .map_err(|_| "QUIC transport is stopped".to_string())?;
+        ack_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| "QUIC transport shutdown timed out".to_string())
     }
 }
 
@@ -212,12 +236,15 @@ enum TransportCommand {
         payload: Vec<u8>,
         result: mpsc::Sender<Result<(), String>>,
     },
-    Shutdown,
+    Shutdown {
+        ack: mpsc::Sender<()>,
+    },
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct PeerKey {
     addr: SocketAddr,
+    requested_addr: String,
     public_key: String,
 }
 
@@ -226,6 +253,23 @@ pub fn start(
     identity_dir: PathBuf,
     on_datagram: DatagramHandler,
     on_stream: StreamHandler,
+) -> Result<TransportHandle, String> {
+    start_inner(preferred_port, identity_dir, on_datagram, Some(on_stream))
+}
+
+pub fn start_datagram_only(
+    preferred_port: u16,
+    identity_dir: PathBuf,
+    on_datagram: DatagramHandler,
+) -> Result<TransportHandle, String> {
+    start_inner(preferred_port, identity_dir, on_datagram, None)
+}
+
+fn start_inner(
+    preferred_port: u16,
+    identity_dir: PathBuf,
+    on_datagram: DatagramHandler,
+    on_stream: Option<StreamHandler>,
 ) -> Result<TransportHandle, String> {
     // Load (or create-and-persist) this machine's transport identity *before*
     // spawning the runtime thread so a stable public key is reused across
@@ -236,6 +280,8 @@ pub fn start(
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
     let peer_health: HealthMap = Arc::new(Mutex::new(HashMap::new()));
     let loop_health = Arc::clone(&peer_health);
+    let connections: ConnectionMap = Arc::new(Mutex::new(HashMap::new()));
+    let loop_connections = Arc::clone(&connections);
 
     thread::Builder::new()
         .name("mykvm-quic-transport".into())
@@ -253,15 +299,20 @@ pub fn start(
                 }
             };
 
-            runtime.block_on(run_transport(
+            let shutdown_ack = runtime.block_on(run_transport(
                 preferred_port,
                 identity,
                 command_rx,
                 on_datagram,
                 on_stream,
                 loop_health,
+                loop_connections,
                 ready_tx,
             ));
+            drop(runtime);
+            if let Some(ack) = shutdown_ack {
+                let _ = ack.send(());
+            }
         })
         .map_err(|error| format!("failed to spawn QUIC transport thread: {error}"))?;
 
@@ -274,6 +325,7 @@ pub fn start(
         port: ready.port,
         public_key: ready.public_key,
         peer_health,
+        connections,
     })
 }
 
@@ -296,15 +348,16 @@ async fn run_transport(
     identity: TransportIdentity,
     mut commands: tokio_mpsc::UnboundedReceiver<TransportCommand>,
     on_datagram: DatagramHandler,
-    on_stream: StreamHandler,
+    on_stream: Option<StreamHandler>,
     health: HealthMap,
+    connections: ConnectionMap,
     ready_tx: mpsc::Sender<Result<ReadyTransport, String>>,
-) {
+) -> Option<mpsc::Sender<()>> {
     let (endpoint, public_key) = match bind_endpoint(preferred_port, &identity) {
         Ok(bound) => bound,
         Err(error) => {
             let _ = ready_tx.send(Err(error));
-            return;
+            return None;
         }
     };
 
@@ -312,7 +365,7 @@ async fn run_transport(
         Ok(addr) => addr.port(),
         Err(error) => {
             let _ = ready_tx.send(Err(format!("failed to read QUIC port: {error}")));
-            return;
+            return None;
         }
     };
 
@@ -324,8 +377,8 @@ async fn run_transport(
     // datagram behind it (the "periodic input freeze + warn every 4s" bug).
     // Datagrams go out synchronously on established connections; connection
     // establishment and stream sends run in spawned tasks.
-    let connections: ConnectionMap = Arc::new(Mutex::new(HashMap::new()));
     let stream_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
+    let mut shutdown_ack = None;
     while let Some(command) = commands.recv().await {
         match command {
             TransportCommand::SendDatagram { peer, payload } => {
@@ -346,8 +399,12 @@ async fn run_transport(
                 let connections = Arc::clone(&connections);
                 let health = Arc::clone(&health);
                 tokio::spawn(async move {
-                    let outcome =
-                        send_stream_task(&endpoint, &connections, &health, peer, payload).await;
+                    // Cancel stalled writes too, not just the caller's wait for
+                    // an answer, so timed-out transfers release their buffers.
+                    let outcome = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        send_stream_task(&endpoint, &connections, &health, peer, payload),
+                    ).await.unwrap_or_else(|_| Err("QUIC stream send timed out".into()));
                     if let Err(error) = &outcome {
                         log::warn!("QUIC stream send failed: {error}");
                     }
@@ -355,12 +412,16 @@ async fn run_transport(
                     drop(permit);
                 });
             }
-            TransportCommand::Shutdown => break,
+            TransportCommand::Shutdown { ack } => {
+                shutdown_ack = Some(ack);
+                break;
+            }
         }
     }
 
     endpoint.close(0_u32.into(), b"shutdown");
     endpoint.wait_idle().await;
+    shutdown_ack
 }
 
 fn bind_endpoint(
@@ -619,18 +680,26 @@ fn client_config(peer: &PeerEndpoint) -> Result<ClientConfig, String> {
     Ok(config)
 }
 
-fn spawn_accept_loop(endpoint: Endpoint, on_datagram: DatagramHandler, on_stream: StreamHandler) {
+fn spawn_accept_loop(
+    endpoint: Endpoint,
+    on_datagram: DatagramHandler,
+    on_stream: Option<StreamHandler>,
+) {
+    let stream_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let remote = incoming.remote_address();
             let on_datagram = Arc::clone(&on_datagram);
-            let on_stream = Arc::clone(&on_stream);
+            let on_stream = on_stream.clone();
+            let stream_slots = Arc::clone(&stream_slots);
 
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(connection) => {
                         spawn_datagram_reader(connection.clone(), remote, on_datagram);
-                        spawn_stream_reader(connection, remote, on_stream);
+                        if let Some(on_stream) = on_stream {
+                            spawn_stream_reader(connection, remote, on_stream, stream_slots);
+                        }
                     }
                     Err(error) => {
                         log::warn!("QUIC incoming connection failed from {remote}: {error}");
@@ -649,7 +718,11 @@ fn spawn_datagram_reader(
     tokio::spawn(async move {
         loop {
             match connection.read_datagram().await {
-                Ok(payload) => on_datagram(payload.to_vec(), remote),
+                // Native input injection can block on the desktop or main queue.
+                // Keep per-connection ordering without occupying a QUIC worker.
+                Ok(payload) => {
+                    tokio::task::block_in_place(|| on_datagram(payload.to_vec(), remote))
+                }
                 Err(error) => {
                     log::debug!("QUIC datagram reader stopped for {remote}: {error}");
                     break;
@@ -663,16 +736,27 @@ fn spawn_stream_reader(
     connection: quinn::Connection,
     remote: SocketAddr,
     on_stream: StreamHandler,
+    stream_slots: Arc<tokio::sync::Semaphore>,
 ) {
     tokio::spawn(async move {
         loop {
             match connection.accept_bi().await {
                 Ok((mut send, mut recv)) => {
+                    let Ok(permit) = Arc::clone(&stream_slots).try_acquire_owned() else {
+                        let _ = recv.stop(0_u32.into());
+                        let _ = send.reset(0_u32.into());
+                        continue;
+                    };
                     let on_stream = Arc::clone(&on_stream);
                     tokio::spawn(async move {
-                        match recv.read_to_end(MAX_STREAM_BYTES).await {
+                        let payload = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(MAX_STREAM_BYTES))
+                            .await.map_err(|error| error.to_string())
+                            .and_then(|result| result.map_err(|error| error.to_string()));
+                        match payload {
                             Ok(payload) => {
-                                let accepted = on_stream(payload, remote);
+                                // Clipboard tools, image decoding and file writes are blocking.
+                                let accepted =
+                                    tokio::task::block_in_place(|| on_stream(payload, remote));
                                 let ack: &[u8] = if accepted { b"ok" } else { b"reject" };
                                 let _ = send.write_all(ack).await;
                                 let _ = send.finish();
@@ -681,6 +765,7 @@ fn spawn_stream_reader(
                                 log::warn!("QUIC stream read failed from {remote}: {error}");
                             }
                         }
+                        drop(permit);
                     });
                 }
                 Err(error) => {
@@ -694,9 +779,8 @@ fn spawn_stream_reader(
 
 /// Datagram send that never awaits: an established connection queues the
 /// payload synchronously (quinn's `send_datagram` is not async); a missing or
-/// dead connection drops this payload and kicks off a background connect —
-/// input datagrams are latest-wins, the next move follows within ~8ms, and
-/// `warm_quic_peer` keeps connections pre-established outside crossings.
+/// dead connection kicks off a background connect. The caller receives false
+/// during warmup and does not enter remote control until the peer is ready.
 fn send_datagram_nonblocking(
     endpoint: &Endpoint,
     connections: &ConnectionMap,
@@ -868,6 +952,7 @@ async fn establish_connection(
 fn peer_key(peer: &PeerEndpoint) -> Result<PeerKey, String> {
     Ok(PeerKey {
         addr: resolve_peer_addr(&peer.addr)?,
+        requested_addr: peer.addr.clone(),
         public_key: peer.public_key.clone(),
     })
 }
@@ -1002,6 +1087,120 @@ mod tests {
         assert_eq!(first.key_der, second.key_der);
         assert!(!first.public_key.is_empty());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn input_survives_slow_streams_and_idle_periods() {
+        let free_port = || {
+            std::net::UdpSocket::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let port = free_port();
+        let dir =
+            std::env::temp_dir().join(format!("mykvm-stream-input-{}-{port}", std::process::id()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (input_tx, input_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate = Arc::clone(&release);
+        let receiver = start(
+            port,
+            dir.join("receiver"),
+            Arc::new(move |payload, _| {
+                let _ = input_tx.send(payload);
+            }),
+            Arc::new(move |_, _| {
+                let _ = entered_tx.send(());
+                let _ = gate.1.wait_timeout_while(
+                    gate.0.lock().unwrap(),
+                    Duration::from_secs(5),
+                    |released| !*released,
+                );
+                true
+            }),
+        )
+        .unwrap();
+        let sender = start(
+            free_port(),
+            dir.join("sender"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .unwrap();
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            PROTOCOL_VERSION,
+        );
+        assert!(!sender
+            .send_datagram(peer.clone(), b"warm".to_vec())
+            .unwrap());
+        let sends: Vec<_> = (0..QUIC_WORKER_THREADS)
+            .map(|_| {
+                let sender = sender.clone();
+                let peer = peer.clone();
+                thread::spawn(move || sender.send_stream_expect_ack(peer, b"clipboard".to_vec()))
+            })
+            .collect();
+        let all_entered = (0..QUIC_WORKER_THREADS)
+            .all(|_| entered_rx.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(sender
+            .send_datagram(peer.clone(), b"input".to_vec())
+            .unwrap());
+        let input = input_rx.recv_timeout(Duration::from_millis(300));
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        for send in sends {
+            let _ = send.join().unwrap();
+        }
+        // Longer than the configured 10-second idle timeout: keepalive must
+        // preserve a ready connection without a fresh handshake on input.
+        thread::sleep(Duration::from_secs(11));
+        let ready_after_idle = sender.send_datagram(peer.clone(), b"after-idle".to_vec());
+        let after_idle = input_rx.recv_timeout(Duration::from_millis(300));
+        sender.stop_and_wait().unwrap();
+        receiver.stop_and_wait().unwrap();
+        let _ = fs::remove_dir_all(dir);
+        assert!(
+            all_entered,
+            "both blocking clipboard handlers must be running"
+        );
+        assert_eq!(
+            input.unwrap(),
+            b"input",
+            "input must arrive while stream handlers are blocked"
+        );
+        assert!(ready_after_idle.unwrap());
+        assert_eq!(after_idle.unwrap(), b"after-idle");
+    }
+
+    #[test]
+    fn stop_and_wait_releases_udp_port_before_returning() {
+        let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("reserve test port");
+        let port = probe.local_addr().expect("test port address").port();
+        drop(probe);
+        let dir = std::env::temp_dir().join(format!(
+            "mykvm-quic-shutdown-test-{}-{port}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let handle = start(
+            port,
+            dir.clone(),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .expect("start transport");
+        let bound_port = handle.port();
+        handle.stop_and_wait().expect("stop transport");
+
+        let rebound = std::net::UdpSocket::bind(("0.0.0.0", bound_port))
+            .expect("shutdown ack must wait for the UDP port to be released");
+        drop(rebound);
         let _ = fs::remove_dir_all(&dir);
     }
 }

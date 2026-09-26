@@ -38,7 +38,15 @@ impl ClipboardContent {
             ClipboardContent::Text(text) => text.len() > CLIPBOARD_MAX_TEXT_BYTES,
             ClipboardContent::Image(image) => {
                 // base64 inflates ~4/3; compare against the decoded RGBA budget.
-                image.rgba_base64.len() / 4 * 3 > CLIPBOARD_MAX_IMAGE_BYTES
+                let padding = image
+                    .rgba_base64
+                    .bytes()
+                    .rev()
+                    .take(2)
+                    .take_while(|byte| *byte == b'=')
+                    .count();
+                (image.rgba_base64.len() / 4 * 3).saturating_sub(padding)
+                    > CLIPBOARD_MAX_IMAGE_BYTES
             }
         }
     }
@@ -81,6 +89,23 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
 /// read instead of falling back to stale text from a previous clipboard format.
 pub(crate) fn read_content() -> Option<ClipboardContent> {
     read_content_for_hint(content_hint(), read_text_content, read_image_content)
+}
+
+pub(crate) fn change_count() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::input::macos_appkit::clipboard_change_count()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let sequence =
+            unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        (sequence != 0).then_some(u64::from(sequence))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 fn read_content_for_hint<F, G>(
@@ -131,6 +156,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_budget_accounts_for_base64_padding() {
+        let encoded_len = CLIPBOARD_MAX_IMAGE_BYTES.div_ceil(3) * 4;
+        let mut image = ClipboardImage {
+            width: 8192,
+            height: 1024,
+            rgba_base64: "A".repeat(encoded_len - 1) + "=",
+        };
+        assert!(!ClipboardContent::Image(image.clone()).is_oversized());
+        image.rgba_base64.replace_range(encoded_len - 1.., "A");
+        assert!(ClipboardContent::Image(image).is_oversized());
+    }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
@@ -228,7 +266,11 @@ fn write_image(image: &ClipboardImage) -> Result<(), String> {
         .map_err(|error| format!("failed to decode clipboard image: {error}"))?;
     let width = image.width as usize;
     let height = image.height as usize;
-    if width == 0 || height == 0 || bytes.len() != width.saturating_mul(height).saturating_mul(4) {
+    if width == 0
+        || height == 0
+        || bytes.len() > CLIPBOARD_MAX_IMAGE_BYTES
+        || bytes.len() != width.saturating_mul(height).saturating_mul(4)
+    {
         return Err("clipboard image has invalid dimensions".into());
     }
 

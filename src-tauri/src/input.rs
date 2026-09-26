@@ -111,6 +111,8 @@ const INPUT_FULL_CRED_REFRESH: Duration = Duration::from_secs(2);
 /// between. A peer that never proved the pairing secret from this address
 /// never gets an entry, so credential-less packets from it are always rejected.
 const INPUT_ORIGIN_CACHE_TTL: Duration = Duration::from_secs(5);
+pub(crate) const NATIVE_INPUT_SUPPORTED: bool =
+    cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// True when a full-credential input packet is due for a destination whose last
 /// credentialled send was `last_sent` (or never). Pure half of
@@ -729,6 +731,12 @@ pub fn input_runtime_status(
 
 fn input_receive_status(layout: &LayoutState, request_permission: bool) -> NativeStageStatus {
     let _ = request_permission;
+    if !NATIVE_INPUT_SUPPORTED {
+        return NativeStageStatus {
+            state: "stubbed".into(),
+            detail: "Input capture and injection are not implemented for Linux X11/Wayland. Network pairing alone does not enable keyboard or mouse sharing.".into(),
+        };
+    }
 
     #[cfg(target_os = "macos")]
     if !macos_accessibility_trusted(request_permission) {
@@ -964,14 +972,8 @@ fn start_platform_capture(
         }
         tap.enable();
         let _ = ready_tx.send(Ok(()));
-        let mut app_nap_suppressed = false;
-
         while !stop.load(Ordering::Relaxed) {
             let was_remote_active = context.remote_active.load(Ordering::Relaxed);
-            if app_nap_suppressed != was_remote_active {
-                set_macos_app_nap_suppressed(was_remote_active);
-                app_nap_suppressed = was_remote_active;
-            }
             let _ = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },
                 Duration::from_millis(macos_capture_loop_ms(
@@ -997,10 +999,6 @@ fn start_platform_capture(
             // making the server pointer reappear and follow the mouse.
             // Re-pin it to the anchor and re-assert hide while active.
             let is_remote_active = context.remote_active.load(Ordering::Relaxed);
-            if app_nap_suppressed != is_remote_active {
-                set_macos_app_nap_suppressed(is_remote_active);
-                app_nap_suppressed = is_remote_active;
-            }
             if is_remote_active {
                 repin_macos_cursor_while_remote(&context);
             }
@@ -1008,12 +1006,17 @@ fn start_platform_capture(
 
         // Critical safety: never leave the cursor decoupled after capture stops,
         // otherwise the user's mouse stays frozen until the app restarts.
+        let active = context
+            .active
+            .lock()
+            .ok()
+            .and_then(|mut active| active.take());
+        if let Some(active) = active {
+            release_held_remote_inputs_macos(&context, &active.target);
+        }
         set_macos_cursor_decoupled(false);
         set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
         show_macos_cursor_if_needed(&context);
-        if app_nap_suppressed {
-            set_macos_app_nap_suppressed(false);
-        }
         context.remote_active.store(false, Ordering::Relaxed);
         clear_clipboard_target(&context.clipboard_target);
         clear_pending_edge_drop(&context);
@@ -1485,11 +1488,21 @@ fn send_packet(
         }
     };
 
-    match quic_transport.send_datagram(peer, payload) {
-        Ok(()) => {
+    let peer_addr = peer.addr.clone();
+    let result = quic_transport.send_datagram(peer, payload);
+    if !matches!(result, Ok(true)) {
+        // The next attempt must carry credentials if this one only warmed the
+        // connection; otherwise a restarted peer rejects input for two seconds.
+        if let Ok(mut tracker) = input_full_cred_tracker().lock() {
+            tracker.remove(&peer_addr);
+        }
+    }
+    match result {
+        Ok(true) => {
             input_events.fetch_add(1, Ordering::Relaxed);
             true
         }
+        Ok(false) => false,
         Err(error) => {
             mark_target_offline(layout_state, target, &error);
             false
@@ -1545,7 +1558,13 @@ pub fn send_secure_attention_control(
         target.protocol_version,
     );
 
-    quic_transport.send_datagram(peer, payload)
+    quic_transport
+        .send_datagram(peer, payload)
+        .and_then(|sent| {
+            sent.then_some(()).ok_or_else(|| {
+                "QUIC peer is reconnecting; retry the control command once connected.".into()
+            })
+        })
 }
 
 struct InputPacketContext {
@@ -1734,11 +1753,34 @@ fn mark_target_offline(
 ///   other hot path contends on
 pub fn handle_input_datagram(
     layout_state: &Arc<Mutex<LayoutState>>,
-    native_layout: &LayoutState,
+    native_layout: &Arc<Mutex<LayoutState>>,
     payload: &[u8],
     source: SocketAddr,
     input_events: &Arc<AtomicU64>,
     clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
+) -> bool {
+    handle_input_datagram_with_sink(
+        layout_state,
+        native_layout,
+        payload,
+        source,
+        input_events,
+        clipboard_target,
+        &dispatch_input_command,
+    )
+}
+
+/// Decodes and authorizes one input-plane datagram, then hands the mapped
+/// native command to the supplied sink. The headless Windows receiver uses a
+/// helper-only sink while the GUI keeps the existing desktop-aware dispatcher.
+pub(crate) fn handle_input_datagram_with_sink(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    native_layout: &Arc<Mutex<LayoutState>>,
+    payload: &[u8],
+    source: SocketAddr,
+    input_events: &Arc<AtomicU64>,
+    clipboard_target: &Arc<Mutex<Option<ClipboardTarget>>>,
+    sink: &dyn Fn(InputCommand) -> bool,
 ) -> bool {
     if let Some(packet) = decode_input_packet(payload) {
         if packet.protocol != INPUT_PROTOCOL {
@@ -1770,12 +1812,15 @@ pub fn handle_input_datagram(
             // No-op for credential-less packets (empty key); the clipboard
             // target was set by the last credentialled packet and persists.
             refresh_clipboard_target(clipboard_target, &layout, &packet, source);
-            input_event_to_command(&layout, native_layout, packet.event)
+            let Ok(native_layout) = native_layout.lock() else {
+                return false;
+            };
+            input_event_to_command(&layout, &native_layout, packet.event)
         };
         let Some(command) = command else {
             return true;
         };
-        if dispatch_input_command(command) {
+        if sink(command) {
             input_events.fetch_add(1, Ordering::Relaxed);
         }
         return true;
@@ -1786,7 +1831,7 @@ pub fn handle_input_datagram(
             return false;
         };
         let local_peer_id = cached_local_peer_id(&layout);
-        return handle_control_packet(&layout, packet, source, &local_peer_id);
+        return handle_control_packet(&layout, packet, source, &local_peer_id, sink);
     }
 
     false
@@ -1859,6 +1904,7 @@ fn handle_control_packet(
     packet: InputControlPacket,
     source: SocketAddr,
     local_peer_id: &str,
+    sink: &dyn Fn(InputCommand) -> bool,
 ) -> bool {
     if packet.protocol != INPUT_CONTROL_PROTOCOL {
         return false;
@@ -1876,19 +1922,21 @@ fn handle_control_packet(
     match packet.command {
         InputControlCommand::SecureAttention => {
             #[cfg(target_os = "windows")]
-            if let Err(error) = send_secure_attention_to_helper() {
+            if !sink(InputCommand::SecureAttention) {
                 log::warn!(
-                    "SecureAttention control from {} could not reach input service: {}",
-                    source,
-                    error
+                    "SecureAttention control from {} could not reach input service",
+                    source
                 );
             }
 
             #[cfg(not(target_os = "windows"))]
-            log::warn!(
-                "SecureAttention control from {} ignored on non-Windows target",
-                source
-            );
+            {
+                let _ = sink(InputCommand::SecureAttention);
+                log::warn!(
+                    "SecureAttention control from {} ignored on non-Windows target",
+                    source
+                );
+            }
         }
     }
 
@@ -2146,6 +2194,9 @@ fn update_remote_mouse_button(button: MouseButton, down: bool) -> (i32, i32) {
 fn dispatch_input_command(command: InputCommand) -> bool {
     #[cfg(target_os = "windows")]
     {
+        if matches!(command, InputCommand::SecureAttention) {
+            return dispatch_input_command_to_windows_helper(command);
+        }
         // Inject locally on the normal desktop; hand off to the privileged SYSTEM
         // helper only for the secure desktop (lock screen / UAC) or Ctrl+Alt+Del.
         //
@@ -2177,6 +2228,35 @@ fn dispatch_input_command(command: InputCommand) -> bool {
     }
 }
 
+/// Headless Windows command sink: always targets the active console-session
+/// helper pipe and never falls back to local desktop injection.
+#[cfg(target_os = "windows")]
+pub(crate) fn dispatch_input_command_to_windows_helper(command: InputCommand) -> bool {
+    match windows_pipe_dispatcher().send(&command) {
+        Ok(()) => true,
+        Err(error) => {
+            note_windows_helper_unavailable(&error);
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn dispatch_input_command_to_windows_helper(_command: InputCommand) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn close_windows_input_helper_pipe() {
+    *windows_pipe_dispatcher()
+        .pipe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn close_windows_input_helper_pipe() {}
+
 /// Logs (at most once every 10s, since a single mouse move floods many packets)
 /// that the privileged input helper could not be reached, so injection fell back
 /// to the user-mode path. On the normal desktop the local fallback works; on the
@@ -2193,9 +2273,9 @@ fn note_windows_helper_unavailable(error: &str) {
         *last = Instant::now();
     }
     log::info!(
-        "input helper unavailable ({error}); injecting locally. Lock-screen / UAC \
-         input needs the MyKVM input service — install it from Settings if clicks \
-         and keys stop working while the screen is locked."
+        "input helper unavailable ({error}); lock-screen / UAC input needs the \
+         MyKVM input service — repair it from Settings if clicks and keys stop \
+         working while the screen is locked."
     );
 }
 
@@ -2281,22 +2361,12 @@ fn windows_pipe_dispatcher() -> &'static WindowsInputDispatcher {
 
 #[cfg(target_os = "windows")]
 pub fn windows_input_pipe_available() -> bool {
-    open_current_session_input_pipe().is_ok()
+    windows_pipe_dispatcher().is_available()
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn windows_input_pipe_available() -> bool {
     false
-}
-
-#[cfg(target_os = "windows")]
-pub fn send_secure_attention_to_helper() -> Result<(), String> {
-    windows_pipe_dispatcher().send(&InputCommand::SecureAttention)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn send_secure_attention_to_helper() -> Result<(), String> {
-    Err("Secure Attention Sequence is only available through the Windows input service.".into())
 }
 
 #[cfg(target_os = "windows")]
@@ -2337,6 +2407,21 @@ impl WindowsInputDispatcher {
         }
 
         Ok(())
+    }
+
+    fn is_available(&self) -> bool {
+        let Ok(mut pipe) = self.pipe.lock() else {
+            return false;
+        };
+        if pipe.as_ref().is_some_and(windows_input_pipe_alive) {
+            return true;
+        }
+        *pipe = None;
+        let Ok(opened) = self.open_pipe_with_backoff() else {
+            return false;
+        };
+        *pipe = Some(opened);
+        true
     }
 
     fn open_pipe_with_backoff(&self) -> Result<std::fs::File, String> {
@@ -2386,12 +2471,34 @@ fn open_current_session_input_pipe() -> Result<std::fs::File, String> {
     let mut errors = Vec::new();
     for session_id in candidates {
         let pipe_name = crate::shared_input::input_pipe_name(session_id);
-        match OpenOptions::new().write(true).open(&pipe_name) {
+        match OpenOptions::new().read(true).write(true).open(&pipe_name) {
             Ok(pipe) => return Ok(pipe),
-            Err(error) => errors.push(format!("open input helper pipe {pipe_name}: {error}")),
+            Err(duplex_error) => match OpenOptions::new().write(true).open(&pipe_name) {
+                Ok(pipe) => return Ok(pipe),
+                Err(write_error) => errors.push(format!(
+                    "open input helper pipe {pipe_name}: duplex={duplex_error}; write={write_error}"
+                )),
+            },
         }
     }
     Err(errors.join("; "))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_pipe_alive(pipe: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    unsafe {
+        PeekNamedPipe(
+            pipe.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -4282,7 +4389,7 @@ pub fn receiver_handoff_drag(controller_device_id: String) {
 /// AppKit calls without one from a non-main thread leak autoreleased objects
 /// and eventually crash (see the clipboard SIGSEGV history).
 #[cfg(target_os = "macos")]
-mod macos_appkit {
+pub(crate) mod macos_appkit {
     use std::ffi::{c_void, CStr, CString};
     use std::os::raw::c_char;
     use std::path::PathBuf;
@@ -4359,6 +4466,18 @@ mod macos_appkit {
             return std::ptr::null_mut();
         }
         msg_obj1(class, sel(b"pasteboardWithName:\0"), name)
+    }
+
+    pub fn clipboard_change_count() -> Option<u64> {
+        unsafe {
+            let _pool = PoolGuard(objc_autoreleasePoolPush());
+            let class = objc_getClass(b"NSPasteboard\0".as_ptr() as *const c_char);
+            let pasteboard = msg_obj(class, sel(b"generalPasteboard\0"));
+            if pasteboard.is_null() {
+                return None;
+            }
+            u64::try_from(msg_i64(pasteboard, sel(b"changeCount\0"))).ok()
+        }
     }
 
     pub fn change_count() -> i64 {
@@ -5271,27 +5390,20 @@ fn set_macos_warp_suppression_interval(seconds: f64) {
     }
 }
 
-/// Opt the process out of macOS App Nap while input is being captured.
-///
-/// When MyKVM is not the frontmost app (another window is focused) or the
-/// window is minimized, macOS throttles our background capture thread's run
-/// loop and coalesces its timers. That throttling is exactly what makes the
-/// cursor "stutter" when it slides back from a remote device: forwarded events
-/// and cursor re-pinning fall behind, then catch up in a burst at the edge.
-///
-/// `NSProcessInfo -beginActivityWithOptions:reason:` with a latency-critical,
-/// user-initiated activity tells the OS to keep us scheduled normally. We hold
-/// the returned (retained) activity token for the whole capture lifetime and
-/// end it on teardown. The option set still allows the machine to idle-sleep.
+/// Keep the active sharing session responsive when its window is hidden,
+/// including receive-only clients and the first crossing after an idle period.
+/// The runtime owns this activity; stopping sharing ends it. System sleep is allowed.
 #[cfg(target_os = "macos")]
-fn set_macos_app_nap_suppressed(suppress: bool) {
+pub(crate) fn set_macos_app_nap_suppressed(suppress: bool) {
     use std::ffi::c_void;
     use std::os::raw::c_char;
-    use std::sync::atomic::AtomicUsize;
 
     // Retained NSProcessInfo activity token (as usize) held between begin/end.
     // 0 means "no activity currently held".
-    static ACTIVITY_TOKEN: AtomicUsize = AtomicUsize::new(0);
+    static ACTIVITY_TOKEN: Mutex<usize> = Mutex::new(0);
+    let Ok(mut activity_token) = ACTIVITY_TOKEN.lock() else {
+        return;
+    };
 
     #[link(name = "objc")]
     extern "C" {
@@ -5302,9 +5414,7 @@ fn set_macos_app_nap_suppressed(suppress: bool) {
 
     // NSActivityOptions, from <Foundation/NSProcessInfo.h>:
     //   NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00EFFFFF
-    //   NSActivityLatencyCritical                      = 0xFF00000000
     const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 = 0x00EF_FFFF;
-    const NS_ACTIVITY_LATENCY_CRITICAL: u64 = 0xFF_0000_0000;
 
     unsafe {
         let process_info_class = objc_getClass(b"NSProcessInfo\0".as_ptr() as *const c_char);
@@ -5320,7 +5430,7 @@ fn set_macos_app_nap_suppressed(suppress: bool) {
         }
 
         if suppress {
-            if ACTIVITY_TOKEN.load(Ordering::Relaxed) != 0 {
+            if *activity_token != 0 {
                 return; // already suppressing
             }
             let string_class = objc_getClass(b"NSString\0".as_ptr() as *const c_char);
@@ -5337,8 +5447,7 @@ fn set_macos_app_nap_suppressed(suppress: bool) {
                 sel_registerName(b"beginActivityWithOptions:reason:\0".as_ptr() as *const c_char);
             let begin: extern "C" fn(*mut c_void, *mut c_void, u64, *mut c_void) -> *mut c_void =
                 std::mem::transmute(objc_msgSend as *const ());
-            let options = NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP
-                | NS_ACTIVITY_LATENCY_CRITICAL;
+            let options = NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP;
             let activity = begin(process_info, begin_sel, options, reason);
             if activity.is_null() {
                 return;
@@ -5349,9 +5458,9 @@ fn set_macos_app_nap_suppressed(suppress: bool) {
             let retain: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
                 std::mem::transmute(objc_msgSend as *const ());
             let retained = retain(activity, retain_sel);
-            ACTIVITY_TOKEN.store(retained as usize, Ordering::Relaxed);
+            *activity_token = retained as usize;
         } else {
-            let token = ACTIVITY_TOKEN.swap(0, Ordering::Relaxed);
+            let token = std::mem::take(&mut *activity_token);
             if token == 0 {
                 return;
             }
@@ -8179,6 +8288,126 @@ mod tests {
                 drag_button: None,
             }
         );
+    }
+
+    #[test]
+    fn input_sink_uses_refreshed_native_coordinates_without_holding_layout_locks() {
+        let mut layout = layout_for_target_tests();
+        layout.machine_role = "client".into();
+        layout.devices[0].screens[0].width = 1920;
+        layout.devices[0].screens[0].height = 1080;
+        layout.devices[0].screens[0].scale = 1.0;
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "192.0.2.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let payload = rmp_serde::to_vec_named(&InputPacket {
+            protocol: INPUT_PROTOCOL.into(),
+            target_device_id: "local-device".into(),
+            origin_device_id: "server".into(),
+            origin_port: 47834,
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            event: InputEvent::MouseMove {
+                screen_id: layout.devices[0].screens[0].id.clone(),
+                x: 100,
+                y: 200,
+            },
+        })
+        .unwrap();
+        let native = Arc::new(Mutex::new(layout.clone()));
+        let layout = Arc::new(Mutex::new(layout));
+        let events = Arc::new(AtomicU64::new(0));
+        let target = Arc::new(Mutex::new(None));
+        for offset in [0, 1920] {
+            native.lock().unwrap().devices[0].screens[0].x = offset;
+            assert!(handle_input_datagram_with_sink(
+                &layout,
+                &native,
+                &payload,
+                "192.0.2.1:47834".parse().unwrap(),
+                &events,
+                &target,
+                &|command| {
+                    assert!(layout.try_lock().is_ok());
+                    assert!(native.try_lock().is_ok());
+                    assert!(
+                        matches!(command, InputCommand::MouseMove { x, .. } if x == offset + 100)
+                    );
+                    true
+                },
+            ));
+        }
+        assert_eq!(events.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn unsupported_platform_never_reports_input_injection_ready() {
+        assert_eq!(
+            input_receive_status(&layout_for_target_tests(), false).state,
+            "stubbed"
+        );
+    }
+
+    #[test]
+    fn secure_attention_control_uses_command_sink() {
+        let mut layout = layout_for_target_tests();
+        layout.machine_role = "client".into();
+        layout.paired_controllers = vec![crate::PairedController {
+            id: "server".into(),
+            name: "Server".into(),
+            host: "server".into(),
+            ip: "10.0.0.1".into(),
+            transport_public_key: "server-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let layout_state = Arc::new(Mutex::new(layout.clone()));
+        let input_events = Arc::new(AtomicU64::new(0));
+        let clipboard_target = Arc::new(Mutex::new(None));
+        let commands = Mutex::new(Vec::new());
+        let sink = |command| {
+            commands.lock().expect("command sink lock").push(command);
+            true
+        };
+        let source = "10.0.0.1:47834".parse().expect("source address");
+
+        let control_payload = rmp_serde::to_vec_named(&InputControlPacket {
+            protocol: INPUT_CONTROL_PROTOCOL.into(),
+            target_device_id: "local-device".into(),
+            origin_device_id: "server".into(),
+            origin_transport_public_key: "server-key".into(),
+            origin_protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: layout.cluster_id.clone(),
+            pair_secret: layout.pair_secret.clone(),
+            command: InputControlCommand::SecureAttention,
+        })
+        .expect("encode input control packet");
+        assert!(handle_input_datagram_with_sink(
+            &layout_state,
+            &Arc::new(Mutex::new(layout)),
+            &control_payload,
+            source,
+            &input_events,
+            &clipboard_target,
+            &sink,
+        ));
+
+        assert_eq!(
+            *commands.lock().expect("command sink lock"),
+            vec![InputCommand::SecureAttention]
+        );
+        assert_eq!(input_events.load(Ordering::Relaxed), 0);
     }
 
     #[test]

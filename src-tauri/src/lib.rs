@@ -23,6 +23,8 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
+#[cfg(target_os = "windows")]
+pub mod headless_client;
 mod input;
 mod performance;
 mod quic_transport;
@@ -569,7 +571,7 @@ struct FileTransferPacket {
 struct AppRuntime {
     app_handle: AppHandle,
     layout: Arc<Mutex<LayoutState>>,
-    native_layout: Mutex<LayoutState>,
+    native_layout: Arc<Mutex<LayoutState>>,
     runtime: Mutex<RuntimeStatus>,
     peers: Arc<Mutex<Vec<LanPeer>>>,
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
@@ -597,17 +599,20 @@ struct AppRuntime {
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
     config_path: PathBuf,
+    #[cfg(target_os = "windows")]
+    input_service_network_lease: Mutex<Option<std::fs::File>>,
 }
 
 impl AppRuntime {
-    fn new(app_handle: AppHandle, config_path: PathBuf, detected_layout: LayoutState) -> Self {
+    fn new(app_handle: AppHandle, config_path: PathBuf, mut detected_layout: LayoutState) -> Self {
         let layout = load_layout_from_disk(&config_path)
             .map(|saved_layout| normalize_saved_layout(saved_layout, detected_layout.clone()))
             .unwrap_or_else(|| detected_layout.clone());
+        align_native_screen_ids(&mut detected_layout, &layout);
         Self {
             app_handle,
             layout: Arc::new(Mutex::new(layout)),
-            native_layout: Mutex::new(detected_layout.clone()),
+            native_layout: Arc::new(Mutex::new(detected_layout.clone())),
             runtime: Mutex::new(default_runtime(&detected_layout)),
             peers: Arc::new(Mutex::new(Vec::new())),
             pairing_challenge: Arc::new(Mutex::new(None)),
@@ -635,6 +640,8 @@ impl AppRuntime {
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
             config_path,
+            #[cfg(target_os = "windows")]
+            input_service_network_lease: Mutex::new(None),
         }
     }
 
@@ -776,7 +783,7 @@ impl AppRuntime {
         let layout_for_input = Arc::clone(&self.layout);
         let layout_for_clipboard = Arc::clone(&self.layout);
         let layout_for_pairing = Arc::clone(&self.layout);
-        let native_layout_for_input = self.native_layout();
+        let native_layout_for_input = Arc::clone(&self.native_layout);
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let clipboard_receive_enabled = Arc::clone(&self.clipboard_receive_enabled);
         let clipboard_seen_text = Arc::clone(&self.clipboard_seen_text);
@@ -886,6 +893,9 @@ impl AppRuntime {
     }
 
     fn start_discovery(&self) -> Result<(), String> {
+        #[cfg(target_os = "windows")]
+        let _ = self.acquire_input_service_network_lease()?;
+
         let mut discovery_stop = self
             .discovery_stop
             .lock()
@@ -1066,7 +1076,19 @@ impl AppRuntime {
                             if peer_visible_to_layout(&current_layout, &incoming.peer) {
                                 merge_peer(&peers, incoming.peer.clone());
                                 sync_layout_peer_presence(&layout_state, &peers);
-                                warm_quic_peer(&quic_transport, &incoming.peer);
+                                let fixed = current_layout.devices.iter().find(|device| {
+                                    device.source == "manual"
+                                        && device_matches_peer(
+                                            device,
+                                            &incoming.peer,
+                                            &current_layout.cluster_id,
+                                        )
+                                });
+                                if fixed
+                                    .is_none_or(|device| same_host(&device.host, &incoming.peer.ip))
+                                {
+                                    warm_quic_peer(&quic_transport, &incoming.peer);
+                                }
                             }
 
                             if matches!(incoming.kind.as_str(), "announce" | "probe") {
@@ -1104,10 +1126,58 @@ impl AppRuntime {
         Ok(())
     }
 
+    #[cfg(target_os = "windows")]
+    fn acquire_input_service_network_lease(&self) -> Result<bool, String> {
+        let mut lease = self
+            .input_service_network_lease
+            .lock()
+            .map_err(|_| "input service network lease lock poisoned".to_string())?;
+        if lease
+            .as_ref()
+            .is_some_and(windows_input_service_network_lease_alive)
+        {
+            return Ok(true);
+        }
+        *lease = None;
+
+        if let Some(file) = acquire_windows_input_service_network_lease()? {
+            *lease = Some(file);
+            return Ok(true);
+        }
+
+        let service = query_windows_input_service_status()?;
+        let owns_network = windows_input_service_owns_network_ports()?;
+        if owns_network && !service.running {
+            start_windows_input_service()?;
+            if let Some(file) = acquire_windows_input_service_network_lease()? {
+                *lease = Some(file);
+                return Ok(true);
+            }
+        }
+        if owns_network {
+            return Err(
+                "MyKVM input service is running but its network takeover pipe is unavailable."
+                    .into(),
+            );
+        }
+        Ok(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn release_input_service_network_lease(&self) -> Result<(), String> {
+        self.input_service_network_lease
+            .lock()
+            .map_err(|_| "input service network lease lock poisoned".to_string())?
+            .take();
+        Ok(())
+    }
+
     fn start_input(&self, layout: LayoutState) -> (NativeStageStatus, NativeStageStatus) {
         sync_layout_peer_presence(&self.layout, &self.peers);
-        self.input_receive_enabled
-            .store(layout.input_mode == "receive", Ordering::Relaxed);
+        self.input_receive_enabled.store(
+            layout.input_mode == "receive" && input::NATIVE_INPUT_SUPPORTED,
+            Ordering::Relaxed,
+        );
         let native_layout = self.native_layout();
         let Ok(mut input_stop) = self.input_stop.lock() else {
             return (
@@ -1151,6 +1221,10 @@ impl AppRuntime {
             Arc::clone(&self.screen_switch_request),
         );
         *input_stop = Some(stop);
+        #[cfg(target_os = "macos")]
+        input::set_macos_app_nap_suppressed(
+            statuses.0.state == "ready" || statuses.1.state == "ready",
+        );
         statuses
     }
 
@@ -1254,6 +1328,8 @@ impl AppRuntime {
     }
 
     fn stop_input(&self) {
+        #[cfg(target_os = "macos")]
+        input::set_macos_app_nap_suppressed(false);
         self.input_receive_enabled.store(false, Ordering::Relaxed);
         if let Ok(mut stop) = self.input_stop.lock() {
             if let Some(signal) = stop.take() {
@@ -2072,21 +2148,37 @@ fn read_input_service_status(state: tauri::State<'_, AppRuntime>) -> InputServic
 
 #[tauri::command]
 fn install_input_service(
+    app: AppHandle,
     state: tauri::State<'_, AppRuntime>,
 ) -> Result<InputServiceStatus, String> {
     #[cfg(target_os = "windows")]
     {
+        let previous_service_pid = windows_input_service_process_id()?;
         let helper_path = resolve_input_helper_path()?;
+        let owner_sid = current_windows_user_sid()?;
         let status = if is_windows_process_elevated().unwrap_or(false) {
-            install_windows_input_service(&helper_path)?;
-            start_windows_input_service()?;
-            current_input_service_status()
+            state.release_input_service_network_lease()?;
+            let result: Result<InputServiceStatus, String> = (|| {
+                install_windows_input_service(&helper_path, &state.config_path, &owner_sid)?;
+                start_windows_input_service()?;
+                let _ = state.acquire_input_service_network_lease()?;
+                Ok(current_input_service_status())
+            })();
+            if result.is_err() {
+                let _ = state.acquire_input_service_network_lease();
+            }
+            result?
         } else {
             launch_current_process_as_admin(&[
                 INSTALL_INPUT_SERVICE_ARG.into(),
                 HELPER_PATH_ARG.into(),
                 helper_path.to_string_lossy().into_owned(),
+                shared_input::SERVICE_CONFIG_PATH_ARG.into(),
+                state.config_path.to_string_lossy().into_owned(),
+                shared_input::SERVICE_OWNER_SID_ARG.into(),
+                owner_sid,
             ])?;
+            wait_for_input_service_network_lease_after_restart(app, previous_service_pid);
             InputServiceStatus {
                 detail: "Administrator approval requested to install the input service.".into(),
                 ..current_input_service_status()
@@ -2098,7 +2190,7 @@ fn install_input_service(
 
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = state;
+        let _ = (app, state);
         Err("Windows input service is only available on Windows.".into())
     }
 }
@@ -2110,7 +2202,12 @@ fn uninstall_input_service(
     #[cfg(target_os = "windows")]
     {
         let status = if is_windows_process_elevated().unwrap_or(false) {
-            uninstall_windows_input_service()?;
+            state.release_input_service_network_lease()?;
+            let result = uninstall_windows_input_service();
+            if let Err(error) = result {
+                let _ = state.acquire_input_service_network_lease();
+                return Err(error);
+            }
             current_input_service_status()
         } else {
             launch_current_process_as_admin(&[UNINSTALL_INPUT_SERVICE_ARG.into()])?;
@@ -2134,6 +2231,33 @@ fn update_runtime_input_service_status(state: &AppRuntime, status: &InputService
     if let Ok(mut runtime) = state.runtime.lock() {
         runtime.input_service = status.clone();
     }
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_input_service_network_lease_after_restart(
+    app: AppHandle,
+    previous_service_pid: Option<u32>,
+) {
+    thread::spawn(move || {
+        for _ in 0..240 {
+            let current_service_pid = windows_input_service_process_id().ok().flatten();
+            if current_service_pid.is_none() || current_service_pid == previous_service_pid {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let state = app.state::<AppRuntime>();
+            match state.acquire_input_service_network_lease() {
+                Ok(true) => {
+                    let status = current_input_service_status();
+                    update_runtime_input_service_status(state.inner(), &status);
+                    let runtime = state.runtime_status();
+                    notify_runtime_state_changed(&app, &runtime);
+                    return;
+                }
+                Ok(false) | Err(_) => thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    });
 }
 
 #[tauri::command]
@@ -2532,15 +2656,19 @@ pub fn handle_process_control_args() -> bool {
             let helper_path = arg_value(&args, HELPER_PATH_ARG)
                 .map(PathBuf::from)
                 .or_else(|| resolve_input_helper_path().ok());
-            match helper_path {
-                Some(path) => {
-                    if let Err(error) = install_windows_input_service(&path)
-                        .and_then(|_| start_windows_input_service())
+            let config_path =
+                arg_value(&args, shared_input::SERVICE_CONFIG_PATH_ARG).map(PathBuf::from);
+            let owner_sid = arg_value(&args, shared_input::SERVICE_OWNER_SID_ARG);
+            match (helper_path, config_path, owner_sid) {
+                (Some(path), Some(config_path), Some(owner_sid)) => {
+                    if let Err(error) =
+                        install_windows_input_service(&path, &config_path, &owner_sid)
+                            .and_then(|_| start_windows_input_service())
                     {
                         eprintln!("{error}");
                     }
                 }
-                None => eprintln!("failed to resolve mykvm-input-helper path"),
+                _ => eprintln!("missing input service path, config path, or owner SID"),
             }
             return true;
         }
@@ -2949,27 +3077,14 @@ fn setup_macos_window_visibility_watcher(app: &tauri::App) {
 fn setup_macos_display_watcher(app: &tauri::App) {
     let app_handle = app.handle().clone();
     thread::spawn(move || {
-        let mut last = macos_display_fingerprint();
         loop {
             thread::sleep(Duration::from_millis(1500));
-            let now = macos_display_fingerprint();
-            if now == last {
-                continue;
-            }
-            last = now;
             let handle = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
                 refresh_local_screens(&handle);
             });
         }
     });
-}
-
-#[cfg(target_os = "macos")]
-fn macos_display_fingerprint() -> Vec<u32> {
-    let mut ids = core_graphics::display::CGDisplay::active_displays().unwrap_or_default();
-    ids.sort_unstable();
-    ids
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3565,9 +3680,8 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
         System::{
             RemoteDesktop::WTSGetActiveConsoleSessionId,
             Services::{
-                OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
-                SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-                SERVICE_STATUS_PROCESS,
+                OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+                SERVICE_RUNNING,
             },
         },
     };
@@ -3597,7 +3711,7 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
         }
         let _service = ServiceHandleGuard(service);
 
-        let service_status = query_service_status_process(service)?;
+        let service_status = query_windows_service_status_process(service)?;
         let running = service_status.dwCurrentState == SERVICE_RUNNING;
         let pipe_available = running && input::windows_input_pipe_available();
         let active_session = WTSGetActiveConsoleSessionId();
@@ -3622,35 +3736,218 @@ fn query_windows_input_service_status() -> Result<InputServiceStatus, String> {
             detail: detail.into(),
         });
     }
+}
 
-    unsafe fn query_service_status_process(
-        service: windows_sys::Win32::System::Services::SC_HANDLE,
-    ) -> Result<SERVICE_STATUS_PROCESS, String> {
-        let mut status = SERVICE_STATUS_PROCESS::default();
-        let mut needed = 0_u32;
-        let ok = QueryServiceStatusEx(
-            service,
-            SC_STATUS_PROCESS_INFO,
-            &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
-            std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
-            &mut needed,
-        ) != 0;
-        if ok {
-            Ok(status)
-        } else {
-            Err(windows_last_error("QueryServiceStatusEx"))
+#[cfg(target_os = "windows")]
+unsafe fn query_windows_service_status_process(
+    service: windows_sys::Win32::System::Services::SC_HANDLE,
+) -> Result<windows_sys::Win32::System::Services::SERVICE_STATUS_PROCESS, String> {
+    use windows_sys::Win32::System::Services::{
+        QueryServiceStatusEx, SC_STATUS_PROCESS_INFO, SERVICE_STATUS_PROCESS,
+    };
+
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0_u32;
+    if QueryServiceStatusEx(
+        service,
+        SC_STATUS_PROCESS_INFO,
+        &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
+        std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
+        &mut needed,
+    ) == 0
+    {
+        return Err(windows_last_error("QueryServiceStatusEx"));
+    }
+    Ok(status)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_service_process_id() -> Result<Option<u32>, String> {
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE},
+        System::Services::{
+            OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+        },
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW(process id)"));
         }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            let code = GetLastError();
+            if code == ERROR_SERVICE_DOES_NOT_EXIST || code == ERROR_SERVICE_MARKED_FOR_DELETE {
+                return Ok(None);
+            }
+            return Err(windows_last_error("OpenServiceW(process id)"));
+        }
+        let _service = ServiceHandleGuard(service);
+        let status = query_windows_service_status_process(service)?;
+        Ok((status.dwProcessId != 0).then_some(status.dwProcessId))
     }
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
+fn acquire_windows_input_service_network_lease() -> Result<Option<std::fs::File>, String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::{
+        Foundation::{
+            GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ,
+            GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        },
+        Storage::FileSystem::{
+            CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
+        },
+        System::Pipes::WaitNamedPipeW,
+    };
+
+    let pipe_name = wide_null(shared_input::SERVICE_CONTROL_PIPE);
+    if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), 2_000) } == 0 {
+        let error = unsafe { GetLastError() };
+        if matches!(
+            error,
+            ERROR_FILE_NOT_FOUND | ERROR_PIPE_BUSY | ERROR_SEM_TIMEOUT
+        ) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "WaitNamedPipeW(MyKVM service control) failed with Windows error {error}"
+        ));
+    }
+
+    let handle = unsafe {
+        CreateFileW(
+            pipe_name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(windows_last_error("CreateFileW(MyKVM service control)"));
+    }
+
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let raw = file.as_raw_handle();
+    let request = [1_u8];
+    let mut written = 0_u32;
+    if unsafe {
+        WriteFile(
+            raw,
+            request.as_ptr(),
+            request.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        )
+    } == 0
+        || written != request.len() as u32
+    {
+        return Err(windows_last_error("write MyKVM service takeover request"));
+    }
+
+    let mut ack = [0_u8; 1];
+    let mut read = 0_u32;
+    if unsafe {
+        ReadFile(
+            raw,
+            ack.as_mut_ptr(),
+            ack.len() as u32,
+            &mut read,
+            std::ptr::null_mut(),
+        )
+    } == 0
+        || read != 1
+        || ack[0] != 1
+    {
+        return Err("MyKVM input service did not acknowledge network takeover.".into());
+    }
+
+    Ok(Some(file))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_service_network_lease_alive(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    unsafe {
+        PeekNamedPipe(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_input_service_owns_network_ports() -> Result<bool, String> {
+    use windows_sys::Win32::System::Services::{
+        OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QUERY_SERVICE_CONFIGW,
+        SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG,
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW(query config)"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(scm, service_name.as_ptr(), SERVICE_QUERY_CONFIG);
+        if service.is_null() {
+            return Ok(false);
+        }
+        let _service = ServiceHandleGuard(service);
+
+        let mut needed = 0_u32;
+        let _ = QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(windows_last_error("QueryServiceConfigW(size)"));
+        }
+        let words =
+            (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut buffer = vec![0_usize; words];
+        let config = buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
+        if QueryServiceConfigW(service, config, needed, &mut needed) == 0 {
+            return Err(windows_last_error("QueryServiceConfigW"));
+        }
+        let path = (*config).lpBinaryPathName;
+        if path.is_null() {
+            return Ok(false);
+        }
+        let len = (0..)
+            .find(|index| *path.add(*index) == 0)
+            .unwrap_or_default();
+        let command = String::from_utf16_lossy(std::slice::from_raw_parts(path, len));
+        Ok(command.contains(shared_input::SERVICE_CONFIG_PATH_ARG))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_input_service(
+    helper_path: &PathBuf,
+    config_path: &PathBuf,
+    owner_sid: &str,
+) -> Result<(), String> {
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_SERVICE_EXISTS},
         System::Services::{
-            ChangeServiceConfigW, CreateServiceW, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+            ChangeServiceConfig2W, ChangeServiceConfigW, CreateServiceW, OpenSCManagerW,
+            OpenServiceW, SC_ACTION, SC_ACTION_RESTART, SC_MANAGER_CONNECT,
             SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-            SERVICE_ERROR_NORMAL, SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+            SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_FAILURE_ACTIONS_FLAG,
+            SERVICE_WIN32_OWN_PROCESS,
         },
     };
 
@@ -3660,6 +3957,9 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
             helper_path.display()
         ));
     }
+
+    stop_windows_input_service_and_wait()?;
+    let protected_helper_path = install_protected_input_helper(helper_path)?;
 
     unsafe {
         let scm = OpenSCManagerW(
@@ -3675,8 +3975,12 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
         let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
         let display_name = wide_null(shared_input::INPUT_SERVICE_DISPLAY_NAME);
         let binary = wide_null(&format!(
-            "{} --service",
-            quote_windows_arg_str(&helper_path.to_string_lossy())
+            "{} --service {} {} {} {}",
+            quote_windows_arg_str(&protected_helper_path.to_string_lossy()),
+            shared_input::SERVICE_CONFIG_PATH_ARG,
+            quote_windows_arg_str(&config_path.to_string_lossy()),
+            shared_input::SERVICE_OWNER_SID_ARG,
+            quote_windows_arg_str(owner_sid),
         ));
         let mut service = CreateServiceW(
             scm,
@@ -3724,21 +4028,384 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
 
         let _service = ServiceHandleGuard(service);
 
-        // Let the logged-in (Authenticated) user stop/start this LocalSystem
-        // service, so the per-user (non-elevated) updater can restart it during
-        // upgrades without a UAC prompt — important for an unattended client.
-        // SYSTEM and Administrators keep full control; AU only gains
-        // start/stop/query. Best-effort: failure just leaves the default DACL.
+        let mut actions = [1000, 5000, 10_000].map(|delay| SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: delay,
+        });
+        let recovery = SERVICE_FAILURE_ACTIONSW {
+            dwResetPeriod: 86400,
+            cActions: actions.len() as u32,
+            lpsaActions: actions.as_mut_ptr(),
+            ..Default::default()
+        };
+        let failure_flags = SERVICE_FAILURE_ACTIONS_FLAG {
+            fFailureActionsOnNonCrashFailures: 1,
+        };
+        if ChangeServiceConfig2W(
+            service,
+            SERVICE_CONFIG_FAILURE_ACTIONS,
+            (&recovery as *const SERVICE_FAILURE_ACTIONSW).cast(),
+        ) == 0
+            || ChangeServiceConfig2W(
+                service,
+                SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                (&failure_flags as *const SERVICE_FAILURE_ACTIONS_FLAG).cast(),
+            ) == 0
+        {
+            return Err(windows_last_error("configure input service recovery"));
+        }
+
+        // Authenticated users may only inspect service state/config. The owner
+        // may start, stop, and remove it, but cannot reconfigure it or its DACL.
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let sddl = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLORC;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)";
-        let _ = std::process::Command::new("sc.exe")
-            .args(["sdset", shared_input::INPUT_SERVICE_NAME, sddl])
+        let sddl = format!(
+            "D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCRPWPLOSDRC;;;{owner_sid})(A;;CCLC;;;AU)"
+        );
+        let result = std::process::Command::new("sc.exe")
+            .args(["sdset", shared_input::INPUT_SERVICE_NAME, &sddl])
             .creation_flags(CREATE_NO_WINDOW)
-            .output();
+            .output()
+            .map_err(|error| format!("failed to secure input service permissions: {error}"))?;
+        if !result.status.success() {
+            let detail = String::from_utf8_lossy(if result.stderr.is_empty() {
+                &result.stdout
+            } else {
+                &result.stderr
+            });
+            return Err(format!(
+                "failed to secure input service permissions: {}",
+                detail.trim()
+            ));
+        }
 
-        Ok(())
+        ensure_windows_input_service_firewall_rule(&protected_helper_path)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn protected_input_helper_path() -> Result<PathBuf, String> {
+    use windows::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG},
+    };
+
+    unsafe {
+        let raw = SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KNOWN_FOLDER_FLAG(0), None)
+            .map_err(|error| format!("failed to locate Program Files: {error}"))?;
+        let program_files = raw
+            .to_string()
+            .map_err(|error| format!("invalid Program Files path: {error}"));
+        CoTaskMemFree(Some(raw.as_ptr().cast()));
+        Ok(PathBuf::from(program_files?)
+            .join("MyKVM")
+            .join("mykvm-input-helper.exe"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_protected_input_helper(source: &PathBuf) -> Result<PathBuf, String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let target = protected_input_helper_path()?;
+    let directory = target
+        .parent()
+        .ok_or_else(|| "protected input helper path has no parent directory".to_string())?;
+    fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "failed to create protected input helper directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    secure_protected_input_helper_path(directory)?;
+
+    let staging = target.with_extension("exe.installing");
+    let _ = fs::remove_file(&staging);
+    let mut staging_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(|error| {
+            format!(
+                "failed to create protected input helper staging file {}: {error}",
+                staging.display()
+            )
+        })?;
+    secure_protected_input_helper_path(&staging)?;
+    let mut source_file = fs::File::open(source)
+        .map_err(|error| format!("failed to open input helper {}: {error}", source.display()))?;
+    std::io::copy(&mut source_file, &mut staging_file).map_err(|error| {
+        format!(
+            "failed to copy input helper to {}: {error}",
+            staging.display()
+        )
+    })?;
+    staging_file.sync_all().map_err(|error| {
+        format!(
+            "failed to flush protected input helper {}: {error}",
+            staging.display()
+        )
+    })?;
+    drop(staging_file);
+
+    let staging_wide = wide_null(&staging.to_string_lossy());
+    let target_wide = wide_null(&target.to_string_lossy());
+    if unsafe {
+        MoveFileExW(
+            staging_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        let error = windows_last_error("MoveFileExW(protected input helper)");
+        let _ = fs::remove_file(&staging);
+        return Err(error);
+    }
+    if let Err(error) = secure_protected_input_helper_path(&target) {
+        let _ = fs::remove_file(&target);
+        return Err(error);
+    }
+
+    Ok(target)
+}
+
+#[cfg(target_os = "windows")]
+fn secure_protected_input_helper_path(path: &std::path::Path) -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{LocalFree, HLOCAL},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+    };
+
+    let descriptor = wide_null("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    let mut security_descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor.as_ptr(),
+            SDDL_REVISION_1,
+            &mut security_descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(windows_last_error(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW(protected helper)",
+        ));
+    }
+
+    let path = wide_null(&path.to_string_lossy());
+    let secured = unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            security_descriptor,
+        )
+    } != 0;
+    let error = (!secured)
+        .then(|| windows_last_error("SetFileSecurityW(protected input helper)"));
+    unsafe {
+        let _ = LocalFree(security_descriptor as HLOCAL);
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn remove_protected_input_helper() {
+    let Ok(target) = protected_input_helper_path() else {
+        return;
+    };
+    let _ = fs::remove_file(&target);
+    let _ = fs::remove_file(target.with_extension("exe.installing"));
+    if let Some(directory) = target.parent() {
+        let _ = fs::remove_dir(directory);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_input_service_and_wait() -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{
+            GetLastError, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_DOES_NOT_EXIST,
+            ERROR_SERVICE_NOT_ACTIVE,
+        },
+        System::Services::{
+            ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+            SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
+            SERVICE_STOPPED, SERVICE_STOP_PENDING,
+        },
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if scm.is_null() {
+            return Err(windows_last_error("OpenSCManagerW(stop)"));
+        }
+        let _scm = ServiceHandleGuard(scm);
+        let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
+        let service = OpenServiceW(
+            scm,
+            service_name.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_STATUS,
+        );
+        if service.is_null() {
+            if GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST {
+                return Ok(());
+            }
+            return Err(windows_last_error("OpenServiceW(stop)"));
+        }
+        let _service = ServiceHandleGuard(service);
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        loop {
+            let mut status = SERVICE_STATUS::default();
+            if QueryServiceStatus(service, &mut status) == 0 {
+                return Err(windows_last_error("QueryServiceStatus(stop)"));
+            }
+            if status.dwCurrentState == SERVICE_STOPPED {
+                return Ok(());
+            }
+
+            if status.dwCurrentState != SERVICE_STOP_PENDING {
+                let mut stop_status = SERVICE_STATUS::default();
+                if ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status) == 0 {
+                    let code = GetLastError();
+                    if code == ERROR_SERVICE_NOT_ACTIVE {
+                        return Ok(());
+                    }
+                    if code != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
+                        return Err(windows_last_error("ControlService(stop)"));
+                    }
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for MyKVM input service to stop".into());
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_windows_user_sid() -> Result<String, String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, LocalFree, HLOCAL},
+        Security::{
+            Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+            TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(windows_last_error("OpenProcessToken(current user SID)"));
+        }
+
+        let mut needed = 0_u32;
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            let _ = CloseHandle(token);
+            return Err(windows_last_error(
+                "GetTokenInformation(current user SID size)",
+            ));
+        }
+        let mut buffer = vec![0_u8; needed as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr() as *mut _,
+            needed,
+            &mut needed,
+        ) == 0
+        {
+            let _ = CloseHandle(token);
+            return Err(windows_last_error("GetTokenInformation(current user SID)"));
+        }
+        let _ = CloseHandle(token);
+
+        let token_user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut sid = std::ptr::null_mut();
+        if ConvertSidToStringSidW(token_user.User.Sid, &mut sid) == 0 {
+            return Err(windows_last_error("ConvertSidToStringSidW"));
+        }
+        let len = (0..)
+            .find(|index| *sid.add(*index) == 0)
+            .unwrap_or_default();
+        let value = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
+        let _ = LocalFree(sid as HLOCAL);
+        Ok(value)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_windows_input_service_firewall_rule(helper_path: &PathBuf) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const RULE_NAME: &str = "MyKVM Headless Input (UDP-In)";
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={RULE_NAME}"),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let result = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &format!("name={RULE_NAME}"),
+            "dir=in",
+            "action=allow",
+            &format!("program={}", helper_path.display()),
+            "protocol=UDP",
+            "profile=any",
+            "enable=yes",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("failed to configure helper firewall rule: {error}"))?;
+    if !result.status.success() {
+        return Err(format!(
+            "failed to configure helper firewall rule: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn remove_windows_input_service_firewall_rule() {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            "name=MyKVM Headless Input (UDP-In)",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 #[cfg(target_os = "windows")]
@@ -3782,11 +4449,11 @@ fn uninstall_windows_input_service() -> Result<(), String> {
     use windows_sys::Win32::{
         Foundation::{GetLastError, ERROR_SERVICE_DOES_NOT_EXIST},
         Storage::FileSystem::DELETE,
-        System::Services::{
-            ControlService, DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
-            SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS, SERVICE_STOP,
-        },
+        System::Services::{DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT},
     };
+
+    remove_windows_input_service_firewall_rule();
+    stop_windows_input_service_and_wait()?;
 
     unsafe {
         let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
@@ -3795,28 +4462,24 @@ fn uninstall_windows_input_service() -> Result<(), String> {
         }
         let _scm = ServiceHandleGuard(scm);
         let service_name = wide_null(shared_input::INPUT_SERVICE_NAME);
-        let service = OpenServiceW(
-            scm,
-            service_name.as_ptr(),
-            SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE,
-        );
+        let service = OpenServiceW(scm, service_name.as_ptr(), DELETE);
         if service.is_null() {
             let code = GetLastError();
             if code == ERROR_SERVICE_DOES_NOT_EXIST {
+                remove_protected_input_helper();
                 return Ok(());
             }
             return Err(windows_last_error("OpenServiceW(uninstall)"));
         }
         let _service = ServiceHandleGuard(service);
 
-        let mut stop_status = SERVICE_STATUS::default();
-        let _ = ControlService(service, SERVICE_CONTROL_STOP, &mut stop_status);
-
         if DeleteService(service) == 0 {
             return Err(windows_last_error("DeleteService"));
         }
-        return Ok(());
     }
+
+    remove_protected_input_helper();
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -4214,22 +4877,20 @@ fn refresh_local_screens(app: &AppHandle) {
         let Ok(mut layout) = state.layout.lock() else {
             return;
         };
-        let Some(local) = layout.devices.iter_mut().find(|device| device.role == "local") else {
+        let Ok(mut native) = state.native_layout.lock() else {
             return;
         };
         let Ok(mut memory) = screen_layout_memory().lock() else {
             return;
         };
-        let merged = restore_local_screen_layout(detected, &local.screens, &mut memory);
+        let changed = apply_detected_local_screens(&mut layout, &mut native, detected, &mut memory);
         drop(memory);
-        if screens_fingerprint(&local.screens) == screens_fingerprint(&merged) {
+        drop(native);
+        if !changed {
             None
         } else {
-            local.screens = merged.clone();
-            if !merged.iter().any(|s| s.id == layout.selected_screen_id) {
-                if let Some(pick) = merged.iter().find(|s| s.is_primary).or_else(|| merged.first()) {
-                    layout.selected_screen_id = pick.id.clone();
-                }
+            if let Err(error) = write_layout_to_disk(&state.config_path, &layout) {
+                log::warn!("failed to save refreshed display layout: {error}");
             }
             Some(layout.clone())
         }
@@ -4248,76 +4909,136 @@ fn refresh_local_screens(app: &AppHandle) {
                 desc.join(", ")
             );
         }
-        let _ = write_layout_to_disk(&state.config_path, &snapshot);
+        // Capture also caches native cursor geometry. Rebuild it on a real
+        // display change; the live QUIC receiver reads the same native layout.
+        if let Err(error) = restart_runtime_if_running(state) {
+            log::warn!("failed to refresh input after display change: {error}");
+        }
     }
 }
 
-// Remembers each display's id + on-canvas position keyed by resolution, so a
-// display that disconnects and comes back (a MacBook lid closing then opening)
-// is restored to the same id and place. Screen ids are built from the volatile
-// enumeration index, so they cannot be trusted across a display-set change;
-// resolution is stable per display. Survives for the life of the process, which
-// covers a lid close→open cycle.
+// Keep disconnected displays for the next lid-open/reconnect event.
 #[cfg(target_os = "macos")]
-fn screen_layout_memory() -> &'static Mutex<std::collections::HashMap<(i32, i32), (String, i32, i32)>>
-{
-    static MEM: std::sync::OnceLock<
-        Mutex<std::collections::HashMap<(i32, i32), (String, i32, i32)>>,
-    > = std::sync::OnceLock::new();
-    MEM.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+fn screen_layout_memory() -> &'static Mutex<Vec<Screen>> {
+    static MEMORY: Mutex<Vec<Screen>> = Mutex::new(Vec::new());
+    &MEMORY
 }
 
-/// Restores each detected display's remembered id + on-canvas position, keyed by
-/// resolution, so a display that disconnected and came back (a MacBook lid) lands
-/// where the user put it instead of at a default spot, and keeps a stable id even
-/// if the enumeration order (which detected ids are built from) shuffled.
-/// `memory` first absorbs the currently-known screens, then supplies matches;
-/// identical-resolution displays keep distinct ids.
-#[cfg(target_os = "macos")]
+/// Match names and dimensions before volatile enumeration ids.
+// ponytail: identical names and dimensions retain enumeration order; use OS display UUIDs if those monitors must be distinguished across reboots.
 fn restore_local_screen_layout(
     detected: Vec<Screen>,
     current: &[Screen],
-    memory: &mut std::collections::HashMap<(i32, i32), (String, i32, i32)>,
+    memory: &mut Vec<Screen>,
 ) -> Vec<Screen> {
-    for screen in current.iter() {
-        memory.insert(
-            (screen.width, screen.height),
-            (screen.id.clone(), screen.x, screen.y),
-        );
+    // NSScreen can temporarily be empty during sleep or display reconfiguration.
+    // Never persist its 1x1 fallback over the last usable arrangement.
+    if !local_screens_available(&detected) {
+        return current.to_vec();
+    }
+    for screen in current.iter().filter(|s| s.width > 1 && s.height > 1) {
+        if let Some(saved) = memory.iter_mut().find(|s| s.id == screen.id) {
+            *saved = screen.clone();
+        } else {
+            memory.push(screen.clone());
+        }
     }
     let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut merged: Vec<Screen> = Vec::with_capacity(detected.len());
     for mut screen in detected {
-        if let Some((id, x, y)) = memory.get(&(screen.width, screen.height)) {
-            if !used_ids.contains(id) {
-                screen.id = id.clone();
-                screen.x = *x;
-                screen.y = *y;
-            }
+        let saved = memory
+            .iter()
+            .filter(|s| !used_ids.contains(&s.id))
+            .filter(|s| {
+                s.name == screen.name
+                    || (s.width, s.height) == (screen.width, screen.height)
+                    || s.id == screen.id
+            })
+            .min_by_key(|s| {
+                (
+                    s.name != screen.name,
+                    (s.width, s.height) != (screen.width, screen.height),
+                    s.id != screen.id,
+                )
+            });
+        if let Some(saved) = saved {
+            screen.id = saved.id.clone();
+            screen.x = saved.x;
+            screen.y = saved.y;
         }
         while used_ids.contains(&screen.id) {
             screen.id = format!("{}-b", screen.id);
         }
         used_ids.insert(screen.id.clone());
-        memory.insert(
-            (screen.width, screen.height),
-            (screen.id.clone(), screen.x, screen.y),
-        );
         merged.push(screen);
     }
     merged
 }
 
-// Identity of a screen set for change detection (ignores on-canvas position,
-// which the user arranges and we carry over).
-#[cfg(target_os = "macos")]
-fn screens_fingerprint(screens: &[Screen]) -> Vec<(String, i32, i32, bool)> {
-    let mut fingerprint: Vec<(String, i32, i32, bool)> = screens
+fn local_screens_available(screens: &[Screen]) -> bool {
+    screens
         .iter()
-        .map(|s| (s.id.clone(), s.width, s.height, s.is_primary))
-        .collect();
-    fingerprint.sort();
-    fingerprint
+        .any(|screen| screen.width > 1 && screen.height > 1)
+}
+
+fn align_native_screen_ids(native: &mut LayoutState, arranged: &LayoutState) {
+    let Some(local) = native.devices.iter_mut().find(|d| d.role == "local") else {
+        return;
+    };
+    if !local_screens_available(&local.screens) {
+        return;
+    }
+    let Some(arranged) = arranged.devices.iter().find(|d| d.role == "local") else {
+        return;
+    };
+    for (screen, arranged) in local.screens.iter_mut().zip(&arranged.screens) {
+        screen.id = arranged.id.clone();
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apply_detected_local_screens(
+    layout: &mut LayoutState,
+    native: &mut LayoutState,
+    detected: Vec<Screen>,
+    memory: &mut Vec<Screen>,
+) -> bool {
+    if !local_screens_available(&detected) {
+        return false;
+    }
+    let Some(local) = layout.devices.iter_mut().find(|d| d.role == "local") else {
+        return false;
+    };
+    let Some(native_local) = native.devices.iter_mut().find(|d| d.role == "local") else {
+        return false;
+    };
+    let merged = restore_local_screen_layout(detected.clone(), &local.screens, memory);
+    let mut native_screens = detected;
+    for (screen, arranged) in native_screens.iter_mut().zip(&merged) {
+        screen.id = arranged.id.clone();
+    }
+    if local.screens == merged && native_local.screens == native_screens {
+        return false;
+    }
+    local.screens = merged;
+    native_local.screens = native_screens;
+    let fallback = local
+        .screens
+        .iter()
+        .find(|s| s.is_primary)
+        .or_else(|| local.screens.first())
+        .map(|s| s.id.clone());
+    if !layout
+        .devices
+        .iter()
+        .flat_map(|d| &d.screens)
+        .any(|s| s.id == layout.selected_screen_id)
+    {
+        if let Some(id) = fallback {
+            layout.selected_screen_id = id;
+        }
+    }
+    true
 }
 
 fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutState) -> LayoutState {
@@ -4389,22 +5110,11 @@ fn merge_detected_local_device(saved_layout: &LayoutState, mut detected_device: 
         .iter()
         .find(|device| device.id == detected_device.id)
     {
-        detected_device.screens = detected_device
-            .screens
-            .into_iter()
-            .map(|screen| {
-                saved_device
-                    .screens
-                    .iter()
-                    .find(|saved_screen| saved_screen.id == screen.id)
-                    .map(|saved_screen| Screen {
-                        x: saved_screen.x,
-                        y: saved_screen.y,
-                        ..screen.clone()
-                    })
-                    .unwrap_or(screen)
-            })
-            .collect();
+        detected_device.screens = restore_local_screen_layout(
+            detected_device.screens,
+            &saved_device.screens,
+            &mut Vec::new(),
+        );
     }
 
     detected_device
@@ -4912,10 +5622,12 @@ fn clipboard_packet_from_content(
             formats: vec![ClipboardFormat {
                 kind: "imageRgba".into(),
                 text: String::new(),
-                image: Some(image.clone()),
+                image: Some(image),
             }],
             text: String::new(),
-            image: Some(image),
+            // The formats envelope is supported by the current stable release.
+            // Keep accepting the legacy alias, but do not send a second bitmap.
+            image: None,
             sequence,
         },
     }
@@ -4934,6 +5646,7 @@ fn run_clipboard_sync(
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
     let mut last_failed: Option<(String, String, String, Instant)> = None;
+    let mut last_read: Option<(u64, String, String)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
 
@@ -4950,9 +5663,20 @@ fn run_clipboard_sync(
         }
         last_poll = Instant::now();
 
+        let version = clipboard::change_count();
+        let retry_due = last_failed.as_ref().is_some_and(|(_, _, _, failed_at)| {
+            failed_at.elapsed() >= Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+        });
+        if clipboard_poll_unchanged(version, &last_read, &target, retry_due) {
+            continue;
+        }
         let Some(content) = clipboard::read_content() else {
             continue;
         };
+        // Only cache a stable read. A copy racing the read must be polled again.
+        last_read = version
+            .filter(|version| Some(*version) == clipboard::change_count())
+            .map(|version| (version, target.device_id.clone(), target.addr.clone()));
         let signature = content.signature();
 
         // If this is the content we just wrote after receiving a peer packet,
@@ -4964,6 +5688,7 @@ fn run_clipboard_sync(
                 .map(|seen| seen.as_deref() == Some(signature.as_str()))
                 .unwrap_or(false);
             if is_known_echo {
+                last_failed = None;
                 continue;
             }
             if let Ok(mut seen) = clipboard_seen_text.lock() {
@@ -4972,6 +5697,7 @@ fn run_clipboard_sync(
         }
 
         if content.is_oversized() {
+            last_failed = None;
             continue;
         }
 
@@ -4982,6 +5708,7 @@ fn run_clipboard_sync(
             })
             .unwrap_or(false)
         {
+            last_failed = None;
             continue;
         }
         if last_failed
@@ -5010,6 +5737,7 @@ fn run_clipboard_sync(
             .unwrap_or(true);
 
         if !should_send {
+            last_failed = None;
             last_sent = Some((target.device_id.clone(), target.addr.clone(), signature));
             continue;
         }
@@ -5050,6 +5778,24 @@ fn run_clipboard_sync(
             }
         }
     }
+}
+
+fn clipboard_poll_unchanged(
+    version: Option<u64>,
+    previous: &Option<(u64, String, String)>,
+    target: &input::ClipboardTarget,
+    retry_due: bool,
+) -> bool {
+    !retry_due
+        && version.is_some_and(|version| {
+            previous
+                .as_ref()
+                .is_some_and(|(last_version, device_id, addr)| {
+                    version == *last_version
+                        && device_id == &target.device_id
+                        && addr == &target.addr
+                })
+        })
 }
 
 /// True while we are inside the post-write grace window (see
@@ -6530,20 +7276,12 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
         }
     }
 
-    refresh_paired_controller_keys(layout, peers);
+    refresh_paired_controller_addresses(layout, peers);
 }
 
-/// Keeps each paired controller's transport_public_key (and id/host/ip) in sync
-/// with the peer it was paired with. A peer's QUIC transport identity is
-/// regenerated whenever its self-signed cert/key file is missing — app updates,
-/// reinstalls, or the file being cleared all rotate the advertised
-/// transport_public_key while the pairing credentials (cluster_id/pair_secret)
-/// stay the same. Without this sync the controller's stored key goes stale, the
-/// input path rejects every packet with "controller not in paired-controllers
-/// list", and the user is forced to re-pair even though the pairing is still
-/// valid. The security premise is unchanged: input packets still have to match
-/// cluster_id/pair_secret, which only the two paired endpoints know.
-fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
+/// Discovery may refresh an address, but cannot replace a paired certificate.
+/// A replacement identity must pass the existing pairing-code flow.
+fn refresh_paired_controller_addresses(layout: &mut LayoutState, peers: &[LanPeer]) {
     if layout.paired_controllers.is_empty() {
         return;
     }
@@ -6551,19 +7289,10 @@ fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
     for controller in &mut layout.paired_controllers {
         let Some(peer) = peers
             .iter()
-            .find(|peer| paired_controller_can_repair_with_peer(controller, peer))
+            .find(|peer| paired_controller_identity_matches_peer(controller, peer))
         else {
             continue;
         };
-
-        let new_key = peer.transport_public_key.trim();
-        if !new_key.is_empty() && controller.transport_public_key != new_key {
-            log::info!(
-                "paired controller {} rotated transport key; updating stored key",
-                controller.id
-            );
-            controller.transport_public_key = new_key.to_string();
-        }
 
         let new_id = peer_device_id(peer);
         if !new_id.is_empty() && controller.id != new_id {
@@ -6583,10 +7312,10 @@ fn refresh_paired_controller_keys(layout: &mut LayoutState, peers: &[LanPeer]) {
 }
 
 fn device_matches_peer(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
-    device.id == peer_device_id(peer)
-        || (!device.transport_public_key.trim().is_empty()
-            && device.transport_public_key == peer.transport_public_key)
-        || same_cluster_host(device, peer, layout_cluster_id)
+    if !device.transport_public_key.trim().is_empty() {
+        return device.transport_public_key == peer.transport_public_key;
+    }
+    device.id == peer_device_id(peer) || same_cluster_host(device, peer, layout_cluster_id)
 }
 
 fn same_cluster_host(device: &Device, peer: &LanPeer, layout_cluster_id: &str) -> bool {
@@ -6647,11 +7376,13 @@ fn sanitize_id(value: &str) -> String {
 fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.online = true;
     device.input_ready = peer.input_ready;
-    device.host = if peer.ip.trim().is_empty() {
-        peer.host.clone()
-    } else {
-        peer.ip.clone()
-    };
+    if device.source != "manual" {
+        device.host = if peer.ip.trim().is_empty() {
+            peer.host.clone()
+        } else {
+            peer.ip.clone()
+        };
+    }
     device.transport_port = peer.transport_port;
     device.quic_port = normalize_quic_port(peer.transport_port, peer.quic_port);
     device.transport_public_key = peer.transport_public_key.clone();
@@ -7326,10 +8057,11 @@ fn is_paired_controller(layout: &LayoutState, peer: &LanPeer) -> bool {
 }
 
 fn paired_controller_identity_matches_peer(controller: &PairedController, peer: &LanPeer) -> bool {
+    if !controller.transport_public_key.trim().is_empty() {
+        return controller.transport_public_key == peer.transport_public_key;
+    }
     (!peer.id.trim().is_empty() && controller.id == peer.id)
         || controller.id == peer_device_id(peer)
-        || (!peer.transport_public_key.trim().is_empty()
-            && controller.transport_public_key == peer.transport_public_key)
 }
 
 fn paired_controller_can_repair_with_peer(controller: &PairedController, peer: &LanPeer) -> bool {
@@ -7872,8 +8604,57 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn unavailable_local_displays_preserve_layout_across_restart() {
+        let mut saved = test_layout();
+        let mut arranged = test_screen("local-device");
+        arranged.id = "local-display-1".into();
+        arranged.width = 2560;
+        arranged.height = 1440;
+        arranged.x = 7500;
+        arranged.y = -3960;
+        saved.devices[0].screens = vec![arranged.clone()];
+        saved.selected_screen_id = arranged.id.clone();
+
+        let mut unavailable = arranged.clone();
+        unavailable.name = "Display unavailable".into();
+        unavailable.width = 1;
+        unavailable.height = 1;
+        unavailable.x = 0;
+        unavailable.y = 0;
+
+        for detected in [Vec::new(), vec![unavailable]] {
+            let sleeping = restore_local_screen_layout(
+                detected.clone(),
+                &saved.devices[0].screens,
+                &mut Vec::new(),
+            );
+            assert_eq!(sleeping, saved.devices[0].screens);
+
+            // Restart with no monitors available and no in-process memory.
+            let mut disk = saved.clone();
+            disk.devices[0].screens = sleeping;
+            let disk = serde_json::from_slice(&serde_json::to_vec(&disk).unwrap()).unwrap();
+            let mut native = test_layout();
+            native.devices[0].screens = detected;
+            let restarted = normalize_saved_layout(disk, native);
+            assert_eq!(restarted.devices[0].screens, saved.devices[0].screens);
+            assert_eq!(restarted.devices[1], saved.devices[1]);
+
+            let mut awake = arranged.clone();
+            awake.x = 0;
+            awake.y = 0;
+            let restored = restore_local_screen_layout(
+                vec![awake],
+                &restarted.devices[0].screens,
+                &mut Vec::new(),
+            );
+            assert_eq!(restored, saved.devices[0].screens);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn restore_local_screen_layout_survives_lid_close_and_reopen() {
-        use std::collections::HashMap;
         let mk = |id: &str, w: i32, h: i32, x: i32, y: i32| Screen {
             id: id.into(),
             device_id: "local-device".into(),
@@ -7885,7 +8666,7 @@ mod tests {
             scale: 1.0,
             is_primary: w == 2560,
         };
-        let mut memory: HashMap<(i32, i32), (String, i32, i32)> = HashMap::new();
+        let mut memory = Vec::new();
 
         // External on top, built-in arranged below (the user's real layout).
         let arranged = vec![
@@ -7925,6 +8706,86 @@ mod tests {
         assert_eq!((built_in.x, built_in.y), (518, 1440), "built-in restored below");
         assert_eq!(external.id, "local-display-1");
         assert_eq!((external.x, external.y), (0, 0), "external restored to origin");
+    }
+
+    #[test]
+    fn display_refresh_updates_native_coordinates_and_preserves_arrangement() {
+        let mut layout = test_layout();
+        let mut first = test_screen("local-device");
+        first.id = "local-display-1".into();
+        first.name = "Display A".into();
+        let mut second = first.clone();
+        second.id = "local-display-2".into();
+        second.name = "Display B".into();
+        second.x = first.width;
+        second.is_primary = false;
+        layout.devices[0].screens = vec![first.clone(), second.clone()];
+        let mut native = layout.clone();
+        for screen in &mut layout.devices[0].screens {
+            screen.x += 7500;
+            screen.y = -3960;
+        }
+        layout.selected_screen_id = layout.devices[1].screens[0].id.clone();
+        let selected = layout.selected_screen_id.clone();
+
+        second.id = "local-display-1".into();
+        second.x = 0;
+        second.y = 1080;
+        second.scale = 1.5;
+        first.id = "local-display-2".into();
+        let detected = vec![second, first];
+        let mut memory = Vec::new();
+        assert!(apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            detected.clone(),
+            &mut memory
+        ));
+        let arranged = &layout.devices[0].screens[0];
+        assert_eq!(arranged.id, "local-display-2");
+        assert_eq!((arranged.x, arranged.y), (9420, -3960));
+        let physical = &native.devices[0].screens[0];
+        assert_eq!(physical.id, arranged.id);
+        assert_eq!((physical.x, physical.y, physical.scale), (0, 1080, 1.5));
+        assert_eq!(layout.selected_screen_id, selected);
+        assert!(!apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            detected.clone(),
+            &mut memory
+        ));
+        assert!(!apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            Vec::new(),
+            &mut memory
+        ));
+
+        // Reboot with the OS enumerating the same two displays in reverse order.
+        let mut detected_layout = test_layout();
+        detected_layout.devices[0].screens = detected;
+        let restored = normalize_saved_layout(layout.clone(), detected_layout.clone());
+        align_native_screen_ids(&mut detected_layout, &restored);
+        assert_eq!(restored.devices[0].screens, layout.devices[0].screens);
+        assert_eq!(
+            detected_layout.devices[0].screens,
+            native.devices[0].screens
+        );
+
+        // Identical display models must not exchange their positions on every poll.
+        for screen in &mut layout.devices[0].screens {
+            screen.name = "Same model".into();
+        }
+        for screen in &mut native.devices[0].screens {
+            screen.name = "Same model".into();
+        }
+        let unchanged = native.devices[0].screens.clone();
+        assert!(!apply_detected_local_screens(
+            &mut layout,
+            &mut native,
+            unchanged,
+            &mut Vec::new()
+        ));
     }
 
     fn test_layout() -> LayoutState {
@@ -8100,6 +8961,25 @@ mod tests {
     }
 
     #[test]
+    fn manually_selected_peer_address_survives_discovery_and_file_transfer() {
+        let mut layout = test_layout();
+        layout.devices[1].source = "manual".into();
+        layout.devices[1].host = "169.254.10.2".into();
+        let peer = test_peer();
+        apply_peer_presence(&mut layout, &[peer.clone()]);
+        assert_eq!(layout.devices[1].host, "169.254.10.2");
+        assert!(layout.devices[1].online);
+        assert_eq!(layout.devices[1].quic_port, peer.quic_port);
+        let target =
+            file_transfer_target_for_device(&layout, &[peer], &layout.devices[1].id).unwrap();
+        assert_eq!(target.addr, "169.254.10.2:52001");
+        let restored: LayoutState =
+            serde_json::from_slice(&serde_json::to_vec(&layout).unwrap()).unwrap();
+        assert_eq!(restored.devices[1].source, "manual");
+        assert_eq!(restored.devices[1].host, "169.254.10.2");
+    }
+
+    #[test]
     fn peer_presence_updates_live_address_and_port() {
         let mut layout = test_layout();
         let peer = test_peer();
@@ -8113,17 +8993,51 @@ mod tests {
     }
 
     #[test]
-    fn peer_presence_matches_same_cluster_host_after_identity_rotation() {
+    fn discovery_cannot_replace_paired_device_certificates() {
+        let mut layout = test_layout();
+        let peer = test_peer();
+        layout.paired_controllers = vec![PairedController {
+            id: peer.id.clone(),
+            name: peer.name.clone(),
+            host: peer.host.clone(),
+            ip: peer.ip.clone(),
+            transport_public_key: peer.transport_public_key.clone(),
+            protocol_version: peer.protocol_version,
+            cluster_id: layout.cluster_id.clone(),
+            paired_at_ms: 1,
+        }];
+        let trusted = layout.paired_controllers[0].clone();
+        let mut impostor = peer.clone();
+        impostor.transport_public_key = "untrusted-replacement".into();
+        apply_peer_presence(&mut layout, &[impostor]);
+        assert!(!layout.devices[1].online);
+        assert_eq!(layout.devices[1].transport_public_key, "peer-public-key");
+        assert_eq!(layout.paired_controllers[0], trusted);
+
+        let mut moved = peer;
+        moved.id = "changed-peer-id".into();
+        moved.ip = "10.0.0.99".into();
+        apply_peer_presence(&mut layout, &[moved]);
+        assert!(layout.devices[1].online);
+        assert_eq!(layout.devices[1].host, "10.0.0.99");
+        assert_eq!(layout.paired_controllers[0].ip, "10.0.0.99");
+        assert_eq!(
+            layout.paired_controllers[0].transport_public_key,
+            trusted.transport_public_key
+        );
+    }
+
+    #[test]
+    fn peer_presence_keeps_trusted_key_when_peer_id_changes() {
         let mut layout = test_layout();
         let mut peer = test_peer();
         peer.id = "rotated-client-id".into();
-        peer.transport_public_key = "rotated-client-key".into();
 
         apply_peer_presence(&mut layout, &[peer]);
 
         assert!(layout.devices[1].online);
         assert!(layout.devices[1].input_ready);
-        assert_eq!(layout.devices[1].transport_public_key, "rotated-client-key");
+        assert_eq!(layout.devices[1].transport_public_key, "peer-public-key");
     }
 
     #[test]
@@ -8631,13 +9545,51 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_poll_skips_unchanged_content_but_keeps_retries_and_peer_changes() {
+        let mut target = input::ClipboardTarget {
+            device_id: "client".into(),
+            addr: "192.0.2.1:47834".into(),
+            transport_public_key: "key".into(),
+            protocol_version: 1,
+            cluster_id: "cluster".into(),
+            pair_secret: "secret".into(),
+            expires_at: None,
+        };
+        let previous = Some((7, target.device_id.clone(), target.addr.clone()));
+        assert!(clipboard_poll_unchanged(Some(7), &previous, &target, false));
+        assert!(!clipboard_poll_unchanged(
+            Some(8),
+            &previous,
+            &target,
+            false
+        ));
+        assert!(!clipboard_poll_unchanged(Some(7), &previous, &target, true));
+        assert!(!clipboard_poll_unchanged(None, &previous, &target, false));
+        target.device_id = "other-client".into();
+        assert!(!clipboard_poll_unchanged(
+            Some(7),
+            &previous,
+            &target,
+            false
+        ));
+        target.device_id = "client".into();
+        target.addr = "192.0.2.2:47834".into();
+        assert!(!clipboard_poll_unchanged(
+            Some(7),
+            &previous,
+            &target,
+            false
+        ));
+    }
+
+    #[test]
     fn clipboard_image_packet_fits_transport_stream_budget() {
-        let raw_rgba_bytes = 800 * 600 * 4;
+        let raw_rgba_bytes = 3840 * 2160 * 4;
         let encoded_len = raw_rgba_bytes / 3 * 4;
         let packet = clipboard_packet_from_content(
             ClipboardContent::Image(ClipboardImage {
-                width: 800,
-                height: 600,
+                width: 3840,
+                height: 2160,
                 rgba_base64: "A".repeat(encoded_len),
             }),
             "local-device".into(),
