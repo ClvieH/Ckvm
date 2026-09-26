@@ -4436,12 +4436,19 @@ pub(crate) mod macos_appkit {
         fn objc_autoreleasePoolPop(pool: *mut c_void);
     }
 
-    struct PoolGuard(*mut c_void);
+    pub(crate) struct PoolGuard(*mut c_void);
 
     impl Drop for PoolGuard {
         fn drop(&mut self) {
             unsafe { objc_autoreleasePoolPop(self.0) }
         }
+    }
+
+    /// Drains what this thread autoreleases until the guard drops. Threads we
+    /// spawn (and tokio's workers) have no pool of their own, so anything
+    /// autoreleased there is only freed when the thread exits.
+    pub(crate) fn autorelease_pool() -> PoolGuard {
+        PoolGuard(unsafe { objc_autoreleasePoolPush() })
     }
 
     unsafe fn sel(name: &[u8]) -> *mut c_void {

@@ -78,6 +78,12 @@ pub(crate) fn write_text(text: &str) -> Result<(), String> {
 }
 
 pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
+    // arboard's macOS image write is not wrapped in an autorelease pool. Synced
+    // clipboards are written on long-lived QUIC worker threads, which have no
+    // pool, so each received image's NSImage/TIFF temporaries (the whole image)
+    // were never freed: a few dozen screenshots reached ~2 GB (discussion #32).
+    #[cfg(target_os = "macos")]
+    let _pool = crate::input::macos_appkit::autorelease_pool();
     match content {
         ClipboardContent::Text(text) => write_text(text),
         ClipboardContent::Image(image) => write_image(image),
@@ -88,6 +94,10 @@ pub(crate) fn write_content(content: &ClipboardContent) -> Result<(), String> {
 /// when the platform can identify a current image format, wait for an image
 /// read instead of falling back to stale text from a previous clipboard format.
 pub(crate) fn read_content() -> Option<ClipboardContent> {
+    // Same reason as `write_content`; arboard pools its image read but not
+    // `Clipboard::new()`, and this runs on the pool-less clipboard thread.
+    #[cfg(target_os = "macos")]
+    let _pool = crate::input::macos_appkit::autorelease_pool();
     read_content_for_hint(content_hint(), read_text_content, read_image_content)
 }
 

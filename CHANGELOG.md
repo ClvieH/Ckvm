@@ -16,6 +16,7 @@ release will reuse them).
 
 ### Fixed
 
+- macOS: memory no longer grows with every image received through clipboard sync. Each synced image leaked its full size, so a few dozen screenshots could push MyKVM to around 2 GB (discussion #32).
 - Controlling another machine no longer drops you back to local control when that machine refuses a clipboard sync (for example clipboard sync is off there, or it runs an older version). The keyboard/mouse connection stays up, refused content is not re-sent every 2 seconds, and large clipboard images get enough time to be acknowledged.
 - After a Wi-Fi stall the controlled machine no longer replays seconds of stale mouse movement and clicks.
 - macOS: pushing the cursor against the bottom of a display no longer jumps into a machine arranged above it (#34).
