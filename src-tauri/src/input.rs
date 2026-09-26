@@ -5800,19 +5800,26 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
 
 #[cfg(target_os = "macos")]
 fn push_macos_cursor_hide(context: &MacCaptureContext) {
+    use core_graphics::display::CGDisplay;
+
     let Ok(mut depth) = context.cursor_hide_depth.lock() else {
         return;
     };
 
+    // Both hides nest (CGDisplayHideCursor ignores its display argument and
+    // counts every call). The 250 ms reassert while remote only has to poke
+    // WindowServer, but it grew the count by ~14k an hour, all unwound inside
+    // the tap callback on return. After the first hide, balance each poke with
+    // a show: the count goes 1 -> 2 -> 1 and never reaches zero, so the cursor
+    // stays hidden and returning unwinds a single level.
     set_macos_cursor_hidden_with_appkit(true);
-    if context.display_snapshots.is_empty() {
-        let _ = core_graphics::display::CGDisplay::main().hide_cursor();
+    let _ = CGDisplay::main().hide_cursor();
+    if *depth == 0 {
+        *depth = 1;
     } else {
-        for display in &context.display_snapshots {
-            let _ = core_graphics::display::CGDisplay::new(display.id).hide_cursor();
-        }
+        let _ = CGDisplay::main().show_cursor();
+        set_macos_cursor_hidden_with_appkit(false);
     }
-    *depth = depth.saturating_add(1);
 }
 
 #[cfg(target_os = "macos")]
@@ -5849,13 +5856,7 @@ fn drain_macos_cursor_hide(context: &MacCaptureContext) {
         .unwrap_or(0);
 
     for _ in 0..count {
-        if context.display_snapshots.is_empty() {
-            let _ = core_graphics::display::CGDisplay::main().show_cursor();
-        } else {
-            for display in &context.display_snapshots {
-                let _ = core_graphics::display::CGDisplay::new(display.id).show_cursor();
-            }
-        }
+        let _ = core_graphics::display::CGDisplay::main().show_cursor();
         set_macos_cursor_hidden_with_appkit(false);
     }
 }
