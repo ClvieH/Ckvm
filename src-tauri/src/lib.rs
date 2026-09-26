@@ -5766,15 +5766,22 @@ fn run_clipboard_sync(
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
             } else {
-                if let Err(error) = send_result {
-                    log::warn!("clipboard send failed: {error}");
+                let error = send_result.err().unwrap_or_default();
+                log::warn!("clipboard send failed: {error}");
+                if error.starts_with(quic_transport::STREAM_REJECTED) {
+                    // The receiver refused it (clipboard sync off, unpaired, too
+                    // old) and will refuse the same content again; wait for the
+                    // next copy instead of resending every retry interval.
+                    last_failed = None;
+                    last_sent = Some((target.device_id, target.addr, signature));
+                } else {
+                    last_failed = Some((
+                        target.device_id.clone(),
+                        target.addr.clone(),
+                        signature,
+                        Instant::now(),
+                    ));
                 }
-                last_failed = Some((
-                    target.device_id.clone(),
-                    target.addr.clone(),
-                    signature,
-                    Instant::now(),
-                ));
             }
         }
     }

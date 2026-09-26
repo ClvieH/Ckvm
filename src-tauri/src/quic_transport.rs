@@ -31,6 +31,8 @@ const MAX_DATAGRAM_BYTES: usize = 16 * 1024;
 // Clipboard images are sent as RGBA base64 over streams. The clipboard module
 // caps decoded images at 32 MiB, which becomes roughly 43 MiB on the wire.
 pub(crate) const MAX_STREAM_BYTES: usize = 48 * 1024 * 1024;
+/// Prefix of the error for a stream the receiver answered with `reject`.
+pub(crate) const STREAM_REJECTED: &str = "QUIC stream receiver rejected payload";
 const PORT_SCAN_COUNT: u16 = 64;
 const QUIC_WORKER_THREADS: usize = 2;
 // Datagram-health fast-fail (concept adopted from PR #22): after this many
@@ -816,12 +818,13 @@ fn send_datagram_nonblocking(
     if let Some(connection) = ready {
         match connection.send_datagram(payload.into()) {
             Ok(()) => record_peer_success(health, &peer.addr),
-            Err(error) => {
-                if let Ok(mut map) = connections.lock() {
-                    map.remove(&key);
-                }
+            // TooLarge/Disabled say nothing about the peer; only a closed
+            // connection is re-dialed and counted against its health.
+            Err(error) if connection.close_reason().is_some() => {
+                forget_connection(connections, &key, &connection);
                 record_peer_failure(health, &peer.addr, &error.to_string());
             }
+            Err(error) => log::debug!("QUIC datagram to {} not sent: {error}", peer.addr),
         }
         return;
     }
@@ -894,19 +897,33 @@ async fn send_stream_task(
         },
     };
 
-    let result = send_stream_on_connection(connection, payload).await;
-    if result.is_err() {
-        if let Ok(mut map) = connections.lock() {
-            map.remove(&key);
-        }
+    let result = send_stream_on_connection(connection.clone(), payload).await;
+    // A peer's `reject` or a slow ack says nothing about the link that input
+    // datagrams share with this stream; evicting it here bounced the user back
+    // to local control mid-session. Forget the connection only once it is dead.
+    if result.is_err() && connection.close_reason().is_some() {
+        forget_connection(connections, &key, &connection);
     }
     result
+}
+
+/// Drop `connection` from the map unless a newer dial already replaced it.
+fn forget_connection(connections: &ConnectionMap, key: &PeerKey, connection: &quinn::Connection) {
+    if let Ok(mut map) = connections.lock() {
+        if matches!(map.get(key), Some(ConnectionSlot::Ready(current)) if current.stable_id() == connection.stable_id())
+        {
+            map.remove(key);
+        }
+    }
 }
 
 async fn send_stream_on_connection(
     connection: quinn::Connection,
     payload: Vec<u8>,
 ) -> Result<(), String> {
+    // The ack also waits for the payload tail to land and for the receiver to
+    // apply it (image decode, pasteboard write): budget ~2 MB/s on top of 500 ms.
+    let ack_timeout = Duration::from_millis(500 + (payload.len() / 2048) as u64);
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -916,7 +933,7 @@ async fn send_stream_on_connection(
         .map_err(|error| format!("failed to write QUIC stream: {error}"))?;
     send.finish()
         .map_err(|error| format!("failed to finish QUIC stream: {error}"))?;
-    match tokio::time::timeout(Duration::from_millis(500), recv.read_to_end(64)).await {
+    match tokio::time::timeout(ack_timeout, recv.read_to_end(64)).await {
         Ok(Ok(bytes)) => verify_stream_ack(&bytes),
         Ok(Err(error)) => Err(format!("failed to read QUIC stream ack: {error}")),
         Err(_) => Err("QUIC stream ack timed out".into()),
@@ -928,7 +945,7 @@ fn verify_stream_ack(bytes: &[u8]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "QUIC stream receiver rejected payload: {}",
+            "{STREAM_REJECTED}: {}",
             String::from_utf8_lossy(bytes)
         ))
     }
@@ -1175,6 +1192,66 @@ mod tests {
         );
         assert!(ready_after_idle.unwrap());
         assert_eq!(after_idle.unwrap(), b"after-idle");
+    }
+
+    #[test]
+    fn stream_reject_keeps_input_connection() {
+        let free_port = || {
+            std::net::UdpSocket::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "mykvm-stream-reject-{}-{}",
+            std::process::id(),
+            free_port()
+        ));
+        let (input_tx, input_rx) = mpsc::channel();
+        // A receiver with clipboard sync off answers every stream `reject`.
+        let receiver = start(
+            free_port(),
+            dir.join("receiver"),
+            Arc::new(move |payload, _| {
+                let _ = input_tx.send(payload);
+            }),
+            Arc::new(|_, _| false),
+        )
+        .unwrap();
+        let sender = start(
+            free_port(),
+            dir.join("sender"),
+            Arc::new(|_, _| {}),
+            Arc::new(|_, _| true),
+        )
+        .unwrap();
+        let peer = sender.peer(
+            format!("127.0.0.1:{}", receiver.port()),
+            receiver.public_key().into(),
+            PROTOCOL_VERSION,
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !sender.send_datagram(peer.clone(), b"warm".to_vec()).unwrap() {
+            assert!(Instant::now() < deadline, "connection never became ready");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let rejected = sender.send_stream_expect_ack(peer.clone(), b"clipboard".to_vec());
+        let ready = sender.send_datagram(peer.clone(), b"input".to_vec());
+        let input = (0..50)
+            .map_while(|_| input_rx.recv_timeout(Duration::from_millis(300)).ok())
+            .find(|payload| payload == b"input");
+        sender.stop_and_wait().unwrap();
+        receiver.stop_and_wait().unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(rejected.unwrap_err().starts_with(STREAM_REJECTED));
+        assert!(
+            ready.unwrap(),
+            "a rejected stream must not tear down the input connection"
+        );
+        assert_eq!(input.as_deref(), Some(&b"input"[..]));
     }
 
     #[test]
