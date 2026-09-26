@@ -4068,8 +4068,6 @@ fn handle_macos_mouse_move(
     if let Some(active_target) = crossing_target(&targets, location.x, location.y, dx, dy) {
         let anchor = local_anchor_point(&active_target);
         dismiss_macos_dock_ui_if_up();
-        set_macos_cursor_decoupled(true);
-        set_macos_warp_suppression_interval(0.0);
         // Hide BEFORE the anchor warp: when MyKVM is hidden/minimized it runs as a
         // background process, and the WindowServer services a background process's
         // cursor-warp and cursor-hide calls lazily. If we warp first the user sees
@@ -4079,8 +4077,7 @@ fn handle_macos_mouse_move(
         // vanishes where it is, then jumps to the anchor invisibly, so no edge
         // stick is ever visible regardless of scheduling latency.
         log::debug!("[diag] cross INTO remote — hiding+decoupling now");
-        hide_macos_cursor_if_needed(context);
-        move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
+        hide_and_pin_macos_cursor(context, active_target.target.edge, anchor);
         if !send_remote_mouse_move(
             &context.quic_transport,
             &active_target,
@@ -5034,10 +5031,36 @@ fn remote_park_point(active: &ActiveTarget) -> (i32, i32) {
     }
 }
 
+/// Hide the local cursor, then pin it at `anchor` for a remote session.
+///
+/// A background app's hide only lands on WindowServer's next cursor update, and
+/// the anchor is the edge pixel the cursor already sits on: the old
+/// decouple -> hide -> warp order moved nothing and left the arrow visible at
+/// the edge for up to a second. Hiding first, decoupling after it (Deskflow's
+/// order against "cursor randomly not hiding") and pinning with a real 1px move
+/// makes the hide land at the crossing: 1-5 ms over 53 measured crossings.
 #[cfg(target_os = "macos")]
-fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveTarget) {
+fn hide_and_pin_macos_cursor(context: &MacCaptureContext, edge: Edge, anchor: (f64, f64)) {
     use core_graphics::geometry::CGPoint;
 
+    hide_macos_cursor_if_needed(context);
+    set_macos_cursor_decoupled(true);
+    set_macos_warp_suppression_interval(0.0);
+    let (inward_x, inward_y) = match edge {
+        Edge::Right => (-1.0, 0.0),
+        Edge::Left => (1.0, 0.0),
+        Edge::Bottom => (0.0, -1.0),
+        Edge::Top => (0.0, 1.0),
+    };
+    move_macos_cursor_without_event(
+        context,
+        CGPoint::new(anchor.0 + inward_x, anchor.1 + inward_y),
+    );
+    move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
+}
+
+#[cfg(target_os = "macos")]
+fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveTarget) {
     let return_point = macos_current_cursor_location().map(|point| (point.x, point.y));
     let anchor = local_anchor_point(&active_target);
     if !send_remote_mouse_move(
@@ -5062,10 +5085,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
         return;
     }
     dismiss_macos_dock_ui_if_up();
-    set_macos_cursor_decoupled(true);
-    set_macos_warp_suppression_interval(0.0);
-    hide_macos_cursor_if_needed(context);
-    move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
+    hide_and_pin_macos_cursor(context, active_target.target.edge, anchor);
     reset_mouse_move_timer(&context.last_mouse_move_sent);
     reset_cursor_repin_timer(context);
     reset_remote_button_mask(&context.remote_button_mask);
