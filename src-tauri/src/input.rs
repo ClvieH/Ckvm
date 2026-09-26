@@ -45,6 +45,9 @@ const RETURN_EDGE_INSET: f64 = 0.0;
 const RETURN_COOLDOWN_MS: u64 = 150;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
+// Keep the 8 ms phase when a hardware callback arrives slightly early/late.
+// This is a scheduling tolerance, not a sleep or an input buffer.
+const MOUSE_MOVE_PACING_TOLERANCE: Duration = Duration::from_micros(500);
 #[cfg(target_os = "macos")]
 const MACOS_IDLE_CAPTURE_LOOP_MS: u64 = 100;
 #[cfg(target_os = "macos")]
@@ -2739,24 +2742,39 @@ fn clear_windows_capture_context() {
     }
 }
 
-fn should_send_mouse_move(last_sent: &Mutex<Option<Instant>>, dragging: bool) -> bool {
+fn should_send_mouse_move(last_tick: &Mutex<Option<Instant>>, dragging: bool) -> bool {
+    let Ok(mut last_tick) = last_tick.lock() else {
+        return true;
+    };
+    mouse_move_send_due(&mut last_tick, Instant::now(), dragging)
+}
+
+// From PR #22: pace on a schedule instead of "time since the last send".
+fn mouse_move_send_due(last_tick: &mut Option<Instant>, now: Instant, dragging: bool) -> bool {
     let interval = Duration::from_millis(if dragging {
         DRAG_MOVE_SEND_INTERVAL_MS
     } else {
         MOUSE_MOVE_SEND_INTERVAL_MS
     });
-    let Ok(mut last_sent) = last_sent.lock() else {
+    let Some(previous_tick) = *last_tick else {
+        *last_tick = Some(now);
         return true;
     };
-    let now = Instant::now();
-    if last_sent
-        .as_ref()
-        .map(|sent| now.duration_since(*sent) < interval)
-        .unwrap_or(false)
-    {
+    let next_tick = previous_tick + interval;
+    if now + MOUSE_MOVE_PACING_TOLERANCE < next_tick {
         return false;
     }
-    *last_sent = Some(now);
+
+    // Advance the scheduled tick, not the callback timestamp: resetting to
+    // `now` on every send can turn a jittery 125 Hz source into ~62.5 Hz.
+    // Keep at most 0.5 ms of phase debt, so late callbacks cannot accumulate
+    // catch-up credit. Consecutive sends stay at least interval - 1 ms apart,
+    // and the aggregate rate remains bounded by the original 8 ms cadence.
+    *last_tick = Some(if now.saturating_duration_since(next_tick) >= interval {
+        now // Resume immediately after idle, without replaying missed ticks.
+    } else {
+        next_tick.max(now.checked_sub(MOUSE_MOVE_PACING_TOLERANCE).unwrap_or(now))
+    });
     true
 }
 
@@ -7215,6 +7233,148 @@ mod tests {
             scale: 1.0,
             is_primary: true,
         }
+    }
+
+    #[test]
+    fn mouse_motion_can_send_at_125_hz_without_bypassing_the_rate_limit() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut sent_at = Vec::new();
+            // A 1 kHz source must not flood the network: only the initial
+            // sample and each subsequent 8 ms sample may be transmitted.
+            for ms in 0..=24 {
+                let now = start + Duration::from_millis(ms);
+                if mouse_move_send_due(&mut last_tick, now, dragging) {
+                    sent_at.push(ms);
+                }
+            }
+            assert_eq!(sent_at, vec![0, 8, 16, 24]);
+        }
+    }
+
+    #[test]
+    fn mouse_motion_keeps_125_hz_cadence_with_polling_jitter() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut sent = 0;
+            // Alternating 7.7/8.3 ms callbacks still represent a 125 Hz
+            // mouse. A strict elapsed-since-last-send gate loses half of them.
+            for sample in 0..=125 {
+                let micros = sample * 8_000 - (sample % 2) * 300;
+                if mouse_move_send_due(
+                    &mut last_tick,
+                    start + Duration::from_micros(micros),
+                    dragging,
+                ) {
+                    sent += 1;
+                }
+            }
+            assert_eq!(
+                sent, 126,
+                "125 Hz polling jitter must not halve the cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_motion_keeps_near_125_hz_cadence_without_phase_drift() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut sent = 0;
+            for sample in 0..=1_250 {
+                if mouse_move_send_due(
+                    &mut last_tick,
+                    start + Duration::from_micros(sample * 7_999),
+                    dragging,
+                ) {
+                    sent += 1;
+                }
+            }
+            assert!((1_249..=1_250).contains(&sent), "sent {sent} of 1251 samples");
+        }
+    }
+
+    #[test]
+    fn mouse_motion_bounds_spacing_and_rate_with_irregular_callbacks() {
+        let start = Instant::now();
+        let interval_us = MOUSE_MOVE_SEND_INTERVAL_MS * 1_000;
+        let tolerance_us = MOUSE_MOVE_PACING_TOLERANCE.as_micros() as u64;
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            let mut previous_send = None;
+            let mut sent = 0;
+            let mut micros = 0;
+            let mut random = 47_834_u64;
+            for _ in 0..100_000 {
+                let now = start + Duration::from_micros(micros);
+                if mouse_move_send_due(&mut last_tick, now, dragging) {
+                    if let Some(previous) = previous_send {
+                        assert!(micros - previous >= interval_us - 2 * tolerance_us);
+                    }
+                    previous_send = Some(micros);
+                    sent += 1;
+                    assert!(sent <= 1 + (micros + tolerance_us) / interval_us);
+                    // Multiple callbacks with the same timestamp cannot burst.
+                    assert!(!mouse_move_send_due(&mut last_tick, now, dragging));
+                }
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                micros += (random >> 32) % 16_001;
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_motion_resumes_after_idle_without_catch_up_credit() {
+        let start = Instant::now();
+        for dragging in [false, true] {
+            let mut last_tick = None;
+            assert!(mouse_move_send_due(&mut last_tick, start, dragging));
+            let resumed = start + Duration::from_secs(1);
+            assert!(mouse_move_send_due(&mut last_tick, resumed, dragging));
+            assert_eq!(last_tick, Some(resumed));
+            // No old ticks may be replayed while the next interval is pending.
+            for micros in 0..7_500 {
+                assert!(!mouse_move_send_due(
+                    &mut last_tick,
+                    resumed + Duration::from_micros(micros),
+                    dragging,
+                ));
+            }
+            assert!(mouse_move_send_due(
+                &mut last_tick,
+                resumed + Duration::from_millis(8),
+                dragging,
+            ));
+        }
+    }
+
+    #[test]
+    fn mouse_motion_forced_position_and_reset_start_a_new_phase() {
+        let last_tick = Mutex::new(Some(Instant::now() - Duration::from_secs(1)));
+        let before = Instant::now();
+        mark_mouse_move_sent(&last_tick);
+        let after = Instant::now();
+        let mut tick = last_tick.lock().expect("mouse pacing lock");
+        let forced = tick.expect("forced position should reset the phase");
+        assert!((before..=after).contains(&forced));
+        for dragging in [false, true] {
+            assert!(!mouse_move_send_due(&mut tick, forced, dragging));
+            assert!(!mouse_move_send_due(
+                &mut tick,
+                forced + Duration::from_millis(7),
+                dragging,
+            ));
+        }
+        drop(tick);
+        reset_mouse_move_timer(&last_tick);
+        let mut tick = last_tick.lock().expect("mouse pacing lock");
+        assert!(tick.is_none());
+        assert!(mouse_move_send_due(&mut tick, after, false));
     }
 
     /// Issue #34: a remote screen sits directly above the Mac's primary
