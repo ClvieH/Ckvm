@@ -224,6 +224,8 @@ export const TEXT = {
       fileTransfer: "文件传输失败。",
       writeClipboard: "写入剪贴板失败。",
       checkUpdate: "检查更新失败。",
+      updateManifestUnavailable:
+        "无法获取更新清单。请检查网络或代理设置，或打开 Releases 查看发布是否已完成。这不影响键鼠共享。",
       installUpdate: "下载安装更新失败。",
       updateSignatureMismatch:
         "更新包签名密钥与当前应用内置公钥不匹配，自动更新无法验证这个版本。请从 Releases 手动安装一次，或由发布者用正确的 TAURI_SIGNING_PRIVATE_KEY 重新签名发布。",
@@ -456,6 +458,8 @@ export const TEXT = {
       fileTransfer: "File transfer failed.",
       writeClipboard: "Failed to write clipboard.",
       checkUpdate: "Failed to check for updates.",
+      updateManifestUnavailable:
+        "The update manifest is unavailable. Check your network or proxy, or open Releases to see whether publishing has finished. Keyboard and mouse sharing are not affected.",
       installUpdate: "Failed to download and install the update.",
       updateSignatureMismatch:
         "The update package was signed with a different key than this app trusts. Install once from Releases manually, or re-sign the release with the matching TAURI_SIGNING_PRIVATE_KEY.",

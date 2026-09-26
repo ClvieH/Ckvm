@@ -1879,7 +1879,14 @@ function App() {
       setUpdateMessage(ui.settings.updateCurrent);
     } catch (error: unknown) {
       setUpdateStatus("error");
-      setUpdateMessage(formatUnknownError(error, ui.errors.checkUpdate));
+      setUpdateMessage(
+        formatUpdaterError(
+          error,
+          ui.errors.checkUpdate,
+          ui.errors.updateSignatureMismatch,
+          ui.errors.updateManifestUnavailable,
+        ),
+      );
     }
   }
 
@@ -1908,6 +1915,7 @@ function App() {
         error,
         ui.errors.installUpdate,
         ui.errors.updateSignatureMismatch,
+        ui.errors.updateManifestUnavailable,
       );
       setUpdateStatus("error");
       setUpdateMessage(`${errorText} ${ui.settings.updateFallback}`);
@@ -3942,8 +3950,12 @@ function formatUpdaterError(
   error: unknown,
   fallback: string,
   signatureMismatch: string,
+  manifestUnavailable: string,
 ) {
   const message = formatUnknownError(error, fallback);
+  if (/could not fetch a valid release json/i.test(message)) {
+    return manifestUnavailable;
+  }
   return /different key|signature.*key/i.test(message)
     ? signatureMismatch
     : message;

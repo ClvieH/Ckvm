@@ -379,7 +379,8 @@ export async function checkForAppUpdate(): Promise<AppUpdateCheckResult> {
   }
 
   const { check } = await import('@tauri-apps/plugin-updater')
-  const update = await check()
+  // A stalled manifest fetch left the check spinning (PR #22).
+  const update = await check({ timeout: 20_000 })
 
   if (!update) {
     return { available: false }
@@ -410,7 +411,8 @@ export async function installAppUpdate(): Promise<void> {
     import('@tauri-apps/plugin-updater'),
     import('@tauri-apps/plugin-process'),
   ])
-  const update = await check()
+  // A stalled manifest fetch left the check spinning (PR #22).
+  const update = await check({ timeout: 20_000 })
 
   if (!update) {
     return
