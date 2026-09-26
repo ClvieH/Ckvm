@@ -228,8 +228,6 @@ struct ActiveTarget {
     current_screen_id: String,
     x: f64,
     y: f64,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    invert_y: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -561,7 +559,6 @@ fn request_screen_switch_from_point(
         current_screen_id: target.screen_id.clone(),
         x: remote_x,
         y: remote_y,
-        invert_y: false,
     })
 }
 
@@ -858,7 +855,6 @@ fn start_platform_capture(
     let target_count = targets.len();
 
     thread::spawn(move || {
-        let local_y_bounds = local_y_bounds(&targets);
         let display_snapshots = mac_display_snapshots();
         enable_macos_background_cursor_hide();
         let context = Arc::new(MacCaptureContext {
@@ -887,7 +883,6 @@ fn start_platform_capture(
             suppress_next_mouse_delta: AtomicBool::new(false),
             hotkey_return_point: Mutex::new(None),
             local_screen_points: Mutex::new(HashMap::new()),
-            local_y_bounds,
             display_snapshots,
             drag_count_at_left_down: std::sync::atomic::AtomicI64::new(
                 macos_appkit::change_count(),
@@ -2550,7 +2545,6 @@ struct MacCaptureContext {
     suppress_next_mouse_delta: AtomicBool,
     hotkey_return_point: Mutex<Option<(f64, f64)>>,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
-    local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
     // Edge drag-drop (ShareMouse-style): the drag pasteboard's changeCount as
     // of the last LOCAL left-button press. A left-drag that crosses the edge
@@ -3898,7 +3892,6 @@ fn handle_macos_mouse_move(
     let location = event.location();
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
-            let dy = if active_target.invert_y { -dy } else { dy };
             if context
                 .suppress_next_mouse_delta
                 .swap(false, Ordering::Relaxed)
@@ -3916,7 +3909,6 @@ fn handle_macos_mouse_move(
 
             if update_active_remote_screen(active_target, dx, dy, &context.layout_state) {
                 let point = local_return_point(active_target);
-                let invert_y = active_target.invert_y;
                 let target = active_target.target.clone();
                 // Control is returning to the local machine: park the controlled
                 // cursor in a corner so it doesn't visibly linger at the shared
@@ -3949,7 +3941,6 @@ fn handle_macos_mouse_move(
                 if let Ok(mut anchor) = context.anchor.lock() {
                     *anchor = None;
                 }
-                let point = mac_cursor_point(context, point, invert_y);
                 // Smooth slide-back: drop the post-warp local-events suppression
                 // for just this final warp so the local pointer tracks the mouse
                 // immediately instead of freezing for ~0.25s. Re-associating then
@@ -4026,14 +4017,8 @@ fn handle_macos_mouse_move(
             }
         }
     }
-    if let Some(active_target) =
-        mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
-    {
-        let anchor = mac_cursor_point(
-            context,
-            local_anchor_point(&active_target),
-            active_target.invert_y,
-        );
+    if let Some(active_target) = crossing_target(&targets, location.x, location.y, dx, dy) {
+        let anchor = local_anchor_point(&active_target);
         dismiss_macos_dock_ui_if_up();
         set_macos_cursor_decoupled(true);
         set_macos_warp_suppression_interval(0.0);
@@ -4573,24 +4558,12 @@ pub(crate) mod macos_appkit {
     }
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn crossing_target(
     targets: &[InputTarget],
     x: f64,
     y: f64,
     dx: f64,
     dy: f64,
-) -> Option<ActiveTarget> {
-    crossing_target_with_transform(targets, x, y, dx, dy, false)
-}
-
-fn crossing_target_with_transform(
-    targets: &[InputTarget],
-    x: f64,
-    y: f64,
-    dx: f64,
-    dy: f64,
-    invert_y: bool,
 ) -> Option<ActiveTarget> {
     targets
         .iter()
@@ -4633,7 +4606,6 @@ fn crossing_target_with_transform(
                 current_screen_id: target.screen_id.clone(),
                 x: remote_x,
                 y: remote_y,
-                invert_y,
             }
         })
 }
@@ -4725,62 +4697,6 @@ fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: 
                 && x <= right + CROSSING_MARGIN
         }
     }
-}
-
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn local_y_bounds(targets: &[InputTarget]) -> Option<(f64, f64)> {
-    let mut min_y: Option<i32> = None;
-    let mut max_y: Option<i32> = None;
-
-    for target in targets {
-        let top = target.local_screen.y;
-        let bottom = target.local_screen.y + target.local_screen.height;
-        min_y = Some(min_y.map_or(top, |current| current.min(top)));
-        max_y = Some(max_y.map_or(bottom, |current| current.max(bottom)));
-    }
-
-    Some((min_y? as f64, max_y? as f64))
-}
-
-#[cfg(target_os = "macos")]
-fn mac_crossing_target(
-    context: &MacCaptureContext,
-    targets: &[InputTarget],
-    x: f64,
-    y: f64,
-    dx: f64,
-    dy: f64,
-) -> Option<ActiveTarget> {
-    if let Some(target) =
-        crossing_target_with_transform(targets, x, y, dx, dy, false)
-    {
-        return Some(target);
-    }
-
-    let Some((min_y, max_y)) = local_y_bounds(targets).or(context.local_y_bounds) else {
-        return None;
-    };
-    let flipped_y = min_y + max_y - y;
-    if (flipped_y - y).abs() < 0.5 {
-        return None;
-    }
-
-    crossing_target_with_transform(targets, x, flipped_y, dx, -dy, true)
-}
-
-#[cfg(target_os = "macos")]
-fn mac_cursor_point(context: &MacCaptureContext, point: (f64, f64), invert_y: bool) -> (f64, f64) {
-    if !invert_y {
-        return point;
-    }
-
-    local_y_bounds(&current_input_targets(
-        &context.layout_state,
-        &context.native_layout,
-    ))
-    .or(context.local_y_bounds)
-    .map(|(min_y, max_y)| (point.0, min_y + max_y - point.1))
-    .unwrap_or(point)
 }
 
 /// After a raw delta has been applied to `active.x`/`active.y`, reconcile which
@@ -5068,11 +4984,7 @@ fn enter_remote_target_macos(context: &MacCaptureContext, active_target: ActiveT
     use core_graphics::geometry::CGPoint;
 
     let return_point = macos_current_cursor_location().map(|point| (point.x, point.y));
-    let anchor = mac_cursor_point(
-        context,
-        local_anchor_point(&active_target),
-        active_target.invert_y,
-    );
+    let anchor = local_anchor_point(&active_target);
     if !send_remote_mouse_move(
         &context.quic_transport,
         &active_target,
@@ -5139,7 +5051,6 @@ fn return_to_local_macos(context: &MacCaptureContext) {
         .ok()
         .and_then(|mut point| point.take());
     let point = local_hotkey_return_point(&active_target, recorded_point);
-    let invert_y = active_target.invert_y;
     let target = active_target.target.clone();
     let _ = send_remote_cursor_park(
         &context.quic_transport,
@@ -5162,11 +5073,6 @@ fn return_to_local_macos(context: &MacCaptureContext) {
     if let Ok(mut anchor) = context.anchor.lock() {
         *anchor = None;
     }
-    let point = if recorded_point.is_some() {
-        point
-    } else {
-        mac_cursor_point(context, point, invert_y)
-    };
     set_macos_warp_suppression_interval(0.0);
     move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
     set_macos_cursor_decoupled(false);
@@ -7299,6 +7205,35 @@ mod tests {
         }
     }
 
+    /// Issue #34: a remote screen sits directly above the Mac's primary
+    /// display, next to a portrait display that has no crossing target.
+    fn top_neighbour_target() -> InputTarget {
+        let mut target = target_for_coordinate_tests();
+        target.local_screen = screen("local-device", "local-display-1", 0, 0, 1680, 1050);
+        target.layout_local_screen = target.local_screen.clone();
+        target.remote_screen = screen("peer-device", "peer-device-local-display-1", -240, -1080, 1920, 1080);
+        target.edge = Edge::Top;
+        target
+    }
+
+    #[test]
+    fn bottom_push_never_crosses_top_neighbour() {
+        assert!(crossing_target(&[top_neighbour_target()], 800.0, 1049.0, 0.0, 3.0).is_none());
+    }
+
+    #[test]
+    fn top_push_crosses_top_neighbour() {
+        let active = crossing_target(&[top_neighbour_target()], 800.0, 0.0, 0.0, -3.0)
+            .expect("an upward push at the top edge crosses");
+        assert_eq!(active.target.edge, Edge::Top);
+    }
+
+    #[test]
+    fn targetless_stacked_display_stays_local() {
+        // Bottom of the 1080x1920 portrait display at x=1680.., pushed down.
+        assert!(crossing_target(&[top_neighbour_target()], 2000.0, 1919.0, 0.0, 3.0).is_none());
+    }
+
     fn target_for_coordinate_tests() -> InputTarget {
         InputTarget {
             device_id: "peer-device".into(),
@@ -7454,7 +7389,6 @@ mod tests {
             current_screen_id: "scr-1".into(),
             x: 100.0,
             y: 1079.0,
-            invert_y: false,
         };
 
         // Pushing down past the primary's bottom edge roams onto the secondary.
@@ -7509,7 +7443,6 @@ mod tests {
             current_screen_id: "local-display-1".into(),
             x: 0.0,
             y: 500.0,
-            invert_y: false,
         };
 
         // Crossed in via the right edge; moving back left off the entry edge
@@ -7557,7 +7490,6 @@ mod tests {
             current_screen_id: "local-display-1".into(),
             x: 1.0,
             y: 500.0,
-            invert_y: false,
         };
         // Simulate the small leftward delta the entry-anchor warp can inject.
         // (Was -RETURN_EDGE_INSET; now that the inset is 0 for edge-flush returns,
@@ -7690,7 +7622,6 @@ mod tests {
             current_screen_id: remote.id.clone(),
             x: 12.0,
             y: 700.0,
-            invert_y: false,
         };
 
         // Controlled Windows: right edge at the exit height, never the
@@ -7930,7 +7861,6 @@ mod tests {
                 current_screen_id: "local-display-1".into(),
                 x: x + dx,
                 y: y + dy,
-                invert_y: false,
             };
 
             assert!(update_active_remote_screen(
