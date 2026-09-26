@@ -66,8 +66,10 @@ const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
-const CLIPBOARD_WRITE_ATTEMPTS: usize = 5;
-const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 30;
+// Progressive 50, 100, ... 450 ms (~2.25 s in all) outlasts another process
+// holding the clipboard open (PR #22).
+const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
+const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
 /// Prefix of a drag-control send error: the peer never opened a drag session.
@@ -6029,7 +6031,7 @@ where
             Err(error) => last_error = Some(error),
         }
         if attempt + 1 < attempts && !retry_delay.is_zero() {
-            thread::sleep(retry_delay);
+            thread::sleep(retry_delay * (attempt as u32 + 1));
         }
     }
 
