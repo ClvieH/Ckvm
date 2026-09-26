@@ -3589,6 +3589,22 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
     sent
 }
 
+/// Precision touchpads and smooth wheels report fractions of the 120-unit
+/// notch; plain integer division dropped every one, so remote scrolling did
+/// nothing. Carry the remainder per axis until it adds up to a whole notch,
+/// the unit the wire carries. (PR #22 rounded each event up instead, which
+/// makes a touchpad scroll many times too fast.)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn wheel_notches(horizontal: bool, raw: i16) -> Option<i32> {
+    use std::sync::atomic::AtomicI32;
+    // The low-level hook runs on one thread.
+    static REMAINDER: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
+    let remainder = &REMAINDER[usize::from(horizontal)];
+    let total = remainder.load(Ordering::Relaxed) + i32::from(raw);
+    remainder.store(total % 120, Ordering::Relaxed);
+    Some(total / 120).filter(|notches| *notches != 0)
+}
+
 #[cfg(target_os = "windows")]
 fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_data: u32) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MOUSEHWHEEL, WM_MOUSEWHEEL};
@@ -3601,7 +3617,10 @@ fn handle_windows_scroll(context: &WindowsCaptureContext, message: u32, mouse_da
     let Some(active_target) = active else {
         return false;
     };
-    let delta = ((mouse_data >> 16) as i16 / 120) as i32;
+    let Some(delta) = wheel_notches(message == WM_MOUSEHWHEEL, (mouse_data >> 16) as i16) else {
+        // Part of a notch: swallowed while remote, sent once it adds up.
+        return true;
+    };
     let (delta_x, delta_y) = if message == WM_MOUSEHWHEEL {
         (delta, 0)
     } else if message == WM_MOUSEWHEEL {
@@ -7375,6 +7394,19 @@ mod tests {
         let mut tick = last_tick.lock().expect("mouse pacing lock");
         assert!(tick.is_none());
         assert!(mouse_move_send_due(&mut tick, after, false));
+    }
+
+    #[test]
+    fn wheel_notches_carry_touchpad_fractions() {
+        // The vertical axis only; the statics are per axis.
+        let sent: Vec<_> = [40, 40, 40, 40, 120, -30, -100, -110]
+            .into_iter()
+            .map(|raw| wheel_notches(false, raw))
+            .collect();
+        assert_eq!(
+            sent,
+            [None, None, Some(1), None, Some(1), None, None, Some(-1)]
+        );
     }
 
     /// Issue #34: a remote screen sits directly above the Mac's primary
