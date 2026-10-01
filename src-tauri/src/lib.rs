@@ -73,6 +73,10 @@ const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
 const CLIPBOARD_WRITE_RETRY_DELAY_MS: u64 = 50;
 const FILE_TRANSFER_PROTOCOL: &str = "mykvm.file-transfer.v1";
 const DRAG_CONTROL_PROTOCOL: &str = "mykvm.drag-control.v1";
+const LOG_REQUEST_PROTOCOL: &str = "mykvm.log-request.v1";
+// A paired peer asks for this device's recent log; the reply is the tail of the
+// device's newest log file, streamed back over the file-transfer path.
+const CLIENT_LOG_TAIL_BYTES: u64 = 512 * 1024;
 /// Prefix of a drag-control send error: the peer never opened a drag session.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DRAG_CONTROL_FAILED: &str = "拖放控制失败";
@@ -572,6 +576,10 @@ struct FileTransferPacket {
     // instead of placing it immediately.
     #[serde(default)]
     drag_drop: bool,
+    // A device's log fetched by its peer: land it in the "MyKVM Remote Logs"
+    // folder instead of the transfers folder.
+    #[serde(default)]
+    client_log: bool,
 }
 
 struct AppRuntime {
@@ -861,6 +869,16 @@ impl AppRuntime {
             let current_peer = local_peer_from_layout(&layout);
 
             if handle_drag_control_packet(&payload, &layout, &current_peer.id) {
+                transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+
+            if handle_log_request_packet(
+                &payload,
+                &layout,
+                &current_peer.id,
+                &app_handle_for_file_transfer,
+            ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
@@ -2385,6 +2403,51 @@ fn send_files_to_device_inner(
     })
 }
 
+/// Ask an online peer (a client, or the paired controller) for its recent log.
+/// The log arrives asynchronously in the "MyKVM Remote Logs" folder (which this
+/// opens); returns its path.
+#[tauri::command]
+fn fetch_client_log(
+    device_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<String, String> {
+    let state = state.inner();
+    state.start_discovery()?;
+    let layout = state.layout_snapshot();
+    if !layout.file_transfer_enabled {
+        return Err("文件传输未开启，无法拉取日志。".into());
+    }
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready; start the runtime first.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
+
+    let packet = LogRequestPacket {
+        protocol: LOG_REQUEST_PROTOCOL.into(),
+        origin_id: local_peer.id.clone(),
+        target_id: target.device_id.clone(),
+        cluster_id: target.cluster_id.clone(),
+        pair_secret: target.pair_secret.clone(),
+    };
+    let payload = encode_wire_packet(&packet)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    quic_transport
+        .send_stream_expect_ack(peer, payload)
+        .map_err(|error| format!("拉取日志失败: {error}"))?;
+
+    let dir = client_log_dir(&state.app_handle)?;
+    let _ = fs::create_dir_all(&dir);
+    let _ = open_external_path(&dir);
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 fn sync_window_chrome(window: tauri::WebviewWindow, theme: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -3514,6 +3577,7 @@ pub fn run() {
             uninstall_input_service,
             send_secure_attention,
             send_files_to_device,
+            fetch_client_log,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -6540,6 +6604,8 @@ enum DropMode {
     /// ShareMouse-style: stage, then drop into the folder under the cursor when
     /// the drag is released (else Desktop).
     DragDrop,
+    /// A device's log fetched on request; lands in the "MyKVM Remote Logs" folder.
+    ClientLog,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6570,6 +6636,7 @@ fn file_transfer_packet(
         data,
         drop_to_desktop: drop_mode == DropMode::Desktop,
         drag_drop: drop_mode == DropMode::DragDrop,
+        client_log: drop_mode == DropMode::ClientLog,
     }
 }
 
@@ -7067,7 +7134,9 @@ fn handle_file_transfer_packet(
     //    under the cursor, or Desktop) happens when the drag is released.
     //  - drop_to_desktop → straight onto the Desktop.
     //  - otherwise → the transfers folder (None here).
-    let drop_root = if packet.drag_drop {
+    let drop_root = if packet.client_log {
+        client_log_dir(app).ok()
+    } else if packet.drag_drop {
         Some(receive_root.join(".mykvm-drag-staging"))
     } else if packet.drop_to_desktop {
         app.path().desktop_dir().ok()
@@ -7093,6 +7162,148 @@ fn file_transfer_receive_root(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map(|directory| directory.join("MyKVM Transfers"))
         .map_err(|error| format!("failed to resolve file transfer receive directory: {error}"))
+}
+
+/// Where logs fetched from other devices land.
+fn client_log_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(downloads) = app.path().download_dir() {
+        return Ok(downloads.join("MyKVM Remote Logs"));
+    }
+    app.path()
+        .app_data_dir()
+        .map(|directory| directory.join("MyKVM Remote Logs"))
+        .map_err(|error| format!("failed to resolve client log directory: {error}"))
+}
+
+/// Read at most the last `max_bytes` bytes of `path`.
+fn tail_of_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max_bytes {
+        file.seek(SeekFrom::Start(len - max_bytes))?;
+    }
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    Ok(tail)
+}
+
+/// Copy the tail of this machine's newest log file into a temp file named after
+/// this device, ready to stream back to whoever asked. Returns the temp path.
+fn write_own_log_tail(app: &AppHandle, device_name: &str) -> Result<PathBuf, String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log dir: {error}"))?;
+    // The plugin keeps the live log plus rotated copies; the newest by mtime is
+    // the one currently being written.
+    let newest = fs::read_dir(&log_dir)
+        .map_err(|error| format!("failed to read log dir: {error}"))?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+        })
+        .max_by_key(|entry| {
+            entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
+        .map(|entry| entry.path())
+        .ok_or_else(|| "no log file found".to_string())?;
+
+    let tail = tail_of_file(&newest, CLIENT_LOG_TAIL_BYTES)
+        .map_err(|error| format!("failed to read log: {error}"))?;
+
+    let safe_name = device_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let file_name = format!("{}-{}.log", safe_name.trim_matches('-'), now_ms());
+    let temp_path = std::env::temp_dir().join(file_name);
+    fs::write(&temp_path, &tail).map_err(|error| format!("failed to stage log: {error}"))?;
+    Ok(temp_path)
+}
+
+// Control channel: a paired peer asks a device for its recent log. The reply
+// travels back as an ordinary file transfer tagged `client_log`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogRequestPacket {
+    protocol: String,
+    origin_id: String,
+    target_id: String,
+    cluster_id: String,
+    pair_secret: String,
+}
+
+/// Device side: a paired peer asked for our log. Reuses the file-transfer trust
+/// checks, then streams our log tail back on a thread (the stream handler must
+/// not block on the round-trip). Returns true if the packet was a log request
+/// addressed to us.
+fn handle_log_request_packet(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+    app: &AppHandle,
+) -> bool {
+    let Some(packet) = decode_wire_packet::<LogRequestPacket>(payload) else {
+        return false;
+    };
+    if packet.protocol != LOG_REQUEST_PROTOCOL {
+        return false;
+    }
+    if !layout.file_transfer_enabled {
+        return true;
+    }
+    if layout.cluster_id.trim().is_empty()
+        || layout.pair_secret.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.pair_secret != layout.pair_secret
+    {
+        return true;
+    }
+    if layout.machine_role == "client"
+        && !layout.paired_controllers.is_empty()
+        && !layout
+            .paired_controllers
+            .iter()
+            .any(|controller| controller.id == packet.origin_id)
+    {
+        return true;
+    }
+    if packet.target_id != local_peer_id || packet.origin_id == local_peer_id {
+        return true;
+    }
+
+    let device_name = local_peer_from_layout(layout).name;
+    let app = app.clone();
+    let origin_id = packet.origin_id;
+    thread::spawn(move || {
+        let temp_path = match write_own_log_tail(&app, &device_name) {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!("log request: could not stage log: {error}");
+                return;
+            }
+        };
+        let state = app.state::<AppRuntime>();
+        let path = temp_path.to_string_lossy().into_owned();
+        match send_files_to_device_inner(state.inner(), &origin_id, &[path], DropMode::ClientLog) {
+            Ok(summary) => log::info!(
+                "log request: sent {} to {}",
+                format_bytes(summary.byte_count),
+                summary.target_name
+            ),
+            Err(error) => log::warn!("log request: send failed: {error}"),
+        }
+        let _ = fs::remove_file(&temp_path);
+    });
+    true
 }
 
 #[cfg(test)]
@@ -10277,7 +10488,18 @@ mod tests {
             data: data.to_vec(),
             drop_to_desktop: false,
             drag_drop: false,
+            client_log: false,
         }
+    }
+
+    #[test]
+    fn tail_of_file_returns_only_the_last_bytes() {
+        let path = std::env::temp_dir().join(format!("mykvm-tail-{}.log", random_hex(6)));
+        fs::write(&path, b"0123456789").expect("write");
+        assert_eq!(tail_of_file(&path, 4).expect("tail"), b"6789");
+        // Smaller than the cap: the whole file.
+        assert_eq!(tail_of_file(&path, 100).expect("tail"), b"0123456789");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

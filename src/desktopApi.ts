@@ -297,6 +297,14 @@ export async function sendFilesToDevice(deviceId: string, paths: string[]): Prom
   return invoke<FileTransferSummary>('send_files_to_device', { deviceId, paths })
 }
 
+export async function fetchClientLog(deviceId: string): Promise<string> {
+  if (!isTauri()) {
+    return ''
+  }
+
+  return invoke<string>('fetch_client_log', { deviceId })
+}
+
 export async function relaunchApp(): Promise<void> {
   if (!isTauri()) {
     window.location.reload()

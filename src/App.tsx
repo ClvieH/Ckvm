@@ -36,6 +36,7 @@ import {
   restartAsAdmin,
   saveLayout,
   sendFilesToDevice,
+  fetchClientLog,
   setAutostart,
   scanLanPeers,
   startRuntime,
@@ -969,6 +970,42 @@ function App() {
 
     try {
       await openLogDirectory();
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsDiagnosticPending(false);
+    }
+  }
+
+  async function handleFetchClientLog() {
+    const layout = snapshotRef.current?.layout;
+    // A server fetches its online clients' logs; a client its controller's.
+    const targetIds = !layout
+      ? []
+      : layout.machineRole === "client"
+        ? layout.pairedControllers.map((controller) => controller.id)
+        : layout.devices
+            .filter(
+              (device) =>
+                device.role !== "local" &&
+                device.online &&
+                device.inputReady &&
+                device.transportPublicKey.trim().length > 0,
+            )
+            .map((device) => device.id);
+    if (targetIds.length === 0) {
+      setDiagnosticMessage(ui.settings.fetchClientLogNoTarget);
+      return;
+    }
+    setIsDiagnosticPending(true);
+    setDiagnosticMessage(null);
+    try {
+      for (const deviceId of targetIds) {
+        await fetchClientLog(deviceId);
+      }
+      setDiagnosticMessage(ui.settings.fetchClientLogSent);
     } catch (error: unknown) {
       setErrorMessage(
         error instanceof Error ? error.message : ui.errors.updateRuntime,
@@ -3201,6 +3238,18 @@ function App() {
                   >
                     {ui.settings.openLogDirectory}
                   </button>
+                  {machineRole === "server" || machineRole === "client" ? (
+                    <button
+                      type="button"
+                      className="secondary-button compact-button"
+                      onClick={() => void handleFetchClientLog()}
+                      disabled={isDiagnosticPending || !isTauri()}
+                    >
+                      {machineRole === "client"
+                        ? ui.settings.fetchServerLog
+                        : ui.settings.fetchClientLog}
+                    </button>
+                  ) : null}
                 </div>
                 {diagnosticMessage ? (
                   <p className="muted-copy diagnostic-message">
