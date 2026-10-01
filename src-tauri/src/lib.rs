@@ -3703,6 +3703,15 @@ fn set_main_window_visible(app: &AppHandle, visible: bool) {
     if let Some(state) = app.try_state::<AppRuntime>() {
         state.main_window_visible.store(visible, Ordering::Relaxed);
     }
+    // With no window on screen (closed, or minimized — the visibility watcher
+    // catches the native yellow button / Cmd+M) MyKVM lives in the tray: drop
+    // out of the Dock and Cmd+Tab, and come back as a regular app when shown.
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(if visible {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    });
 }
 
 fn set_main_window_focused(app: &AppHandle, focused: bool) {
