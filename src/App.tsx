@@ -609,7 +609,8 @@ function App() {
           const currentSnapshot = snapshotRef.current;
           if (
             currentSnapshot?.layout.machineRole === "client" &&
-            currentSnapshot.layout.pairedControllers.length === 0 &&
+            (currentSnapshot.layout.pairedControllers.length === 0 ||
+              currentSnapshot.runtime?.pairing.state === "requested") &&
             nextRuntime.pairing.state === "paired"
           ) {
             void loadAppState()

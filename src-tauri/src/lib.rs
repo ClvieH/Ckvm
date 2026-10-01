@@ -743,51 +743,7 @@ impl AppRuntime {
     }
 
     fn pairing_status_for_layout(&self, layout: &LayoutState) -> PairingStatus {
-        if layout.machine_role != "client" {
-            return idle_pairing_status();
-        }
-
-        if !layout.paired_controllers.is_empty() {
-            return PairingStatus {
-                state: "paired".into(),
-                code: String::new(),
-                requester_name: String::new(),
-                requester_ip: String::new(),
-                expires_at_ms: 0,
-                detail: "客户端已配对，只对白名单服务端响应。".into(),
-            };
-        }
-
-        let now = Instant::now();
-        if let Ok(mut challenge) = self.pairing_challenge.lock() {
-            if challenge
-                .as_ref()
-                .map(|challenge| challenge.expires_at <= now)
-                .unwrap_or(false)
-            {
-                *challenge = None;
-            }
-
-            if let Some(challenge) = challenge.as_ref() {
-                return PairingStatus {
-                    state: "requested".into(),
-                    code: challenge.code.clone(),
-                    requester_name: challenge.requester_name.clone(),
-                    requester_ip: challenge.requester_ip.clone(),
-                    expires_at_ms: challenge.expires_at_ms,
-                    detail: "服务端正在请求配对，请在服务端输入此验证码。".into(),
-                };
-            }
-        }
-
-        PairingStatus {
-            state: "available".into(),
-            code: String::new(),
-            requester_name: String::new(),
-            requester_ip: String::new(),
-            expires_at_ms: 0,
-            detail: "客户端等待服务端发起配对。".into(),
-        }
+        pairing_status(layout, &self.pairing_challenge)
     }
 
     fn quic_transport_handle(&self) -> Option<quic_transport::TransportHandle> {
@@ -8584,6 +8540,61 @@ fn handle_pairing_stream_packet(
     }
 }
 
+/// What the client's pairing panel shows. A live challenge wins over "paired":
+/// `begin_pairing_challenge` lets a known controller re-pair (rotated key, or
+/// the two machines swapped roles), and answering "paired" with an empty code
+/// popped the window up with no code to type on the server.
+fn pairing_status(
+    layout: &LayoutState,
+    pairing_challenge: &Mutex<Option<PairingChallenge>>,
+) -> PairingStatus {
+    if layout.machine_role != "client" {
+        return idle_pairing_status();
+    }
+
+    let now = Instant::now();
+    if let Ok(mut challenge) = pairing_challenge.lock() {
+        if challenge
+            .as_ref()
+            .map(|challenge| challenge.expires_at <= now)
+            .unwrap_or(false)
+        {
+            *challenge = None;
+        }
+
+        if let Some(challenge) = challenge.as_ref() {
+            return PairingStatus {
+                state: "requested".into(),
+                code: challenge.code.clone(),
+                requester_name: challenge.requester_name.clone(),
+                requester_ip: challenge.requester_ip.clone(),
+                expires_at_ms: challenge.expires_at_ms,
+                detail: "服务端正在请求配对，请在服务端输入此验证码。".into(),
+            };
+        }
+    }
+
+    if !layout.paired_controllers.is_empty() {
+        return PairingStatus {
+            state: "paired".into(),
+            code: String::new(),
+            requester_name: String::new(),
+            requester_ip: String::new(),
+            expires_at_ms: 0,
+            detail: "客户端已配对，只对白名单服务端响应。".into(),
+        };
+    }
+
+    PairingStatus {
+        state: "available".into(),
+        code: String::new(),
+        requester_name: String::new(),
+        requester_ip: String::new(),
+        expires_at_ms: 0,
+        detail: "客户端等待服务端发起配对。".into(),
+    }
+}
+
 fn begin_pairing_challenge(
     pairing_challenge: &Arc<Mutex<Option<PairingChallenge>>>,
     layout: &LayoutState,
@@ -9608,6 +9619,14 @@ mod tests {
             stored.as_ref().expect("challenge").requester_id,
             requester.id
         );
+        let code = stored.as_ref().expect("challenge").code.clone();
+        drop(stored);
+
+        // The already-paired client must show this code, not "paired": the
+        // window popped up with nothing to type on the server.
+        let status = pairing_status(&layout, &challenge);
+        assert_eq!(status.state, "requested");
+        assert_eq!(status.code, code);
     }
 
     #[test]
