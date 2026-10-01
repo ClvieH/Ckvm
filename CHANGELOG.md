@@ -13,8 +13,16 @@ release will reuse them).
 - Manually added peers keep their selected connection IP, including after pairing, rediscovery, and address changes (#26).
 - Drag-and-drop files across machines (ShareMouse-style, experimental): drag files on the machine that owns the keyboard and mouse onto a controlled machine. Controlling Windows → Mac: drag files toward the screen edge that borders the Mac — a document icon follows the cursor onto the Mac, and releasing over an open Finder folder drops the files there (otherwise the Desktop). Controlling Mac → Windows client is also in. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
 - Drag files the other way too — from a controlled machine back to the controller. While controlling a Mac from Windows, grab a file on the Mac and drag it back across the edge onto Windows: it becomes a real native drag on Windows that you can drop into any folder, app, or field. Requires both sides on this version or newer.
+- Fetch the other machine's log from Settings → Diagnostics: a server pulls its online clients' logs ("Fetch Client Log"), a client pulls its server's ("Fetch Server Log"). The log lands in Downloads/MyKVM Remote Logs, so troubleshooting no longer means copying files between machines. Requires both sides on this version or newer.
 
 ### Fixed
+
+- One input that fails to send (the connection is being rebuilt, a Wi-Fi hiccup) no longer hands control back to the controlling machine; only inputs that keep failing for a second do. Before, your next keys and shortcuts could land on the controlling machine while you were still looking at the other screen, until you moved the mouse over again.
+- Pairing a client that was already paired (the two machines swapped roles, or the server was reinstalled) now shows the pairing code on the client, instead of bringing its window up with no code to type.
+- macOS: crossing from the Mac onto another machine hides the Mac cursor right away, instead of leaving it painted at the screen edge for up to a second.
+- macOS: with its window closed or minimized, MyKVM leaves the Dock and Cmd+Tab and stays in the menu bar; it comes back when the window is shown.
+- A machine running a proxy in TUN mode (Clash, Mihomo, Surge, sing-box) keeps the same device identity whether the proxy is on or off, instead of showing up as a second device.
+- Clipboard sync to a machine that stopped answering backs off to one retry a minute and logs once, instead of retrying every 2 seconds and filling the log.
 
 - macOS: memory no longer grows with every image received through clipboard sync. Each synced image leaked its full size, so a few dozen screenshots could push MyKVM to around 2 GB (discussion #32).
 - Controlling another machine no longer drops you back to local control when that machine refuses a clipboard sync (for example clipboard sync is off there, or it runs an older version). The keyboard/mouse connection stays up, refused content is not re-sent every 2 seconds, and large clipboard images get enough time to be acknowledged.
