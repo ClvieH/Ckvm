@@ -1065,6 +1065,7 @@ fn start_platform_capture(
             pressed_keys: Mutex::new(Vec::new()),
             tap_disabled: AtomicBool::new(false),
             just_crossed: AtomicBool::new(false),
+            decouple_pending: AtomicBool::new(false),
             suppress_next_mouse_delta: AtomicBool::new(false),
             hotkey_return_point: Mutex::new(None),
             local_screen_points: Mutex::new(HashMap::new()),
@@ -2792,6 +2793,9 @@ struct MacCaptureContext {
     pressed_keys: Mutex<Vec<u16>>,
     tap_disabled: AtomicBool,
     just_crossed: AtomicBool,
+    // Crossed into a remote but no mouse event has arrived since: the cursor
+    // stays attached until that event draws the hide (hide_and_pin_macos_cursor).
+    decouple_pending: AtomicBool,
     suppress_next_mouse_delta: AtomicBool,
     hotkey_return_point: Mutex<Option<(f64, f64)>>,
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
@@ -4257,6 +4261,12 @@ fn handle_macos_mouse_move(
     let location = event.location();
     if let Ok(mut active) = context.active.lock() {
         if let Some(active_target) = active.as_mut() {
+            // First mouse event since crossing: it moved the still-attached
+            // cursor, which draws the hide. Now detach and pin.
+            if context.decouple_pending.swap(false, Ordering::Relaxed) {
+                set_macos_cursor_decoupled(true);
+                force_repin_macos_cursor_to_anchor(context);
+            }
             if context
                 .suppress_next_mouse_delta
                 .swap(false, Ordering::Relaxed)
@@ -5423,7 +5433,14 @@ fn hide_and_pin_macos_cursor(context: &MacCaptureContext, edge: Edge, anchor: (f
     use core_graphics::geometry::CGPoint;
 
     hide_macos_cursor_if_needed(context);
-    set_macos_cursor_decoupled(true);
+    // A background app's hide is counted at once (CGCursorIsVisible turns false
+    // within 2 ms) but only DRAWN by the next mouse-driven cursor update. A
+    // detached cursor gets none — warps do not count — so it stayed painted at
+    // the edge until macOS re-attached it on its own (~1 s, varying). Keep it
+    // attached (as Deskflow's hideCursor does) so the first remote mouse event
+    // draws the hide; that event detaches it and pins it to the anchor.
+    set_macos_cursor_decoupled(false);
+    context.decouple_pending.store(true, Ordering::Relaxed);
     set_macos_warp_suppression_interval(0.0);
     let (inward_x, inward_y) = match edge {
         Edge::Right => (-1.0, 0.0),
@@ -5431,11 +5448,11 @@ fn hide_and_pin_macos_cursor(context: &MacCaptureContext, edge: Edge, anchor: (f
         Edge::Bottom => (0.0, -1.0),
         Edge::Top => (0.0, 1.0),
     };
+    // 1 px in, so even a push straight into the edge moves the cursor for real.
     move_macos_cursor_without_event(
         context,
         CGPoint::new(anchor.0 + inward_x, anchor.1 + inward_y),
     );
-    move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
 }
 
 #[cfg(target_os = "macos")]
@@ -5545,6 +5562,10 @@ fn return_to_local_macos(context: &MacCaptureContext) {
 /// those APIs are stack-based and must stay one enter paired with one return.
 #[cfg(target_os = "macos")]
 fn repin_macos_cursor_while_remote(context: &MacCaptureContext) {
+    // Detaching before the first mouse event would strand the hide undrawn.
+    if context.decouple_pending.load(Ordering::Relaxed) {
+        return;
+    }
     set_macos_cursor_decoupled(true);
     if !context.main_window_visible.load(Ordering::Relaxed) {
         let drifted = if let Some(location) = macos_current_cursor_location() {
