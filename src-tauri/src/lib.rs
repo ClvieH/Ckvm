@@ -67,6 +67,8 @@ const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_POLL_INTERVAL_MS: u64 = 150;
 const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
+// A peer that stays down doubles the wait each time, up to a minute.
+const CLIPBOARD_RETRY_MAX_MS: u64 = 60_000;
 // Progressive 50, 100, ... 450 ms (~2.25 s in all) outlasts another process
 // holding the clipboard open (PR #22).
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
@@ -5906,6 +5908,12 @@ fn clipboard_packet_from_content(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Wait before resending content that failed `failures` times in a row.
+fn clipboard_retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(5);
+    Duration::from_millis((CLIPBOARD_RETRY_INTERVAL_MS << doublings).min(CLIPBOARD_RETRY_MAX_MS))
+}
+
 fn run_clipboard_sync(
     quic_transport: quic_transport::TransportHandle,
     local_peer_id: String,
@@ -5917,7 +5925,8 @@ fn run_clipboard_sync(
     stop: Arc<AtomicBool>,
 ) {
     let mut last_sent: Option<(String, String, String)> = None;
-    let mut last_failed: Option<(String, String, String, Instant)> = None;
+    // (device, addr, signature, failed_at, consecutive failures)
+    let mut last_failed: Option<(String, String, String, Instant, u32)> = None;
     let mut last_read: Option<(u64, String, String)> = None;
     let mut last_poll = Instant::now() - Duration::from_secs(1);
     let mut sequence = now_ms();
@@ -5936,9 +5945,11 @@ fn run_clipboard_sync(
         last_poll = Instant::now();
 
         let version = clipboard::change_count();
-        let retry_due = last_failed.as_ref().is_some_and(|(_, _, _, failed_at)| {
-            failed_at.elapsed() >= Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
-        });
+        let retry_due = last_failed
+            .as_ref()
+            .is_some_and(|(_, _, _, failed_at, failures)| {
+                failed_at.elapsed() >= clipboard_retry_delay(*failures)
+            });
         if clipboard_poll_unchanged(version, &last_read, &target, retry_due) {
             continue;
         }
@@ -5985,11 +5996,11 @@ fn run_clipboard_sync(
         }
         if last_failed
             .as_ref()
-            .map(|(device_id, addr, previous, failed_at)| {
+            .map(|(device_id, addr, previous, failed_at, failures)| {
                 device_id == &target.device_id
                     && addr == &target.addr
                     && previous == &signature
-                    && failed_at.elapsed() < Duration::from_millis(CLIPBOARD_RETRY_INTERVAL_MS)
+                    && failed_at.elapsed() < clipboard_retry_delay(*failures)
             })
             .unwrap_or(false)
         {
@@ -6032,14 +6043,33 @@ fn run_clipboard_sync(
                 target.protocol_version,
             );
             let send_result = quic_transport.send_stream_expect_ack(peer, payload);
+            // Retries of this same content (the peer is still down).
+            let failures = last_failed
+                .as_ref()
+                .filter(|(device_id, addr, previous, _, _)| {
+                    device_id == &target.device_id
+                        && addr == &target.addr
+                        && previous == &signature
+                })
+                .map_or(0, |(_, _, _, _, failures)| *failures);
             if send_result.is_ok() {
                 transport_packets.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
+                if failures > 0 {
+                    log::info!("clipboard send recovered after {failures} failed attempt(s)");
+                }
                 last_failed = None;
                 last_sent = Some((target.device_id, target.addr, signature));
             } else {
                 let error = send_result.err().unwrap_or_default();
-                log::warn!("clipboard send failed: {error}");
+                // One warning per content; a peer that stays down filled the
+                // log every 2 s (1.7k lines in an afternoon, rotating out
+                // everything useful).
+                if failures == 0 {
+                    log::warn!("clipboard send failed: {error}");
+                } else {
+                    log::debug!("clipboard send failed again ({failures}): {error}");
+                }
                 if error.starts_with(quic_transport::STREAM_REJECTED) {
                     // The receiver refused it (clipboard sync off, unpaired, too
                     // old) and will refuse the same content again; wait for the
@@ -6052,6 +6082,7 @@ fn run_clipboard_sync(
                         target.addr.clone(),
                         signature,
                         Instant::now(),
+                        failures.saturating_add(1),
                     ));
                 }
             }
@@ -10562,6 +10593,15 @@ mod tests {
             drag_drop: false,
             client_log: false,
         }
+    }
+
+    #[test]
+    fn clipboard_retry_backs_off_to_a_minute() {
+        assert_eq!(clipboard_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(clipboard_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(clipboard_retry_delay(5), Duration::from_secs(32));
+        assert_eq!(clipboard_retry_delay(6), Duration::from_secs(60));
+        assert_eq!(clipboard_retry_delay(40), Duration::from_secs(60));
     }
 
     #[test]
