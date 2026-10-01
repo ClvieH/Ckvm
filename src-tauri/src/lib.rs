@@ -5464,12 +5464,49 @@ fn probe_local_ip_address() -> Option<String> {
     // back 127.0.0.1, and announcing that address makes peers unable to connect
     // (the "worked yesterday, dead this morning" symptom). Fall back to any real
     // LAN interface address so we never advertise loopback.
+    //
+    // A proxy in TUN mode owns the default route; its tunnel address is not the
+    // LAN, and since the device id is host + this address, the id flipped every
+    // time the proxy toggled. Skip a point-to-point tunnel and pick the LAN.
     if let Some(ip) = default_route_ipv4_address() {
-        if usable_discovery_ipv4(ip) {
+        if usable_discovery_ipv4(ip) && !point_to_point_ipv4(ip) {
             return Some(ip.to_string());
         }
     }
-    local_ipv4_addresses().first().map(|ip| ip.to_string())
+    preferred_lan_ipv4(&local_ipv4_addresses()).map(|ip| ip.to_string())
+}
+
+/// The likeliest physical-LAN address: host-side virtual adapters (VirtualBox,
+/// VMware, Hyper-V/WSL) usually end in .1, then home > corporate > container
+/// ranges.
+// ponytail: heuristic, only used while a tunnel holds the default route; read
+// the OS routing table's non-tunnel default route if this ever picks wrong.
+fn preferred_lan_ipv4(addresses: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+    addresses.iter().copied().min_by_key(|ip| {
+        let octets = ip.octets();
+        let class = match octets {
+            [192, 168, ..] => 0,
+            [10, ..] => 1,
+            [172, b, ..] if (16..32).contains(&b) => 2,
+            _ => 3,
+        };
+        (octets[3] == 1, class)
+    })
+}
+
+/// The default route's interface is a /30-or-narrower point-to-point link: a
+/// TUN adapter (sing-box style), never a LAN.
+fn point_to_point_ipv4(ip: Ipv4Addr) -> bool {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces.iter().any(|interface| match &interface.addr {
+                if_addrs::IfAddr::V4(address) => {
+                    address.ip == ip && u32::from(address.netmask).count_ones() >= 30
+                }
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
@@ -5512,11 +5549,15 @@ fn default_route_ipv4_address() -> Option<Ipv4Addr> {
 }
 
 fn usable_discovery_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, ..] = address.octets();
     !address.is_loopback()
         && !address.is_unspecified()
         && !address.is_multicast()
         && !address.is_broadcast()
         && !address.is_link_local()
+        // 198.18.0.0/15 (RFC 2544 benchmarking) is the TUN range of Clash,
+        // Mihomo and Surge — never a LAN a peer could reach.
+        && !(a == 198 && b & 0xfe == 18)
 }
 
 fn default_device_source() -> String {
@@ -6354,7 +6395,10 @@ fn file_transfer_target_for_device(
             };
 
             return Ok(FileTransferTarget {
-                device_id: controller.id.clone(),
+                // The controller's id as it announces itself now, not as stored
+                // at pairing: it is host + IP, so it moves with the IP (a TUN
+                // proxy flipped it), and the receiver matches target_id exactly.
+                device_id: peer.id.clone(),
                 name: controller.name.clone(),
                 addr: format!("{}:{}", host, peer.quic_port),
                 transport_public_key: peer.transport_public_key.clone(),
@@ -10518,6 +10562,24 @@ mod tests {
             drag_drop: false,
             client_log: false,
         }
+    }
+
+    #[test]
+    fn lan_ip_choice_skips_proxy_tunnels_and_host_side_adapters() {
+        // Clash/Mihomo/Surge TUN range is never a LAN.
+        assert!(!usable_discovery_ipv4(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(!usable_discovery_ipv4(Ipv4Addr::new(198, 19, 255, 254)));
+        assert!(usable_discovery_ipv4(Ipv4Addr::new(198, 20, 0, 1)));
+        // sing-box tunnel, VirtualBox host-only, the real Wi-Fi address.
+        let addresses = [
+            Ipv4Addr::new(172, 19, 0, 1),
+            Ipv4Addr::new(192, 168, 56, 1),
+            Ipv4Addr::new(192, 168, 66, 106),
+        ];
+        assert_eq!(
+            preferred_lan_ipv4(&addresses),
+            Some(Ipv4Addr::new(192, 168, 66, 106))
+        );
     }
 
     #[test]
