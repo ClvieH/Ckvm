@@ -1693,6 +1693,26 @@ fn peer_screen_id(device: &Device, screen: &Screen) -> String {
         .to_string()
 }
 
+/// Start (`now_ms`) of the current run of failed input sends; 0 while sends go
+/// through. Atomic because the input hooks read it.
+static INPUT_SEND_FAILING_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How long clicks/keys/scrolls must keep failing before control goes back to
+/// this machine (#33: the peer is gone, do not swallow input forever).
+const INPUT_SEND_FAILURE_GRACE_MS: u64 = 1_000;
+
+/// One failed send is usually the connection being rebuilt (send_datagram
+/// "warming") or a dropped packet. Handing control back on it put the user's
+/// next keystrokes and shortcuts on this machine while they were still looking
+/// at the remote one. Only a run of failures lasting the grace period counts.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn input_send_failure_persistent(failing_since: &AtomicU64, now: u64) -> bool {
+    match failing_since.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => false,
+        Err(since) => now.saturating_sub(since) >= INPUT_SEND_FAILURE_GRACE_MS,
+    }
+}
+
 fn send_packet(
     quic_transport: &quic_transport::TransportHandle,
     target: &InputTarget,
@@ -1767,6 +1787,7 @@ fn send_packet(
     match result {
         Ok(true) => {
             input_events.fetch_add(1, Ordering::Relaxed);
+            INPUT_SEND_FAILING_SINCE_MS.store(0, Ordering::Relaxed);
             true
         }
         Ok(false) => false,
@@ -3868,7 +3889,11 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
 /// Hand control back and swallow the event that was meant for the other side.
 #[cfg(target_os = "windows")]
 fn return_to_local_after_send_failure_windows(context: &WindowsCaptureContext, what: &str) {
-    log::warn!("remote send failed for {what}; returning control to the local machine");
+    if !input_send_failure_persistent(&INPUT_SEND_FAILING_SINCE_MS, crate::now_ms()) {
+        log::info!("remote send failed for {what}; keeping remote control (transient)");
+        return;
+    }
+    log::warn!("remote sends kept failing ({what}); returning control to the local machine");
     release_windows_remote_control(context, false);
 }
 
@@ -4189,7 +4214,11 @@ fn return_to_local_after_send_failure_macos(
     context: &MacCaptureContext,
     event_type: core_graphics::event::CGEventType,
 ) {
-    log::warn!("remote send failed for {event_type:?}; returning control to the local machine");
+    if !input_send_failure_persistent(&INPUT_SEND_FAILING_SINCE_MS, crate::now_ms()) {
+        log::info!("remote send failed for {event_type:?}; keeping remote control (transient)");
+        return;
+    }
+    log::warn!("remote sends kept failing ({event_type:?}); returning control to the local machine");
     return_to_local_macos(context);
 }
 
@@ -7570,6 +7599,19 @@ fn inject_key(_key_code: u16, _down: bool) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_failed_send_keeps_remote_control_a_second_of_them_hands_it_back() {
+        let failing_since = AtomicU64::new(0);
+        // The connection is being rebuilt: keep control, drop this one input.
+        assert!(!input_send_failure_persistent(&failing_since, 10_000));
+        assert!(!input_send_failure_persistent(&failing_since, 10_900));
+        // Still failing a second later: the peer is gone (#33), hand it back.
+        assert!(input_send_failure_persistent(&failing_since, 11_000));
+        // A send went through (send_packet clears it): the next failure is new.
+        failing_since.store(0, Ordering::Relaxed);
+        assert!(!input_send_failure_persistent(&failing_since, 20_000));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
