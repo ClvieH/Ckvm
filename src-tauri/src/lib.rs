@@ -1044,7 +1044,22 @@ impl AppRuntime {
         // our own (possibly drifted) `actual_port`, so a peer that landed on a
         // neighbouring port still receives them.
         let broadcast_targets = broadcast_addrs(desired_port);
-        let direct_targets = known_peer_discovery_targets(&layout, desired_port);
+        let peer_last_seen: HashMap<String, u64> = self
+            .peers
+            .lock()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .map(|peer| (peer.id.clone(), peer.last_seen_ms))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let direct_targets = known_peer_discovery_targets(
+            &layout,
+            desired_port,
+            &peer_last_seen,
+            now_ms(),
+        );
         log::info!(
             "discovery started desired_port={} actual_port={} quic_port={} broadcast_targets={} directed_targets={}",
             desired_port,
@@ -1078,8 +1093,21 @@ impl AppRuntime {
                             apply_transport_to_peer(&mut peer, &quic_transport);
                             peer.input_ready = advertised_input_ready(&layout, current_input_ready);
                             peer.upgrading = upgrading.load(Ordering::Relaxed);
-                            let direct_targets =
-                                known_peer_discovery_targets(&layout, desired_port);
+                            let peer_last_seen: HashMap<String, u64> = peers
+                                .lock()
+                                .map(|known| {
+                                    known
+                                        .iter()
+                                        .map(|peer| (peer.id.clone(), peer.last_seen_ms))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let direct_targets = known_peer_discovery_targets(
+                                &layout,
+                                desired_port,
+                                &peer_last_seen,
+                                now_ms(),
+                            );
                             Some((peer, direct_targets))
                         })
                         .unwrap_or_else(|_| Some((local_peer.clone(), Vec::new())));
@@ -1152,7 +1180,7 @@ impl AppRuntime {
                                         &config_path,
                                         &peers,
                                     );
-                                    let _ = send_discovery_packet(
+                                    let _ = send_discovery_packet_to(
                                         &socket,
                                         "pair-challenge",
                                         &current_peer,
@@ -1206,7 +1234,7 @@ impl AppRuntime {
                                     reply
                                 );
                                 if reply {
-                                    let _ = send_discovery_packet(
+                                    let _ = send_discovery_packet_to(
                                         &socket,
                                         "reply",
                                         &current_peer,
@@ -3165,6 +3193,11 @@ async fn scan_lan_peers(
             {
                 break;
             }
+            // Rate limit: a /24 unicast sweep is a per-IP ARP burst. Space
+            // rounds out (plus jitter) so each host is probed well under one
+            // packet per second instead of back-to-back for the whole window.
+            let jitter = (now_ms() % 500) as u64;
+            thread::sleep(Duration::from_millis(2500 + jitter));
         }
         found
     })
@@ -3990,6 +4023,10 @@ pub fn run() {
                     .level(log::LevelFilter::Info)
                     .max_file_size(LOG_MAX_FILE_SIZE_BYTES)
                     .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
+                    // Local timestamps: the storm-incident triage wasted time
+                    // on UTC-vs-local clock confusion; logs must read in the
+                    // machine's own timezone.
+                    .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
                     .build(),
             )?;
             if let Ok(log_dir) = app.path().app_log_dir() {
@@ -4002,6 +4039,19 @@ pub fn run() {
             // call silently replaces this one in Tauri 2, which is exactly how
             // these wirings were lost the first time. Wired AFTER the log
             // plugin registers so the lines above are visible in the log.
+            // Running from a UNC share keeps Windows touching the share for
+            // every read; when the network hiccups the reconnects themselves
+            // become traffic (broadcast-storm report, bug 5).
+            if let Ok(exe) = env::current_exe() {
+                let exe_path = exe.to_string_lossy().to_string();
+                if exe_path.starts_with("\\\\") {
+                    log::warn!(
+                        "MyKVM is running from a network share ({}); copy it to a                          local disk — SMB reconnects after every network hiccup                          will keep the share busy",
+                        exe_path
+                    );
+                }
+            }
+
             if let Some(config_path) = app.path().app_config_dir().ok() {
                 if let Some(parent) = config_path.parent() {
                     discovery_signing::set_identity_dir(parent.to_path_buf());
@@ -9277,7 +9327,7 @@ fn scan_for_peers(local_peer: &LanPeer, base_port: u16) -> Result<Vec<LanPeer>, 
         .map_err(|error| format!("failed to set UDP scan timeout: {error}"))?;
 
     for target in broadcast_addrs(base_port) {
-        let _ = send_discovery_packet(&socket, "announce", local_peer, target);
+        let _ = send_discovery_packet(&socket, "announce", local_peer, &target);
     }
     // Fallback for networks that drop broadcast but forward unicast.
     for target in unicast_sweep_targets(base_port) {
@@ -9494,17 +9544,122 @@ fn split_host_port(input: &str) -> (String, Option<u16>) {
     (input.trim().to_string(), None)
 }
 
+// --- discovery target resolution --------------------------------------------
+// Discovery targets are "host:port" strings whose host may be a bare
+// COMPUTERNAME ("CLVIE") stored from a paired controller. Handing that to
+// UdpSocket::send_to resolves it through getaddrinfo EVERY time — a failed
+// single-label lookup falls back to LLMNR multicast + NBNS broadcast with a
+// zero negative cache, which is the 7×24 name-resolution storm measured in
+// the broadcast-storm incident report (~10 resolutions/s across two
+// processes). Every periodic discovery send therefore goes through
+// resolve_discovery_target: IPv4 literals pass straight through; hostnames
+// resolve at most once per backoff window and the answer is cached.
+static DISCOVERY_TARGET_RESOLVE_STATE: OnceLock<Mutex<HashMap<String, DiscoveryResolveState>>> =
+    OnceLock::new();
+
+fn discovery_resolve_state() -> &'static Mutex<HashMap<String, DiscoveryResolveState>> {
+    DISCOVERY_TARGET_RESOLVE_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Default)]
+struct DiscoveryResolveState {
+    addr: Option<SocketAddr>,
+    last_attempt_ms: u64,
+    failures: u32,
+}
+
+const DISCOVERY_RESOLVE_SUCCESS_TTL_MS: u64 = 10 * 60_000;
+const DISCOVERY_RESOLVE_BACKOFF_BASE_MS: u64 = 30_000;
+const DISCOVERY_RESOLVE_BACKOFF_MAX_MS: u64 = 10 * 60_000;
+
+fn discovery_resolve_backoff_ms(failures: u32) -> u64 {
+    let doublings = failures.saturating_sub(1).min(6);
+    (DISCOVERY_RESOLVE_BACKOFF_BASE_MS << doublings).min(DISCOVERY_RESOLVE_BACKOFF_MAX_MS)
+}
+
+fn resolve_discovery_target(target: &str) -> Option<SocketAddr> {
+    resolve_discovery_target_at(target, now_ms())
+}
+
+fn resolve_discovery_target_at(target: &str, now: u64) -> Option<SocketAddr> {
+    let (host, explicit_port) = split_host_port(target);
+    let port = explicit_port.unwrap_or(0);
+    // IP literals (broadcast, subnet sweep, saved peer IPs) never resolve.
+    if let Ok(ip) = host.trim().parse::<std::net::Ipv4Addr>() {
+        return Some(SocketAddr::from((ip, port)));
+    }
+    if host.trim().is_empty() || port == 0 {
+        return None;
+    }
+
+    // Cached state decides without touching the network.
+    {
+        let Ok(state) = discovery_resolve_state().lock() else {
+            return None;
+        };
+        if let Some(entry) = state.get(host.trim()) {
+            if let Some(addr) = entry.addr {
+                if now.saturating_sub(entry.last_attempt_ms)
+                    < DISCOVERY_RESOLVE_SUCCESS_TTL_MS
+                {
+                    return Some(addr);
+                }
+            } else if now.saturating_sub(entry.last_attempt_ms)
+                < discovery_resolve_backoff_ms(entry.failures)
+            {
+                return None;
+            }
+        }
+    }
+
+    // Due for a real attempt; the lock is released while resolving.
+    use std::net::ToSocketAddrs as _;
+    let attempt = format!("{host}:{port}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|addrs| addrs.filter(|addr| addr.is_ipv4()).next());
+    if let Ok(mut state) = discovery_resolve_state().lock() {
+        let entry = state.entry(host.trim().to_string()).or_default();
+        entry.last_attempt_ms = now;
+        match &attempt {
+            Some(addr) => {
+                entry.addr = Some(*addr);
+                entry.failures = 0;
+            }
+            None => entry.failures = entry.failures.saturating_add(1),
+        }
+    }
+    attempt
+}
+
 fn send_discovery_packet(
     socket: &UdpSocket,
     kind: &str,
     local_peer: &LanPeer,
-    target: impl std::net::ToSocketAddrs,
+    target: &str,
 ) -> Result<(), String> {
     send_discovery_packet_with_pairing(
         socket,
         kind,
         local_peer,
         target,
+        DiscoveryPairingFields::default(),
+    )
+}
+
+/// Direct send for an already-resolved socket address (replies to a packet's
+/// source): no resolution layer involved.
+fn send_discovery_packet_to(
+    socket: &UdpSocket,
+    kind: &str,
+    local_peer: &LanPeer,
+    addr: SocketAddr,
+) -> Result<(), String> {
+    send_discovery_packet_with_pairing(
+        socket,
+        kind,
+        local_peer,
+        addr,
         DiscoveryPairingFields::default(),
     )
 }
@@ -10179,26 +10334,128 @@ fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String
 /// the peer would age out after `PEER_TTL_MS` even though direct UDP still
 /// worked. Keep paired/configured machines warm with a small directed announce
 /// fan-out.
-fn known_peer_discovery_targets(layout: &LayoutState, base_port: u16) -> Vec<String> {
+// Directed probes toward peers we have not seen recently are the "keep
+// trying to reach an offline paired device" path. Without a gate they fire
+// 8-9 packets every 3s per offline device, forever — the sustained traffic
+// behind the broadcast-storm incident. Online: full rate. Offline: single
+// base-port packet, backing off 30s for the first windows then 300s.
+const DIRECTED_ONLINE_WINDOW_MS: u64 = 60_000;
+const DIRECTED_OFFLINE_FIRST_INTERVAL_MS: u64 = 30_000;
+const DIRECTED_OFFLINE_MAX_INTERVAL_MS: u64 = 300_000;
+const DIRECTED_OFFLINE_FAST_PROBES: u32 = 5;
+
+static DIRECTED_PROBE_GATES: OnceLock<Mutex<HashMap<String, (u64, u32)>>> = OnceLock::new();
+
+fn directed_probe_gates() -> &'static Mutex<HashMap<String, (u64, u32)>> {
+    DIRECTED_PROBE_GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True when a directed probe toward `key` may fire right now. Online peers
+/// always pass (and reset their offline streak); offline peers are throttled.
+fn directed_probe_due(key: &str, online: bool, now: u64) -> bool {
+    if online {
+        if let Ok(mut gates) = directed_probe_gates().lock() {
+            gates.remove(key);
+        }
+        return true;
+    }
+    let Ok(mut gates) = directed_probe_gates().lock() else {
+        return true;
+    };
+    let entry = gates.entry(key.to_string()).or_insert((0_u64, 0_u32));
+    let interval = if entry.1 < DIRECTED_OFFLINE_FAST_PROBES {
+        DIRECTED_OFFLINE_FIRST_INTERVAL_MS
+    } else {
+        DIRECTED_OFFLINE_MAX_INTERVAL_MS
+    };
+    if now.saturating_sub(entry.0) >= interval {
+        entry.0 = now;
+        entry.1 = entry.1.saturating_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+fn known_peer_discovery_targets(
+    layout: &LayoutState,
+    base_port: u16,
+    peer_last_seen: &HashMap<String, u64>,
+    now: u64,
+) -> Vec<String> {
     let base_ports = discovery_target_ports(base_port);
     let mut targets = Vec::new();
+
+    let seen_recently = |id: &str| {
+        peer_last_seen
+            .get(id)
+            .is_some_and(|seen| now.saturating_sub(*seen) < DIRECTED_ONLINE_WINDOW_MS)
+    };
 
     for device in layout
         .devices
         .iter()
         .filter(|device| device.role != "local")
     {
-        let ports = known_peer_ports(base_port, device.transport_port);
-        push_host_discovery_targets(&mut targets, &device.host, &ports);
+        let online = device.online || seen_recently(&device.id);
+        let ports = if online {
+            known_peer_ports(base_port, device.transport_port)
+        } else {
+            vec![base_port]
+        };
+        for host in host_candidates(&device.host) {
+            if directed_probe_due(&format!("{}:{host}", device.id), online, now) {
+                push_host_discovery_targets(&mut targets, &host, &ports);
+            }
+        }
     }
 
     for controller in &layout.paired_controllers {
-        push_host_discovery_targets(&mut targets, &controller.ip, &base_ports);
-        push_host_discovery_targets(&mut targets, &controller.host, &base_ports);
+        let online = seen_recently(&controller.id);
+        let ports = if online { base_ports.clone() } else { vec![base_port] };
+        let hosts = host_candidates(&controller.ip)
+            .into_iter()
+            .chain(host_candidates(&controller.host));
+        for host in hosts {
+            if directed_probe_due(&format!("{}:{host}", controller.id), online, now) {
+                push_host_discovery_targets(&mut targets, &host, &ports);
+            }
+        }
     }
 
     targets.sort();
     targets.dedup();
+
+    // Storm self-observability: a pile-up of long-offline paired devices is
+    // what grew the incident in the first place; surface it once an hour.
+    let stale_offline = layout
+        .paired_controllers
+        .iter()
+        .filter(|controller| {
+            !seen_recently(&controller.id)
+                && now.saturating_sub(controller.paired_at_ms) > 10 * 60_000
+        })
+        .count();
+    if stale_offline >= 3 {
+        static LAST_STALE_WARN: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+        let last = LAST_STALE_WARN.get_or_init(|| Mutex::new(None));
+        let due = last
+            .lock()
+            .map(|mut guard| {
+                let ok = guard.map(|at| now.saturating_sub(at) > 60 * 60_000).unwrap_or(true);
+                if ok {
+                    *guard = Some(now);
+                }
+                ok
+            })
+            .unwrap_or(false);
+        if due {
+            log::warn!(
+                "{stale_offline} paired devices have been offline for a long time;                  their directed discovery probes keep backing off (30s-300s). Remove                  retired devices from the pairing list if they are never coming back"
+            );
+        }
+    }
+
     targets
 }
 
@@ -10279,7 +10536,10 @@ pub(crate) fn unicast_sweep_targets(port: u16) -> Vec<String> {
 }
 
 fn unicast_sweep_targets_for_ips(port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
-    let ports = discovery_target_ports(port);
+    // One packet per host, on the base port only. Sweeping the whole /24 on
+    // all eight discovery ports was an ARP storm multiplier (2032-6096
+    // unicasts per round, each miss triggering per-IP ARP); peers whose port
+    // drifted are still found through the broadcast announce fan-out.
     let mut targets = Vec::new();
 
     for ip in local_ips {
@@ -10288,12 +10548,7 @@ fn unicast_sweep_targets_for_ips(port: u16, local_ips: &[Ipv4Addr]) -> Vec<Strin
         targets.extend(
             (1..=254u8)
                 .filter(|host| *host != self_host)
-                .flat_map(|host| {
-                    let subnet_prefix = subnet_prefix.clone();
-                    ports
-                        .iter()
-                        .map(move |port| format!("{subnet_prefix}.{host}:{port}"))
-                }),
+                .map(move |host| format!("{subnet_prefix}.{host}:{port}")),
         );
     }
 
@@ -10500,6 +10755,37 @@ mod tests {
         if let Ok(mut usage) = paired_controller_usage_map().lock() {
             usage.remove("pk:pk-peer-live");
         }
+    }
+
+    #[test]
+    fn discovery_resolve_passes_ip_literals_without_resolution() {
+        let target = format!("192.168.31.255:{DISCOVERY_PORT}");
+        assert_eq!(
+            resolve_discovery_target_at(&target, now_ms()),
+            Some(SocketAddr::from(([192, 168, 31, 255], DISCOVERY_PORT)))
+        );
+    }
+
+    #[test]
+    fn discovery_resolve_backs_off_failed_hostname_lookups() {
+        // .invalid never resolves, so the first attempt really fails.
+        let host = "mykvm-storm-test-host.invalid";
+        let target = format!("{host}:{DISCOVERY_PORT}");
+        let now = now_ms();
+        assert_eq!(resolve_discovery_target_at(&target, now), None);
+        // Within the backoff window no second attempt happens: the cached
+        // failure answers None and the failure counter does not advance —
+        // this is what turns the per-send getaddrinfo storm into one
+        // attempt per 30s+ window.
+        assert_eq!(resolve_discovery_target_at(&target, now + 1_000), None);
+        {
+            let state = discovery_resolve_state().lock().expect("state");
+            let entry = state.get(host).expect("entry");
+            assert!(entry.addr.is_none());
+            assert_eq!(entry.failures, 1);
+        }
+        assert!(discovery_resolve_backoff_ms(1) >= 30_000);
+        assert!(discovery_resolve_backoff_ms(8) == DISCOVERY_RESOLVE_BACKOFF_MAX_MS);
     }
 
     #[test]
@@ -12833,8 +13119,12 @@ mod tests {
         let mut layout = test_layout();
         layout.devices[1].host = "Client / 10.0.0.2".into();
         layout.devices[1].transport_port = DISCOVERY_PORT + DISCOVERY_PORT_SPAN + 2;
+        directed_probe_gates().lock().expect("gates").clear();
 
-        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT);
+        // Online peer: the full port span is probed.
+        let now = now_ms();
+        let seen = HashMap::from([(layout.devices[1].id.clone(), now)]);
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &seen, now);
 
         assert!(targets.contains(&format!("10.0.0.2:{DISCOVERY_PORT}")));
         assert!(targets.contains(&format!("10.0.0.2:{}", DISCOVERY_PORT + 1)));
@@ -12842,6 +13132,16 @@ mod tests {
             "10.0.0.2:{}",
             DISCOVERY_PORT + DISCOVERY_PORT_SPAN + 2
         )));
+        assert!(targets.contains(&format!("Client:{DISCOVERY_PORT}")));
+
+        // Offline peer: degraded to a single base-port packet per host — the
+        // broadcast-storm fix. Hostname candidates stay (the resolver, not
+        // this layer, throttles their getaddrinfo cost).
+        layout.devices[1].online = false;
+        directed_probe_gates().lock().expect("gates").clear();
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &HashMap::new(), now);
+        assert!(targets.contains(&format!("10.0.0.2:{DISCOVERY_PORT}")));
+        assert!(!targets.contains(&format!("10.0.0.2:{}", DISCOVERY_PORT + 1)));
         assert!(targets.contains(&format!("Client:{DISCOVERY_PORT}")));
     }
 
@@ -12861,7 +13161,8 @@ mod tests {
             last_used_ms: 0,
         }];
 
-        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT);
+        directed_probe_gates().lock().expect("gates").clear();
+        let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT, &HashMap::new(), now_ms());
 
         assert!(targets.contains(&format!("10.0.0.1:{DISCOVERY_PORT}")));
         assert!(targets.contains(&format!("server-host:{DISCOVERY_PORT}")));

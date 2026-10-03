@@ -12,7 +12,8 @@ use crate::{
     advertised_input_ready, apply_transport_to_peer, bind_available_udp_port, broadcast_addrs,
     decode_discovery_packet, discovery_base_port, input, known_peer_discovery_targets,
     load_layout_from_disk, local_peer_from_layout, peer_from_discovery_packet, preferred_quic_port,
-    quic_transport, send_discovery_packet, should_reply_to_discovery, LayoutState,
+    quic_transport, send_discovery_packet, send_discovery_packet_to,
+    should_reply_to_discovery, LayoutState,
 };
 
 /// The receive-only network runtime used by the Windows service before the
@@ -128,7 +129,7 @@ pub fn start(config_path: PathBuf) -> Result<Option<HeadlessClientHandle>, Strin
 
                     for target in broadcast_addrs(desired_port)
                         .into_iter()
-                        .chain(known_peer_discovery_targets(&current, desired_port))
+                        .chain(known_peer_discovery_targets(&current, desired_port, &std::collections::HashMap::new(), crate::now_ms()))
                     {
                         let _ = send_discovery_packet(&socket, "announce", &peer, target.as_str());
                     }
@@ -157,7 +158,7 @@ pub fn start(config_path: PathBuf) -> Result<Option<HeadlessClientHandle>, Strin
                 if matches!(incoming.kind.as_str(), "announce" | "probe")
                     && should_reply_to_discovery(&current, &incoming.peer)
                 {
-                    let _ = send_discovery_packet(&socket, "reply", &local_peer, source);
+                    let _ = send_discovery_packet_to(&socket, "reply", &local_peer, source);
                 }
             }
         });
