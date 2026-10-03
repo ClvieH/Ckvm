@@ -570,6 +570,20 @@ ubuntu-22.04 单 job：Node 22 → Linux 桌面依赖（libwebkit2gtk-4.1-dev �
 
 **下一批**（路线图阶段三/四 + 贯穿项）：Win→Win 拖拽落点（依赖 5.1 拆分 file_transfer.rs）、Linux 输入、ARM64、Peer 验证码 UI、屏幕预览、多语言、前端测试扩充、打包脚本化。
 
+### 第七轮：路线图阶段三 + 阶段四（2026-10-03 晚，本地锚点未推送）
+
+| 项 | 实现 | 锚点 |
+|---|---|---|
+| **5.1 file_transfer.rs 拆分** | 纯移动 -1191 行：wire 包/收发路径/续传/目标解析/清洗器 → `file_transfer.rs`；lib.rs 保留命令胶水、进度上报、历史与队列持久化；glob 导入使调用点零改动 | f208975 |
+| **3.1 Win→Win 拖拽落点跟随光标** | 受端合成 OLE 会话（windows_drag.rs）本为 Mac 控制端服务；本轮解除 send_ole_drag_start/stream/signal 的 macOS 门控（补缺失的 cancel 参数），edge-drop 交接改为「先开原生会话再流式喂字节」，拒收/旧端自动回落 stage 路径；input.rs 转发 left-up 时发 drop（本地拖拽已在贴边被 inject_end_drag 终结）、回程发 cancel；流式中断发 cancel 防半喂挂死；设置开关 dragNativeDrop 默认开 | 278c2d1 |
+| **4.3 Peer 验证码** | `pairing_status` 放开 peer 角色（原为非 client 一律 idle，验证码生成了但前端永远查不到），文案角色感知；前端本已 peer-ready | a8f0e1d |
+| **4.2 ARM64** | release.yml 矩阵加 `windows-arm64`（aarch64-pc-windows-msvc 交叉构建），latest.json 防止 arm64 资产被误当 x64 updater 并注册 windows-aarch64 | 23de1f4 |
+| **4.4 屏幕预览** | `screen_preview.rs`：GDI BitBlt 虚拟屏 → JPEG q60 长边 480px → base64，借 QUIC stream ack 通道以 `ok:<base64>` 回传（新协议 mykvm.preview.v1）；按需单帧（偏离路线图的 1~2fps 连续流，属刻意 MVP 取舍）；`previewEnabled` 双端默认关，服务端校验配对+开关；设备卡预览按钮+弹窗 | 287b7e4 |
+| **4.5 多语言** | `src/locales/{zh-CN,en}.ts` 拆分，i18n.ts 变注册表并附扩展配方；纯移动 | ffa7185 |
+| **4.1 Linux** | ⏸ 延期：无法交叉类型检查（ring C 构建限制）更无法运行验证，盲写会危及 Linux 端「诚实提示不可用」语义；按路线图建议独立立项 | — |
+
+**验证**：cargo test 170+5 全绿；tsc/eslint/vitest（24）全绿。**全部锚点仅本地提交，未推送**（等用户命令）。便携包仍为 10-03 04:15 版（按约定整条路线完成前不打包）。
+
 ## 11. 本机构建验证记录（Windows 10 x64，2026-10-02）
 
 **bate 分支（当前基线）**：

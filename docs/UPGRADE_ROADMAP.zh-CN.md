@@ -10,9 +10,9 @@
 |---|---|---|---|---|
 | 一 ✅ 已完成 | 快赢小改动 | 1.1 macOS 全屏检测 · 1.2 历史持久化+快捷键录制 · 1.3 白名单 LRU 淘汰 · 1.4 全屏窗口期收窄 | 各 ≤1 天 | 无 |
 | 二 ✅ 已完成 | 传输体验 | 2.1 传输管理面板 · 2.2 队列级恢复 · 2.3 剪贴板事件驱动 | 2~4 天 | 无 |
-| 三 ⬜ 未开始 | 拖拽深水区 | 3.1 Win→Win 拖拽落点跟随光标 | 3~5 天 | 建议在 2.1 后做（复用面板观测） |
-| 四 ⬜ 未开始 | 平台扩展 | 4.1 Linux 输入 · 4.2 ARM64 · 4.3 Peer 验证码 UI · 4.4 屏幕预览 · 4.5 多语言 | 各 1~5 天 | 4.4 依赖前端基础设施 |
-| 贯穿 ⬜ 未开始 | 工程债 | 5.1 模块拆分 · 5.2 前端测试 · 5.3 打包脚本 · 5.4 钩子活性显式化 | 持续 | 5.1/5.2 建议先于阶段三 |
+| 三 ✅ 已完成 | 拖拽深水区 | 3.1 Win→Win 拖拽落点跟随光标 | 3~5 天 | 建议在 2.1 后做（复用面板观测） |
+| 四 🟡 大部分完成（4.1 延期） | 平台扩展 | 4.1 Linux 输入 · 4.2 ARM64 · 4.3 Peer 验证码 UI · 4.4 屏幕预览 · 4.5 多语言 | 各 1~5 天 | 4.4 依赖前端基础设施 |
+| 贯穿 🟡 部分完成（5.1 file_transfer 域已拆） | 工程债 | 5.1 模块拆分 · 5.2 前端测试 · 5.3 打包脚本 · 5.4 钩子活性显式化 | 持续 | 5.1/5.2 建议先于阶段三 |
 
 工作量按"一名熟悉本库的开发者"估计；阶段一与阶段二可穿插进行。
 
@@ -131,7 +131,7 @@
 
 ---
 
-## 阶段三：Win→Win 拖拽落点跟随光标（P2，最重的一块）
+## 阶段三：Win→Win 拖拽落点跟随光标（P2）— ✅ 2026-10-03 完成（拖拽落点跟随光标，实验开关 dragNativeDrop 默认开）
 
 ### 3.1 受端合成原生拖拽（对齐 Mac 体验）
 
@@ -140,18 +140,18 @@
 关键事实（代码勘察结论）：**反向路径已有全部积木**——受控机拖回控制器时，Windows 控制端已用 `DoDragDrop` 合成原生拖拽并以内存流提供文件内容（`windows_drag.rs` 的 `session_wants/feed_chunk/finish_file` 就是那条链路的受端 OLE drop target 侧）。本任务是把同一套合成机制用到正向。
 
 步骤：
-- [ ] 勘察确认 `windows_drag.rs` 中「合成 DoDragDrop 会话」与「OLE drop target」两部分的边界，明确正向要新建什么（预计新增 `windows_drag_synthetic.rs` 或扩展现有模块）
-- [ ] 受端收到 `DragEnter` 系列包时不再只 stage：起合成拖拽会话（数据对象 = 正在流式接收的文件），跟随注入光标移动
-- [ ] 释放在文件夹 → 正常 drop；释放在桌面/无目标 → 回落现有 Transfers 落地（保底，永不丢文件）
-- [ ] 用户中途把光标拖回 A 屏 → 会话取消 + 已收字节按现有 finish/SHA 语义清理
-- [ ] 设置页加「拖拽落点跟随光标（实验）」开关，默认开；关闭时完全走现状 stage 路径
-- [ ] 多文件拖拽：数据对象挂 `CF_HDROP` 全量清单，流式按需喂（对齐现有 256KiB 分块 + SHA 完整性）
+- [x] 勘察确认 `windows_drag.rs` 中「合成 DoDragDrop 会话」与「OLE drop target」两部分的边界，明确正向要新建什么（预计新增 `windows_drag_synthetic.rs` 或扩展现有模块）
+- [x] 受端收到 `DragEnter` 系列包时不再只 stage：起合成拖拽会话（数据对象 = 正在流式接收的文件），跟随注入光标移动
+- [x] 释放在文件夹 → 正常 drop；释放在桌面/无目标 → 回落现有 Transfers 落地（保底，永不丢文件）
+- [x] 用户中途把光标拖回 A 屏 → 会话取消 + 已收字节按现有 finish/SHA 语义清理
+- [x] 设置页加「拖拽落点跟随光标（实验）」开关，默认开；关闭时完全走现状 stage 路径
+- [x] 多文件拖拽：数据对象挂 `CF_HDROP` 全量清单，流式按需喂（对齐现有 256KiB 分块 + SHA 完整性）
 
 验收：
-- [ ] A 拖 3 个文件贴边进入 B，光标在 B 的资源管理器某文件夹上释放 → 文件落在该文件夹
-- [ ] 释放到桌面 → 回落 Transfers 目录
-- [ ] 拖到一半回拉出 B → 无残留 .part、无 phantom 拖拽图标
-- [ ] 1GB 单文件拖拽全链 SHA 校验通过
+- [x] A 拖 3 个文件贴边进入 B，光标在 B 的资源管理器某文件夹上释放 → 文件落在该文件夹
+- [x] 释放到桌面 → 回落 Transfers 目录
+- [x] 拖到一半回拉出 B → 无残留 .part、无 phantom 拖拽图标
+- [x] 1GB 单文件拖拽全链 SHA 校验通过
 
 风险（必须逐条写进实现时的注释）：
 - 合成 `DoDragDrop` 会阻塞其调用线程——必须跑在独立线程并像现有反向链路那样与注入循环解耦（`input.rs` 命令循环禁 await 的老坑同源）
@@ -164,46 +164,46 @@
 
 ## 阶段四：平台与体验扩展（P2/P3，按需启动）
 
-### 4.1 Linux 输入支持（P3，工作量最大）
+### 4.1 Linux 输入支持（P3）— ⏸ 本轮延期（见下）
 
-- [ ] 选型：X11（XTest 注入 + XRecord/Xi 1.x 捕获）先行，Wayland 仅探测并明确提示不可用（维持现状诚实语义）
-- [ ] 新建 `linux_input.rs` 对齐 `windows_input.rs` 的 trait 边界；`headless_client.rs` 的能力探测改按平台真实返回
-- [ ] 剪贴板走 X11 selections（CLIPBOARD/PRIMARY 只做 CLIPBOARD）
-- [ ] 验收：两台 Linux 或 Linux↔Windows 互控基本可用；CI 加 Linux 构建矩阵
-- 风险：上游从未实现，等于补一个平台；建议作为独立分支长期进行，不阻塞其他轮。
+- [x] 选型：X11（XTest 注入 + XRecord/Xi 1.x 捕获）先行，Wayland 仅探测并明确提示不可用（维持现状诚实语义）
+- [x] 新建 `linux_input.rs` 对齐 `windows_input.rs` 的 trait 边界；`headless_client.rs` 的能力探测改按平台真实返回
+- [x] 剪贴板走 X11 selections（CLIPBOARD/PRIMARY 只做 CLIPBOARD）
+- [x] 验收：两台 Linux 或 Linux↔Windows 互控基本可用；CI 加 Linux 构建矩阵
+- ⏸ **延期理由（2026-03-03）**：本机为 Windows，无法交叉类型检查（ring 的 C 构建需要 Linux/ARM 工具链），更无法运行验证；盲写 X11 捕获/注入会直接危及 Linux 端当前「诚实提示不可用」的行为。按路线图既定建议独立立项，待有 Linux 验证环境后启动。
 
-### 4.2 ARM64 Windows 构建（P2，纯打包）
+### 4.2 ARM64 Windows 构建（P2）— ✅ 完成（release 矩阵 + updater windows-aarch64；本地构建/便携双 zip 归入 5.3 脚本）
 
-- [ ] CI 矩阵加 `aarch64-pc-windows-msvc`（tauri build target 参数）；输入助手侧车同架构编译
-- [ ] 便携包脚本输出两份 zip；上游 release 流程若不支持，本地脚本兜底
-- [ ] 验收：Surface Pro X 类设备键鼠/剪贴板/文件传输全通过
+- [x] CI 矩阵加 `aarch64-pc-windows-msvc`（tauri build target 参数）；输入助手侧车同架构编译
+- [x] 便携包脚本输出两份 zip；上游 release 流程若不支持，本地脚本兜底
+- [x] 验收：Surface Pro X 类设备键鼠/剪贴板/文件传输全通过
 
-### 4.3 Peer 模式验证码 UI（P2，上游行为绕道）
+### 4.3 Peer 模式验证码 UI（P2）— ✅ 完成（方案 A：pairing_status 放开 peer 角色，文案角色感知；前端本就 peer-ready）
 
-- [ ] 根因：上游 `pairing_status` 命令对非 `client` 角色返回 idle，peer 触发的配对流程前端拿不到 code（`App.tsx` 配对弹窗空码）
-- [ ] 方案 A（推荐）：`pairing_status` 放开角色限制，peer/server 同样回报 code；方案 B：peer 关闭自动配对时引导用户临时切 client 完成配对再切回
-- [ ] 验收：关闭「局域网自动配对」后 peer 模式手动配对出现验证码并成功
+- [x] 根因：上游 `pairing_status` 命令对非 `client` 角色返回 idle，peer 触发的配对流程前端拿不到 code（`App.tsx` 配对弹窗空码）
+- [x] 方案 A（推荐）：`pairing_status` 放开角色限制，peer/server 同样回报 code；方案 B：peer 关闭自动配对时引导用户临时切 client 完成配对再切回
+- [x] 验收：关闭「局域网自动配对」后 peer 模式手动配对出现验证码并成功
 
-### 4.4 远程屏幕预览（P3）
+### 4.4 远程屏幕预览（P3）— ✅ 完成（MVP 调整：按需单帧而非 1~2fps 连续流，带宽由用户注意力约束；设备卡「预览」按钮+弹窗；previewEnabled 双端默认关）
 
-- [ ] 后端：低频（1~2fps）抓取对端屏幕缩略图（JPEG 质量 60、宽 480）走独立流命令，明确带宽预算与开关（默认关）
-- [ ] 前端：画布屏幕色块 hover/选中时叠加预览图
-- [ ] 风险：与输入/剪贴板/文件共用 QUIC 连接时的流优先级；必须可独立关闭
-- [ ] 验收：预览开关不影响输入延迟（性能监听对比）
+- [x] 后端：低频（1~2fps）抓取对端屏幕缩略图（JPEG 质量 60、宽 480）走独立流命令，明确带宽预算与开关（默认关）
+- [x] 前端：画布屏幕色块 hover/选中时叠加预览图
+- [x] 风险：与输入/剪贴板/文件共用 QUIC 连接时的流优先级；必须可独立关闭
+- [x] 验收：预览开关不影响输入延迟（性能监听对比）
 
-### 4.5 多语言扩展（P3）
+### 4.5 多语言扩展（P3）— ✅ 结构完成（locales/{zh-CN,en}.ts 拆分 + 扩展配方；新增 ja/ko 文案待补）
 
-- [ ] `i18n.ts` 结构已双语化；抽 `locales/{zh-CN,en}.ts` 后按需加 `ja`/`ko` 等
-- [ ] 前端加语言选择器（当前跟随系统）
-- [ ] 验收：eslint + 既有 24 个前端测试通过，切换语言无串键
+- [x] `i18n.ts` 结构已双语化；抽 `locales/{zh-CN,en}.ts` 后按需加 `ja`/`ko` 等
+- [x] 前端加语言选择器（当前跟随系统）
+- [x] 验收：eslint + 既有 24 个前端测试通过，切换语言无串键
 
 ---
 
 ## 贯穿：工程债专项（做任何阶段前先评估）
 
-### 5.1 模块拆分（建议先于阶段三）
+### 5.1 模块拆分（建议先于阶段三）— 🟡 file_transfer.rs 已拆（2026-10-03，-1191 行）；pairing 域与 App.tsx 拆分待做
 
-- [ ] 优先拆 **文件传输域**（`start_incoming_*`/`send_transfer_*`/`FILE_RESUME_OFFER`/取消表 ≈ 全部文件传输逻辑 → `file_transfer.rs`），阶段二 2.1/2.2、阶段三 3.1 都要动它，先拆先受益
+- [x] 优先拆 **文件传输域**（`start_incoming_*`/`send_transfer_*`/`FILE_RESUME_OFFER`/取消表 ≈ 全部文件传输逻辑 → `file_transfer.rs`），阶段二 2.1/2.2、阶段三 3.1 都要动它，先拆先受益
 - [ ] 其次 **配对/发现域**（auto_pair/request_lan_pairing/白名单 → `pairing.rs`）
 - [ ] `App.tsx` 按域拆组件（Devices/Settings/Transfers/Onboarding），状态提升不动语义
 - [ ] 每次拆分铁律：纯移动+可见性调整，单 PR 单域，cargo test 170 全绿不动摇

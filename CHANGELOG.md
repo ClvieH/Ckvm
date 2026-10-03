@@ -10,6 +10,8 @@ release will reuse them).
 
 ### Added
 
+- Drag-and-drop between two Windows machines now drops files into the folder under the cursor: the receiver runs a real native drag session that follows the cursor, like the Windows→Mac direction already did. Old peers and refused sessions automatically fall back to landing in the Transfers folder; a Settings toggle ("Drop files under the cursor", on by default) switches back to the old behavior.
+- Remote screen preview: with "Screen preview" enabled on both machines (off by default), the Devices tab gets a Preview button that shows a one-shot thumbnail of the peer's screen. Nothing is streamed in the background.
 - Clipboard history is saved on this machine and survives restarts; the popup hotkey is now configurable in Settings (with a "clear history" button in the popup itself).
 - Transfer history: the last 50 finished transfers (sent and received) are listed on the Devices tab, with one-click resend for failed sends. The list is persisted and clearable.
 - Interrupted multi-file sends can be resumed: after a restart, a banner offers to send the files that never finished (the per-file resume from the previous release picks up partial files where they stopped).
@@ -31,6 +33,7 @@ release will reuse them).
 - Peer mode: screens of a newly paired machine are now placed to the right of the local screens instead of on top of them, so both directions of crossing work right after pairing instead of only one.
 - Corner guard fixes: changing the guard size in Settings no longer freezes the spinner or restarts input on both machines, and the guard now also protects the return path (B → A) instead of only the forward one.
 - Deliberately skipped low-level hook events no longer look like a dead hook, so the input hooks are no longer torn down and reinstalled dozens of times during a normal remote session.
+- Manual pairing between two peer-mode machines now shows the verification code on the receiving side (the code was generated but the status endpoint hid it from non-client roles, leaving the modal blank).
 
 - Open pairing: devices discovered on the same LAN are paired automatically — no confirmation code. Trust is anchored on each device's certificate (whitelist-first authorization, the shared pair secret stays as a legacy fallback); a new "LAN Auto-Pairing" toggle in Settings switches back to the confirmation-code flow, and the cap on paired controllers is 8.
 - Wake-on-LAN: devices now advertise their NIC MAC, and each device in the Devices tab gets a Wake button that wakes a sleeping machine.
