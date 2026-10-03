@@ -228,6 +228,7 @@ export const zhCN = {
     scanning: "扫描中",
     scanningTitle: "正在扫描局域网",
     scanningCopy: "正在搜索同网络下的 MyKVM 设备…",
+    scanCancel: "取消扫描",
     autoPairingHint:
       "局域网自动配对已开启：同一网络下发现的 MyKVM 设备会自动加入并互控；可在设置中关闭或改用验证码确认。",
     pair: "配对",
@@ -280,7 +281,7 @@ export const zhCN = {
     manualHostRequired: "请输入对方设备的 Host 或 IP。",
     peerWithoutScreens: "在线，但没有上报屏幕信息。",
     connectedWithoutScreens: "已连接，但没有拿到屏幕信息。",
-    probeFailed: "没有收到 mykvm 响应。",
+    probeFailed: "没有收到 mykvm 响应。请确认对端已安装并正在运行 MyKVM、两端在同一网络，且对端防火墙已放行 UDP 47833-47837。",
     pairingCodeRequired: "请输入客户端显示的 6 位验证码。",
     pairingFailed: "配对失败。",
     wakeFailed: "唤醒失败。",

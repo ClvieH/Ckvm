@@ -228,6 +228,7 @@ export const en = {
     scanning: "Scanning",
     scanningTitle: "Scanning LAN",
     scanningCopy: "Searching for MyKVM devices on this network…",
+    scanCancel: "Cancel scan",
     autoPairingHint:
       "LAN auto-pairing is on: MyKVM devices discovered on this network join automatically with mutual control. Disable it in Settings to switch back to confirmation codes.",
     pair: "Pair",
@@ -280,7 +281,7 @@ export const en = {
     manualHostRequired: "Enter the other device host or IP.",
     peerWithoutScreens: "is online, but did not report screen data.",
     connectedWithoutScreens: "Connected, but no screen data was reported.",
-    probeFailed: "No mykvm response was received.",
+    probeFailed: "No MyKVM response. Make sure MyKVM is installed and running on that device, both machines are on the same network, and its firewall allows inbound UDP 47833-47837.",
     pairingCodeRequired: "Enter the 6-digit code shown on the client.",
     pairingFailed: "Pairing failed.",
     wakeFailed: "Wake-on-LAN failed.",

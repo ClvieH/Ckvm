@@ -3112,8 +3112,18 @@ fn set_app_upgrading(state: tauri::State<'_, AppRuntime>, enabled: bool) {
     state.upgrading.store(enabled, Ordering::Relaxed);
 }
 
+// Set by cancel_lan_scan; a running windowed scan checks it between sweeps.
+static LAN_SCAN_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// One UI-triggered scan. `duration_secs = 0/None` keeps the historical
+/// single-sweep behavior; a longer window repeats the ~1.4s broadcast sweep
+/// until the time is up (so slow announce cycles cannot be missed), merging
+/// peers as they arrive and emitting "lan-scan-progress" after each sweep.
 #[tauri::command]
-async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<DiscoveryStatus, String> {
+async fn scan_lan_peers(
+    duration_secs: Option<u32>,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<DiscoveryStatus, String> {
     state.start_discovery()?;
     let layout = state
         .layout
@@ -3125,22 +3135,55 @@ async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<Discovery
         apply_transport_to_peer(&mut local_peer, &transport);
     }
     let base_port = discovery_base_port(&layout);
+    let window = duration_secs.unwrap_or(0).min(120) as u64;
+    let app_handle = state.app_handle.clone();
+    let peers_slot = Arc::clone(&state.peers);
+    LAN_SCAN_CANCEL.store(false, Ordering::Relaxed);
 
-    // scan_for_peers blocks for ~1.4s on UDP recv; run it on a blocking thread
-    // so the async command doesn't freeze the webview UI.
-    let discovered =
-        tauri::async_runtime::spawn_blocking(move || scan_for_peers(&local_peer, base_port))
-            .await
-            .map_err(|e| format!("scan task failed: {e}"))??;
+    // The whole window runs on a blocking thread: scan_for_peers blocks ~1.4s
+    // per sweep on UDP recv.
+    let total = tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let mut found = 0_usize;
+        loop {
+            let local = local_peer.clone();
+            // A sweep that failed to open its socket (firewall policy flip,
+            // port exhaustion) must not end the window — retry next round.
+            if let Ok(discovered) = scan_for_peers(&local, base_port) {
+                for peer in discovered {
+                    merge_peer(&peers_slot, peer);
+                    found += 1;
+                }
+            }
+            let _ = app_handle.emit(
+                "lan-scan-progress",
+                serde_json::json!({ "found": found, "elapsedSecs": started.elapsed().as_secs() }),
+            );
+            if window == 0
+                || started.elapsed() >= Duration::from_secs(window)
+                || LAN_SCAN_CANCEL.load(Ordering::Relaxed)
+            {
+                break;
+            }
+        }
+        found
+    })
+    .await
+    .map_err(|e| format!("scan task failed: {e}"))?;
+    let _ = total;
 
-    for peer in discovered {
-        merge_peer(&state.peers, peer);
-    }
     prune_stale_peers(&state.peers);
     auto_pair_discovered_peers(&state.layout, &state.config_path, &state.peers);
     sync_layout_peer_presence(&state.layout, &state.peers);
 
     Ok(state.discovery_status())
+}
+
+/// Frontend cancel for a windowed scan: the sweep loop exits before its next
+/// round, so the command resolves within ~1.4s of the click.
+#[tauri::command]
+fn cancel_lan_scan() {
+    LAN_SCAN_CANCEL.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -4268,6 +4311,7 @@ pub fn run() {
             read_performance_sample,
             set_app_upgrading,
             scan_lan_peers,
+            cancel_lan_scan,
             probe_lan_peer,
             request_lan_pairing,
             confirm_lan_pairing,
@@ -9336,8 +9380,9 @@ fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<La
         _ => format!("UDP {base_port}"),
     };
     Err(format!(
-        "no mykvm peer answered at {host} ({port_hint}); \
-         make sure mykvm is running on that device and UDP is allowed"
+        "no mykvm peer answered at {host} ({port_hint}); make sure MyKVM is \
+         installed AND running on that device, both machines are on the same \
+         network, and its firewall allows inbound UDP {port_hint}"
     ))
 }
 

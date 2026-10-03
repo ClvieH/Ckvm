@@ -1986,6 +1986,11 @@
   animation: scan-spin 0.7s linear infinite;
 }
 
+.scan-modal-cancel {
+  margin-top: 14px;
+  padding: 6px 18px;
+}
+
 .scan-modal-countdown {
   font-size: 0.8rem;
   color: #71717a;

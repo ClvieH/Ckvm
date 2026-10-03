@@ -188,12 +188,20 @@ export async function stopRuntime(): Promise<RuntimeStatus> {
   return invoke<RuntimeStatus>('stop_runtime')
 }
 
-export async function scanLanPeers(): Promise<DiscoveryStatus> {
+export async function scanLanPeers(durationSecs = 0): Promise<DiscoveryStatus> {
   if (!isTauri()) {
     return BROWSER_RUNTIME.discovery
   }
 
-  return invoke<DiscoveryStatus>('scan_lan_peers')
+  return invoke<DiscoveryStatus>('scan_lan_peers', { durationSecs })
+}
+
+export async function cancelLanScan(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('cancel_lan_scan')
 }
 
 export async function probeLanPeer(host: string) {

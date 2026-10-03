@@ -51,6 +51,7 @@ import {
   resumePendingTransferQueue,
   setAutostart,
   scanLanPeers,
+  cancelLanScan,
   startRuntime,
   startWindowDrag,
   stopRuntime,
@@ -1376,9 +1377,13 @@ function App() {
     }
   }
 
+  // The scan window: repeated backend sweeps for this long, so a peer with a
+  // slow announce cycle cannot be missed between two manual clicks.
+  const LAN_SCAN_WINDOW_SECS = 20;
+
   async function scanLan() {
     setErrorMessage(null);
-    setScanCountdown(6);
+    setScanCountdown(LAN_SCAN_WINDOW_SECS);
     setIsScanningLan(true);
 
     // Let the browser paint the modal before we hit the blocking backend call,
@@ -1389,10 +1394,9 @@ function App() {
     const countdownTimer = setInterval(() => {
       setScanCountdown((remaining) => (remaining > 0 ? remaining - 1 : 0));
     }, 1000);
-    const startedAt = Date.now();
 
     try {
-      const discovery = await scanLanPeers();
+      const discovery = await scanLanPeers(LAN_SCAN_WINDOW_SECS);
       setSnapshot((current) =>
         current
           ? {
@@ -1410,18 +1414,15 @@ function App() {
       );
     } finally {
       clearInterval(countdownTimer);
-      const elapsed = Date.now() - startedAt;
-      const minDisplayMs = 2500;
-      if (elapsed < minDisplayMs) {
-        setTimeout(() => {
-          setScanCountdown(0);
-          setIsScanningLan(false);
-        }, minDisplayMs - elapsed);
-      } else {
-        setScanCountdown(0);
-        setIsScanningLan(false);
-      }
+      setScanCountdown(0);
+      setIsScanningLan(false);
     }
+  }
+
+  function cancelScanLan() {
+    // The backend sweep loop exits before its next round (~1.4s), which
+    // resolves the pending scanLanPeers call and closes the modal.
+    void cancelLanScan();
   }
 
   function boardRect(screen: Screen) {
@@ -4139,6 +4140,13 @@ function App() {
             {scanCountdown > 0 ? (
               <span className="scan-modal-countdown">{scanCountdown}s</span>
             ) : null}
+            <button
+              type="button"
+              className="secondary-button scan-modal-cancel"
+              onClick={cancelScanLan}
+            >
+              {ui.devices.scanCancel}
+            </button>
           </div>
         </div>
       ) : null}
