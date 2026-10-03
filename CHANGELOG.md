@@ -8,6 +8,10 @@ release will reuse them).
 
 ## [Unreleased]
 
+### Fixed
+
+- Broadcast storm eradication (incident report): MyKVM used to resolve paired devices' bare computer names through getaddrinfo on every discovery send — a 7x24 stream of LLMNR/NBNS traffic (~10 resolutions/s across the app and the unattended service) even when a paired device was offline, and the manual LAN scan swept the whole /24 across all eight discovery ports (up to ~1450 packets/s of ARP-generating unicast). Discovery now sends IP-literal targets only, resolves hostnames at most once per 30s-10min backoff window with caching, backs off offline peers to one base-port probe per 30s-300s, and the scan sweep drops to one packet per host with ~3s between rounds. Log timestamps are local time; running from a network share warns at startup.
+
 ### Added
 
 - Drag-and-drop between two Windows machines now drops files into the folder under the cursor: the receiver runs a real native drag session that follows the cursor, like the Windows→Mac direction already did. Old peers and refused sessions automatically fall back to landing in the Transfers folder; a Settings toggle ("Drop files under the cursor", on by default) switches back to the old behavior.

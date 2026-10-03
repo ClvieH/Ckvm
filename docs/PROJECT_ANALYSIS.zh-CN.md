@@ -595,6 +595,29 @@ ubuntu-22.04 单 job：Node 22 → Linux 桌面依赖（libwebkit2gtk-4.1-dev �
 
 **路线图状态**：四阶段 + 工程债全部执行完毕（4.1 Linux 延期立项）；便携包按最终代码重建（19:15 版），「整条路线完成才打包」条件达成。
 
+### 第九轮：局域网广播风暴根治（2026-10-04，事件报告驱动）
+
+事件档案：`C:\Users\Administrator\.zcode\workspace\default\MyKVM风暴事件-修复与防复发报告.md`（含 pcapng 证据、net-loss-log.csv、验证抓包法）。
+
+**实测根因**（两轮代码勘察 + 本机向 B 机 47833 端口直发合法发现包零响应的对照实验）：
+
+| 风暴源 | 根因代码 | 修复 |
+|---|---|---|
+| **主机名解析风暴 ~10 次/秒 7×24**（主雷） | `known_peer_discovery_targets` 把配对设备的 `host`（= 对端裸 COMPUTERNAME，如 "CLVIE"）拼成 `"CLVIE:47833".."47840"` 8 个目标；`send_to(impl ToSocketAddrs)` 每次触发 getaddrinfo → 单标签名回退 LLMNR 组播 + NBNS 广播，负缓存为 0。UI 进程 + headless 服务进程各占一半 | 新增 `resolve_discovery_target`：IP 字面量直通；主机名一次性解析 + 缓存 10min，失败退避 30s→10min；手动添加/配对路径显式解析一次 |
+| **离线定向宣告无退避** | 每 3s × 8-9 端口 × (ip+host) 永久探测所有已保存设备/配对控制器，不看 online | `directed_probe_due` 门控：在线（60s 内见过）全速；离线只发基端口 1 包，30s×5 次后降 300s（UI + headless 共用） |
+| **扫描 = /24×8 端口 ARP 炸弹** | `unicast_sweep_targets_for_ips` 每轮 254 IP × 8 端口 × N 子网，20s 窗口连发 ≈ 峰值 1450 pps | 端口扇出 8→1（漂移端口靠广播宣告覆盖）；20s 窗口每轮间隔 2.5s+抖动 |
+
+**报告指控不成立的部分**（无需修）：剪贴板同步已有 2s→60s 指数退避（d6abb6e，闸门在包构造之前）；WOL 仅用户手动触发（3 包/次）；QUIC fast-fail 3 次/3s 有界。
+
+**一并落地（报告 Bug 5/6）**：日志时间戳改本地时区（`TimezoneStrategy::UseLocal`，事件排查曾因 UTC 混淆浪费一小时）；从 UNC 共享运行时启动告警；长离线配对设备 ≥3 台时每小时 WARN 一次（风暴自监控）。
+
+**验证**：cargo test 173+5（新增解析退避/离线降级/扇出单端口测试）、前端 30 全绿；便携包 05:26 版。**上线后验证抓包**（两台机器跑新版 24h）：
+
+```
+tshark -i <idx> -a duration:120 -f "arp or udp port 5353 or udp port 5355 or udp port 137" -w check.pcapng
+tshark -r check.pcapng -Y "arp.opcode==1" | wc -l   # 健康：<20/2min
+```
+
 ## 11. 本机构建验证记录（Windows 10 x64，2026-10-02）
 
 **bate 分支（当前基线）**：
