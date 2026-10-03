@@ -9649,7 +9649,10 @@ fn merge_peer_entry(peers: &mut Vec<LanPeer>, next_peer: LanPeer) {
         }
     }
 
-    log::debug!(
+    // First sight of a peer is the single most useful diagnostic line for
+    // "why can't I see the other machine" reports: it proves discovery INBOUND
+    // works on this machine, and the ip shows which subnet the peer came from.
+    log::info!(
         "discovery peer found id={} name={} ip={} discovery_port={} quic_port={} input_ready={} pairing_required={}",
         next_peer.id,
         next_peer.name,
