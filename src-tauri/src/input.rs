@@ -3712,6 +3712,15 @@ fn set_control_clipboard_target(
 #[cfg(target_os = "windows")]
 static LAST_HOOK_EVENT_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The removal decision, pure for tests: the system recorded input more than
+/// two seconds AFTER the last event our hooks saw. System-vs-hook comparison
+/// is deliberately preferred over a send-success flag: it also covers idle
+/// periods (no sends while not controlling) without special-casing.
+#[cfg(target_os = "windows")]
+fn hook_liveness_removed(last_input_tick: u32, last_hook_tick: u32) -> bool {
+    last_hook_tick != 0 && last_input_tick.wrapping_sub(last_hook_tick) as i32 > 2_000
+}
+
 /// Windows silently removes a low-level hook whose callback overran
 /// LowLevelHooksTimeout, after which input simply stops being captured until
 /// a restart. The system still records input then (GetLastInputInfo) while
@@ -3728,7 +3737,7 @@ fn windows_hooks_look_removed() -> bool {
         return false;
     }
     let last_hook = LAST_HOOK_EVENT_TICK.load(Ordering::Relaxed);
-    last_hook != 0 && info.dwTime.wrapping_sub(last_hook) as i32 > 2_000
+    hook_liveness_removed(info.dwTime, last_hook)
 }
 
 #[cfg(target_os = "windows")]
@@ -3743,6 +3752,12 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
+    // Record the tick BEFORE any early return (same invariant as the keyboard
+    // hook): any event the hook chain delivered proves it is alive, even one
+    // we pass through or handle during teardown.
+    let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
+    LAST_HOOK_EVENT_TICK.store(event.time, Ordering::Relaxed);
+
     let Some(context) = windows_capture_context() else {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     };
@@ -3751,8 +3766,6 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
-    let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
-    LAST_HOOK_EVENT_TICK.store(event.time, Ordering::Relaxed);
     // Injected events (remote input this machine is receiving, our own
     // synthetic cursor parks) pass straight through: never re-captured, never
     // re-forwarded — that would echo the remote stream back to its sender.
@@ -8639,6 +8652,42 @@ fn inject_key(_key_code: u16, _down: bool) {}
 
 #[cfg(test)]
 mod tests {
+    // Regression for the reinstall storm: the liveness decision must read the
+    // tick comparisons exactly as documented (any event the hooks deliver —
+    // forwarded, injected, or peer-arbitrated — refreshes the tick, so a pure
+    // keyboard remote session can never look "removed" while events flow).
+    #[test]
+    fn hook_liveness_zero_reinstalls_for_injected_only_streams() {
+        use super::hook_liveness_removed;
+        // Events flowing (injected or forwarded) keep the hook tick within
+        // the 2s window of the system's last input tick.
+        let mut system_tick = 1_000_000_u32;
+        let mut hook_tick = system_tick;
+        for step in 0..1_800 {
+            // ~30 minutes of events at 1 Hz, hook never more than 500ms behind.
+            system_tick += 1_000;
+            hook_tick = system_tick - 500;
+            assert!(
+                !hook_liveness_removed(system_tick, hook_tick),
+                "step {step}: flowing events must never look removed"
+            );
+        }
+        // Silence: no system input at all -> no decision to remove.
+        assert!(!hook_liveness_removed(system_tick, hook_tick));
+        // The hook really died: system input continues, hooks see nothing.
+        let stalled_hook = system_tick;
+        system_tick += 2_001;
+        assert!(hook_liveness_removed(system_tick, stalled_hook));
+        // Exactly 2000ms is inside the window (strictly greater removes).
+        assert!(!hook_liveness_removed(3_000, 1_000));
+        // Tick wrap-around (GetTickCount is u32): must compare forward, not
+        // treat the wrap as a huge gap.
+        assert!(!hook_liveness_removed(500, u32::MAX - 1_000));
+        assert!(hook_liveness_removed(3_001, u32::MAX - 1_000));
+        // A never-seen event (0) is never "removed" (nothing to compare yet).
+        assert!(!hook_liveness_removed(9_999, 0));
+    }
+
     use super::*;
 
     #[test]
