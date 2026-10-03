@@ -231,6 +231,12 @@ jobs:
           - os: windows-latest
             name: windows
             args: --ci
+          # Windows on ARM (Surface Pro X / Snapdragon laptops): cross-built
+          # on the x64 runner — the image ships the ARM64 MSVC toolset ring
+          # needs, and NSIS produces a -arm64-setup.exe.
+          - os: windows-latest
+            name: windows-arm64
+            args: --ci --target aarch64-pc-windows-msvc
           - os: ubuntu-22.04
             name: linux
             args: --ci
@@ -257,6 +263,10 @@ jobs:
 
       - name: Install Rust stable
         run: rustup default stable
+
+      - name: Add Windows ARM64 Rust target
+        if: matrix.name == 'windows-arm64'
+        run: rustup target add aarch64-pc-windows-msvc
 
       - name: Add macOS Rust targets
         if: matrix.name == 'macos'
@@ -636,6 +646,7 @@ jobs:
             (name) =>
               !name.endsWith('.sig') &&
               name !== 'mykvm-windows-x64-setup.exe' &&
+              !/arm64/i.test(name) &&
               (/setup\.exe$/i.test(name) || /\.msi$/i.test(name)),
           );
           if (windowsAsset) {
@@ -647,6 +658,16 @@ jobs:
             );
             files = fs.readdirSync(dir);
             addPlatform('windows-x86_64', windowsUpdaterAsset);
+          }
+
+          const windowsArmAsset = files.find(
+            (name) =>
+              !name.endsWith('.sig') &&
+              /arm64/i.test(name) &&
+              (/setup\.exe$/i.test(name) || /\.msi$/i.test(name)),
+          );
+          if (windowsArmAsset) {
+            addPlatform('windows-aarch64', windowsArmAsset);
           }
 
           const linuxAsset = files.find(
