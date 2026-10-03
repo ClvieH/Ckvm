@@ -61,6 +61,7 @@ const BROWSER_RUNTIME: RuntimeStatus = {
       pairingRequired: false,
       host: 'localhost',
       ip: '127.0.0.1',
+      mac: '',
       transportPort: defaultLayout.transportPort,
       quicPort: defaultLayout.quicPort,
       transportPublicKey: '',
@@ -295,6 +296,125 @@ export async function sendFilesToDevice(deviceId: string, paths: string[]): Prom
   }
 
   return invoke<FileTransferSummary>('send_files_to_device', { deviceId, paths })
+}
+
+export async function wakeDevice(deviceId: string): Promise<void> {
+  if (!isTauri()) {
+    throw new Error('Wake-on-LAN is available only in the Tauri desktop runtime.')
+  }
+
+  await invoke('wake_device', { deviceId })
+}
+
+export async function cancelFileTransfer(transferId: string): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('cancel_file_transfer', { transferId })
+}
+
+export interface ClipboardHistoryEntry {
+  id: number
+  kind: 'text' | 'files'
+  text: string
+  fileNames: string[]
+  totalBytes: number
+  atMs: number
+}
+
+export async function readClipboardHistory(): Promise<ClipboardHistoryEntry[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return invoke<ClipboardHistoryEntry[]>('read_clipboard_history')
+}
+
+export async function restoreClipboardHistory(id: number): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('restore_clipboard_history', { id })
+}
+
+export async function clearClipboardHistory(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('clear_clipboard_history')
+}
+
+export interface TransferHistoryEntry {
+  id: number
+  direction: 'send' | 'receive'
+  deviceId: string
+  deviceName: string
+  fileName: string
+  fileCount: number
+  totalBytes: number
+  ok: boolean
+  error: string | null
+  atMs: number
+  paths: string[]
+}
+
+export async function listTransferHistory(): Promise<TransferHistoryEntry[]> {
+  if (!isTauri()) {
+    return []
+  }
+
+  return invoke<TransferHistoryEntry[]>('list_transfer_history')
+}
+
+export async function clearTransferHistory(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('clear_transfer_history')
+}
+
+export async function resendTransferHistoryEntry(
+  id: number,
+): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('resend_transfer_history_entry', { id })
+}
+
+export interface PendingQueueSummary {
+  deviceName: string
+  remaining: number
+  total: number
+}
+
+export async function readPendingTransferQueue(): Promise<PendingQueueSummary | null> {
+  if (!isTauri()) {
+    return null
+  }
+
+  return invoke<PendingQueueSummary | null>('read_pending_transfer_queue')
+}
+
+export async function dismissPendingTransferQueue(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('dismiss_pending_transfer_queue')
+}
+
+export async function resumePendingTransferQueue(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('resume_pending_transfer_queue')
 }
 
 export async function fetchClientLog(deviceId: string): Promise<string> {

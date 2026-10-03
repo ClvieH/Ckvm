@@ -37,6 +37,17 @@ import {
   saveLayout,
   sendFilesToDevice,
   fetchClientLog,
+  wakeDevice,
+  cancelFileTransfer,
+  readClipboardHistory,
+  restoreClipboardHistory,
+  clearClipboardHistory,
+  listTransferHistory,
+  clearTransferHistory,
+  resendTransferHistoryEntry,
+  readPendingTransferQueue,
+  dismissPendingTransferQueue,
+  resumePendingTransferQueue,
   setAutostart,
   scanLanPeers,
   startRuntime,
@@ -47,7 +58,12 @@ import {
   uninstallInputService,
   writeClipboardText,
 } from "./desktopApi";
-import type { AppUpdateInfo } from "./desktopApi";
+import type {
+  AppUpdateInfo,
+  ClipboardHistoryEntry,
+  TransferHistoryEntry,
+  PendingQueueSummary,
+} from "./desktopApi";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
@@ -202,6 +218,16 @@ function App() {
   const [fileTransfers, setFileTransfers] = useState<
     Record<string, FileTransferProgressEntry>
   >({});
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const historyOpenRef = useRef(false);
+  const [historyEntries, setHistoryEntries] = useState<
+    ClipboardHistoryEntry[]
+  >([]);
+  const [transferHistory, setTransferHistory] = useState<
+    TransferHistoryEntry[]
+  >([]);
+  const [queueResume, setQueueResume] =
+    useState<PendingQueueSummary | null>(null);
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
   const [isInputServicePending, setIsInputServicePending] = useState(false);
@@ -237,6 +263,8 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isCapturingEdgeSwitchHotkey, setIsCapturingEdgeSwitchHotkey] =
     useState(false);
+  const [isCapturingHistoryHotkey, setIsCapturingHistoryHotkey] =
+    useState(false);
   const [capturingDirection, setCapturingDirection] = useState<
     "left" | "right" | "up" | "down" | null
   >(null);
@@ -246,6 +274,7 @@ function App() {
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
   const edgeSwitchHotkeyButtonRef = useRef<HTMLButtonElement | null>(null);
+  const historyHotkeyButtonRef = useRef<HTMLButtonElement | null>(null);
   const screenSwitchButtonRefs = useRef<
     Record<"left" | "right" | "up" | "down", HTMLButtonElement | null>
   >({ left: null, right: null, up: null, down: null });
@@ -328,6 +357,7 @@ function App() {
             }));
             // A finished (or failed) toast lingers briefly, then disappears.
             if (payload.done) {
+              void refreshTransferHistory();
               const existing = removalTimers.get(payload.transferId);
               if (existing) {
                 clearTimeout(existing);
@@ -365,6 +395,35 @@ function App() {
         clearTimeout(timer);
       }
       removalTimers.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    let unlistenHistory: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen("clipboard-history-toggle", () => {
+          const next = !historyOpenRef.current;
+          historyOpenRef.current = next;
+          setHistoryOpen(next);
+          if (next) {
+            void readClipboardHistory()
+              .then((entries) => setHistoryEntries(entries))
+              .catch(() => {});
+          }
+        }),
+      )
+      .then((unlisten) => {
+        unlistenHistory = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      unlistenHistory?.();
     };
   }, []);
 
@@ -436,7 +495,8 @@ function App() {
         }
         if (
           active &&
-          nextSnapshot.layout.machineRole === "client" &&
+          (nextSnapshot.layout.machineRole === "client" ||
+            nextSnapshot.layout.machineRole === "peer") &&
           !nextSnapshot.runtime.started
         ) {
           setIsRuntimePending(true);
@@ -608,21 +668,25 @@ function App() {
 
           const currentSnapshot = snapshotRef.current;
           if (
-            currentSnapshot?.layout.machineRole === "client" &&
-            (currentSnapshot.layout.pairedControllers.length === 0 ||
-              currentSnapshot.runtime?.pairing.state === "requested") &&
-            nextRuntime.pairing.state === "paired"
+            currentSnapshot?.layout.machineRole === "client" ||
+            currentSnapshot?.layout.machineRole === "peer"
           ) {
-            void loadAppState()
-              .then((pairingSnapshot) => {
-                if (active) {
-                  setSnapshot({
-                    ...pairingSnapshot,
-                    runtime: nextRuntime,
-                  });
-                }
-              })
-              .catch(() => {});
+            if (
+              (currentSnapshot.layout.pairedControllers.length === 0 ||
+                currentSnapshot.runtime?.pairing.state === "requested") &&
+              nextRuntime.pairing.state === "paired"
+            ) {
+              void loadAppState()
+                .then((pairingSnapshot) => {
+                  if (active) {
+                    setSnapshot({
+                      ...pairingSnapshot,
+                      runtime: nextRuntime,
+                    });
+                  }
+                })
+                .catch(() => {});
+            }
           }
 
           // Keep a persistent blocking condition visible. The inject stage holds
@@ -740,7 +804,7 @@ function App() {
       : ui.settings.inputServiceNeedsInstall;
   const canManageInputService =
     usesWindowsChrome &&
-    machineRole === "client" &&
+    (machineRole === "client" || machineRole === "peer") &&
     Boolean(runtime?.privilege.isElevated);
   const hasBlockingOverlay =
     Boolean(inputServiceAction) ||
@@ -1470,6 +1534,41 @@ function App() {
     }));
   }
 
+  function setAutoPairing(autoPairing: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      autoPairing,
+    }));
+  }
+
+  function setLockOnLeave(lockOnLeave: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      lockOnLeave,
+    }));
+  }
+
+  function setFullscreenGuard(fullscreenGuard: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      fullscreenGuard,
+    }));
+  }
+
+  function setCornerGuard(cornerGuard: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      cornerGuard,
+    }));
+  }
+
+  function setCornerGuardSize(cornerGuardSize: number) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      cornerGuardSize: clampCornerGuardSize(cornerGuardSize),
+    }));
+  }
+
   function setModifierRemap(modifierRemap: boolean) {
     updateLayout((layoutState) => ({
       ...layoutState,
@@ -1518,6 +1617,109 @@ function App() {
   function commitEdgeSwitchHotkey(value: string) {
     setEdgeSwitchHotkey(normalizeEdgeSwitchHotkeyInput(value));
   }
+
+  function setClipboardHistoryShortcut(clipboardHistoryShortcut: string) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      clipboardHistoryShortcut,
+    }));
+  }
+
+  function refreshTransferHistory() {
+    void listTransferHistory()
+      .then((entries) => setTransferHistory(entries))
+      .catch(() => {});
+  }
+
+  function handleResendTransfer(id: number) {
+    void resendTransferHistoryEntry(id)
+      .then(() => refreshTransferHistory())
+      .catch((error) => setFileTransferMessage(String(error)));
+  }
+
+  function handleResumeQueue() {
+    void resumePendingTransferQueue()
+      .then(() => setQueueResume(null))
+      .catch((error) => setFileTransferMessage(String(error)));
+  }
+
+  function handleDismissQueue() {
+    void dismissPendingTransferQueue();
+    setQueueResume(null);
+  }
+
+  useEffect(() => {
+    if (currentTab !== "devices") {
+      return;
+    }
+    refreshTransferHistory();
+  }, [currentTab, fileTransferMessage]);
+
+  // Interrupted transfer queue: query once, then listen for the startup
+  // event (setup fires it after a leftover queue file is found).
+  useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+    void readPendingTransferQueue()
+      .then((summary) => setQueueResume(summary))
+      .catch(() => {});
+
+    let unlistenQueue: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<PendingQueueSummary>("transfer-queue-resume", ({ payload }) => {
+          setQueueResume(payload);
+        }),
+      )
+      .then((unlisten) => {
+        unlistenQueue = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      unlistenQueue?.();
+    };
+  }, []);
+
+  const captureHistoryHotkey = useEffectEvent((event: KeyboardEvent) => {
+    const hotkey = hotkeyFromKeyboardEvent(event, metaKeyLabel);
+    if (!hotkey) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    setClipboardHistoryShortcut(hotkey);
+    setIsCapturingHistoryHotkey(false);
+  });
+
+  useEffect(() => {
+    if (!isCapturingHistoryHotkey) {
+      return;
+    }
+
+    const cancelIfOutsideRecorder = (event: Event) => {
+      const target = event.target;
+      const button = historyHotkeyButtonRef.current;
+      if (target instanceof Node && button?.contains(target)) {
+        return;
+      }
+      setIsCapturingHistoryHotkey(false);
+    };
+    const cancelRecording = () => setIsCapturingHistoryHotkey(false);
+
+    window.addEventListener("keydown", captureHistoryHotkey, true);
+    document.addEventListener("pointerdown", cancelIfOutsideRecorder, true);
+    document.addEventListener("focusin", cancelIfOutsideRecorder, true);
+    window.addEventListener("blur", cancelRecording);
+    return () => {
+      window.removeEventListener("keydown", captureHistoryHotkey, true);
+      document.removeEventListener("pointerdown", cancelIfOutsideRecorder, true);
+      document.removeEventListener("focusin", cancelIfOutsideRecorder, true);
+      window.removeEventListener("blur", cancelRecording);
+    };
+  }, [isCapturingHistoryHotkey]);
 
   const captureEdgeSwitchHotkey = useEffectEvent((event: KeyboardEvent) => {
     const hotkey = hotkeyFromKeyboardEvent(event, metaKeyLabel);
@@ -1672,14 +1874,15 @@ function App() {
     const nextLayout: LayoutState = {
       ...layout,
       machineRole,
-      inputMode: machineRole === "client" ? "receive" : "control",
+      // Peer mode captures AND receives at the same time.
+      inputMode: machineRole === "client" ? "receive" : machineRole === "peer" ? "both" : "control",
     };
 
     setErrorMessage(null);
     await persistLayout(nextLayout);
     setActiveTab(machineRole === "client" ? "settings" : "layout");
 
-    if (machineRole === "client" && !runtime?.started) {
+    if ((machineRole === "client" || machineRole === "peer") && !runtime?.started) {
       await setRuntimeState(true);
     }
   }
@@ -1780,6 +1983,14 @@ function App() {
 
     try {
       const challengePeer = await requestLanPairing(host);
+      // Open pairing: an already-paired peer (pairingRequired=false) needs no
+      // confirmation code — upsert it into the layout and we're done.
+      if (!challengePeer.pairingRequired) {
+        updateLayout((current) => upsertPeerDevice(current, challengePeer, alias, manual));
+        setServerPairing(null);
+        setServerPairingError(null);
+        return;
+      }
       setServerPairing({ peer: challengePeer, host, manual, alias });
       setServerPairingCode("");
       setServerPairingError(null);
@@ -2080,6 +2291,15 @@ function App() {
                       transfer.totalBytes,
                     )} · ${transfer.targetName}`}
               </div>
+              {!transfer.done && !failed ? (
+                <button
+                  type="button"
+                  className="secondary-button compact-button file-transfer-cancel"
+                  onClick={() => void handleCancelFileTransfer(transfer.transferId)}
+                >
+                  {ui.devices.cancelTransfer}
+                </button>
+              ) : null}
             </div>
           );
         })}
@@ -2186,16 +2406,25 @@ function App() {
               className="role-choice-card"
               onClick={() => void setMachineRole("server")}
             >
-              <span>Server</span>
+              <span>{ui.onboarding.serverLabel}</span>
               <strong>{ui.onboarding.serverTitle}</strong>
               <p>{ui.onboarding.serverCopy}</p>
             </button>
             <button
               type="button"
               className="role-choice-card"
+              onClick={() => void setMachineRole("peer")}
+            >
+              <span>{ui.onboarding.peerLabel}</span>
+              <strong>{ui.onboarding.peerTitle}</strong>
+              <p>{ui.onboarding.peerCopy}</p>
+            </button>
+            <button
+              type="button"
+              className="role-choice-card"
               onClick={() => void setMachineRole("client")}
             >
-              <span>Client</span>
+              <span>{ui.onboarding.clientLabel}</span>
               <strong>{ui.onboarding.clientTitle}</strong>
               <p>{ui.onboarding.clientCopy}</p>
             </button>
@@ -2234,7 +2463,7 @@ function App() {
   function screenFileTransferTargetId(screen: FlattenedScreen) {
     if (
       !fileTransferEnabled ||
-      machineRole !== "server" ||
+      machineRole === "client" ||
       screen.role === "local" ||
       !screen.online ||
       !screen.inputReady ||
@@ -2246,6 +2475,23 @@ function App() {
     return screen.deviceId;
   }
 
+  async function handleWakeDevice(device: Device) {
+    setErrorMessage(null);
+    try {
+      await wakeDevice(device.id);
+    } catch (error: unknown) {
+      setErrorMessage(formatUnknownError(error, ui.errors.wakeFailed));
+    }
+  }
+
+  async function handleCancelFileTransfer(transferId: string) {
+    try {
+      await cancelFileTransfer(transferId);
+    } catch (error: unknown) {
+      setErrorMessage(formatUnknownError(error, ui.errors.fileTransfer));
+    }
+  }
+
   function renderAddedDeviceActions(device: Device) {
     if (device.role === "local") {
       return null;
@@ -2253,6 +2499,17 @@ function App() {
 
     return (
       <>
+        <button
+          type="button"
+          className="secondary-button compact-button"
+          onClick={() => void handleWakeDevice(device)}
+          disabled={device.mac.trim().length === 0}
+          title={
+            device.mac.trim().length === 0 ? ui.devices.wakeUnavailable : undefined
+          }
+        >
+          {ui.devices.wake}
+        </button>
         <button
           type="button"
           className="secondary-button compact-button"
@@ -2342,10 +2599,106 @@ function App() {
 
       {errorMessage ? renderErrorDialog(errorMessage) : null}
       {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
+      {queueResume ? (
+        <div className="queue-resume-banner" role="status">
+          <span>
+            {ui.devices.queueResumeCopy
+              .replace("{count}", String(queueResume.remaining))
+              .replace("{device}", queueResume.deviceName)}
+          </span>
+          <div className="queue-resume-actions">
+            <button
+              type="button"
+              className="primary-button"
+              onClick={handleResumeQueue}
+            >
+              {ui.devices.queueResumeContinue}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={handleDismissQueue}
+            >
+              {ui.devices.queueResumeDismiss}
+            </button>
+          </div>
+        </div>
+      ) : null}
       {renderFileTransferToasts()}
+      {historyOpen ? (
+        <div
+          className="pairing-modal-backdrop"
+          role="presentation"
+          onClick={() => {
+            historyOpenRef.current = false;
+            setHistoryOpen(false);
+          }}
+        >
+          <div
+            className="pairing-modal clipboard-history-modal"
+            role="dialog"
+            aria-label={ui.settings.historyTitle}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="pairing-close-button"
+              onClick={() => {
+                historyOpenRef.current = false;
+                setHistoryOpen(false);
+              }}
+              aria-label={ui.common.close}
+            >
+              <WindowCloseIcon />
+            </button>
+            <p className="eyebrow">{ui.settings.historyEyebrow}</p>
+            <h2>{ui.settings.historyTitle}</h2>
+            <p className="muted-copy">{ui.settings.historyCopy}</p>
+            <div className="history-list">
+              {historyEntries.length === 0 ? (
+                <p className="muted-copy">{ui.settings.historyEmpty}</p>
+              ) : (
+                historyEntries.map((entry) => (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    className="history-entry"
+                    onClick={() => {
+                      void restoreClipboardHistory(entry.id);
+                      historyOpenRef.current = false;
+                      setHistoryOpen(false);
+                    }}
+                  >
+                    <span className="history-entry-kind">
+                      {entry.kind === "files" ? ui.settings.historyFiles : ui.settings.historyText}
+                    </span>
+                    <span className="history-entry-text" title={entry.text}>
+                      {entry.kind === "files"
+                        ? entry.fileNames.join("、") || entry.text
+                        : entry.text}
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
+            <div className="clipboard-history-footer">
+              <button
+                type="button"
+                className="history-clear-button"
+                onClick={() => {
+                  void clearClipboardHistory();
+                  setHistoryEntries([]);
+                }}
+              >
+                {ui.settings.historyClear}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {inputServiceAction ? renderInputServicePrompt(inputServiceAction) : null}
 
-      {machineRole === "server" && currentTab === "layout" ? (
+      {machineRole !== "client" && currentTab === "layout" ? (
         <section className="workspace-shell">
           <section className="layout-panel">
             <div className="layout-toolbar">
@@ -2460,7 +2813,7 @@ function App() {
         </section>
       ) : null}
 
-      {machineRole === "server" && currentTab === "devices" ? (
+      {machineRole !== "client" && currentTab === "devices" ? (
         <section className="page-panel">
           <div className="page-heading">
             <div>
@@ -2469,6 +2822,10 @@ function App() {
               <p>{ui.devices.subtitle}</p>
             </div>
           </div>
+
+          {layout.autoPairing ? (
+            <p className="muted-copy">{ui.devices.autoPairingHint}</p>
+          ) : null}
 
           <div className="connection-stack">
             <section className="surface-card connection-add-card">
@@ -2625,6 +2982,70 @@ function App() {
                 ))}
               </div>
             </section>
+
+            <section className="surface-card transfers-panel-card">
+              <div className="transfers-panel-head">
+                <h2>{ui.devices.transferHistoryTitle}</h2>
+                {transferHistory.length > 0 ? (
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      void clearTransferHistory();
+                      setTransferHistory([]);
+                    }}
+                  >
+                    {ui.devices.transferHistoryClear}
+                  </button>
+                ) : null}
+              </div>
+              {transferHistory.length === 0 ? (
+                <p className="muted-copy">{ui.devices.transferHistoryEmpty}</p>
+              ) : (
+                <div className="transfers-history-list">
+                  {transferHistory.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className={`transfer-history-entry${entry.ok ? "" : " failed"}`}
+                    >
+                      <span className="transfer-history-direction">
+                        {entry.direction === "send"
+                          ? ui.devices.transferSent
+                          : ui.devices.transferReceived}
+                      </span>
+                      <span
+                        className="transfer-history-name"
+                        title={entry.fileName}
+                      >
+                        {entry.fileName}
+                      </span>
+                      <span className="transfer-history-meta">
+                        {entry.deviceName} ·{" "}
+                        {formatFileTransferBytes(entry.totalBytes)} ·{" "}
+                        {new Date(entry.atMs).toLocaleTimeString()}
+                      </span>
+                      {entry.ok ? null : (
+                        <span
+                          className="transfer-history-error"
+                          title={entry.error ?? ""}
+                        >
+                          {entry.error ?? ""}
+                        </span>
+                      )}
+                      {!entry.ok && entry.direction === "send" ? (
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          onClick={() => handleResendTransfer(entry.id)}
+                        >
+                          {ui.devices.transferResend}
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
           </div>
         </section>
       ) : null}
@@ -2650,6 +3071,13 @@ function App() {
                     onClick={() => void setMachineRole("server")}
                   >
                     {ui.roles.server}
+                  </button>
+                  <button
+                    type="button"
+                    className={machineRole === "peer" ? "active" : ""}
+                    onClick={() => void setMachineRole("peer")}
+                  >
+                    {ui.roles.peer}
                   </button>
                   <button
                     type="button"
@@ -2761,7 +3189,7 @@ function App() {
                     </button>
                   </div>
                 </div>
-                {machineRole === "server" ? (
+                {machineRole !== "client" ? (
                   <>
                     <div className="settings-control-row">
                       <span>{ui.settings.edgeSwitchHotkey}</span>
@@ -2880,11 +3308,160 @@ function App() {
                     </button>
                   </div>
                 </div>
-                {machineRole === "client" ? (
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.autoPairing}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.autoPairingCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.autoPairing ? "active" : ""}
+                      onClick={() => setAutoPairing(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.autoPairing ? "active" : ""}
+                      onClick={() => setAutoPairing(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.lockOnLeave}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.lockOnLeaveCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.lockOnLeave ? "active" : ""}
+                      onClick={() => setLockOnLeave(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.lockOnLeave ? "active" : ""}
+                      onClick={() => setLockOnLeave(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.fullscreenGuard}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.fullscreenGuardCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.fullscreenGuard ? "active" : ""}
+                      onClick={() => setFullscreenGuard(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.fullscreenGuard ? "active" : ""}
+                      onClick={() => setFullscreenGuard(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.historyHotkey}</span>
+                  <button
+                    type="button"
+                    ref={historyHotkeyButtonRef}
+                    className={`hotkey-recorder-button ${
+                      isCapturingHistoryHotkey ? "recording" : ""
+                    }`}
+                    aria-pressed={isCapturingHistoryHotkey}
+                    onClick={() =>
+                      setIsCapturingHistoryHotkey((recording) => !recording)
+                    }
+                  >
+                    {isCapturingHistoryHotkey
+                      ? ui.settings.historyHotkeyRecording
+                      : layout.clipboardHistoryShortcut
+                        ? renderHotkeyTags(
+                            formatEdgeSwitchHotkeyForDisplay(
+                              layout.clipboardHistoryShortcut,
+                              metaKeyLabel,
+                            ),
+                            localPlatform,
+                          )
+                        : ui.settings.historyHotkeyDisabled}
+                  </button>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.cornerGuard}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.cornerGuardCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.cornerGuard ? "active" : ""}
+                      onClick={() => setCornerGuard(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.cornerGuard ? "active" : ""}
+                      onClick={() => setCornerGuard(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                {layout.cornerGuard ? (
+                  <div className="settings-control-row">
+                    <span>{ui.settings.cornerGuardSize}</span>
+                    <input
+                      className="settings-number-input"
+                      type="number"
+                      min="0"
+                      max="200"
+                      value={layout.cornerGuardSize}
+                      onChange={(event) =>
+                        setCornerGuardSize(Number(event.target.value))
+                      }
+                    />
+                  </div>
+                ) : null}
+                {machineRole === "client" || machineRole === "peer" ? (
                   <div className="settings-control-row paired-controller-row">
                     <span className="paired-controller-label">
                       {layout.pairedControllers.length > 0
-                        ? `${ui.settings.pairedWith}: ${layout.pairedControllers
+                        ? `${ui.settings.pairedWith} (${layout.pairedControllers.length}/8): ${layout.pairedControllers
                             .map(
                               (controller) =>
                                 controller.name ||
@@ -2962,6 +3539,12 @@ function App() {
                   <div>
                     <dt>{ui.settings.address}</dt>
                     <dd>{runtime.discovery.localPeer.ip}</dd>
+                  </div>
+                  <div>
+                    <dt>{ui.settings.localMac}</dt>
+                    <dd>
+                      {runtime.discovery.localPeer.mac.trim() || "—"}
+                    </dd>
                   </div>
                   <div>
                     <dt>{ui.settings.ports}</dt>
@@ -3239,18 +3822,16 @@ function App() {
                   >
                     {ui.settings.openLogDirectory}
                   </button>
-                  {machineRole === "server" || machineRole === "client" ? (
-                    <button
-                      type="button"
-                      className="secondary-button compact-button"
-                      onClick={() => void handleFetchClientLog()}
-                      disabled={isDiagnosticPending || !isTauri()}
-                    >
-                      {machineRole === "client"
-                        ? ui.settings.fetchServerLog
-                        : ui.settings.fetchClientLog}
-                    </button>
-                  ) : null}
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void handleFetchClientLog()}
+                    disabled={isDiagnosticPending || isTauri()}
+                  >
+                    {machineRole === "client"
+                      ? ui.settings.fetchServerLog
+                      : ui.settings.fetchClientLog}
+                  </button>
                 </div>
                 {diagnosticMessage ? (
                   <p className="muted-copy diagnostic-message">
@@ -3330,7 +3911,8 @@ function App() {
         </div>
       ) : null}
 
-      {machineRole === "client" && runtime.pairing.state === "requested" ? (
+      {(machineRole === "client" || machineRole === "peer") &&
+      runtime.pairing.state === "requested" ? (
         <div className="pairing-modal-backdrop" role="presentation">
           <div className="pairing-modal pairing-modal-client">
             <button
@@ -3508,6 +4090,14 @@ function normalizePort(value: number) {
   }
 
   return Math.round(Math.min(65535, Math.max(1024, value)));
+}
+
+function clampCornerGuardSize(value: number) {
+  if (!Number.isFinite(value)) {
+    return 32;
+  }
+
+  return Math.round(Math.min(200, Math.max(0, value)));
 }
 
 function normalizeEdgeSwitchHotkeyInput(value: string) {
@@ -3819,7 +4409,9 @@ function upsertPeerDevice(
   return {
     ...layout,
     devices,
-    inputMode: "control",
+    // Adding a device makes this machine a controller, but a peer must keep
+    // its receive side enabled, so never downgrade 'both' here.
+    inputMode: layout.inputMode === "both" ? "both" : "control",
     activeDeviceId: nextDevice.id,
     selectedScreenId: nextDevice.screens[0]?.id ?? layout.selectedScreenId,
   };
@@ -3839,6 +4431,7 @@ function createDeviceFromPeer(
     name: alias || existingDevice?.name || peer.name,
     platform: normalizePlatform(peer.platform),
     host: !manual && existingDevice?.source === "manual" ? existingDevice.host : peer.ip || peer.host,
+    mac: peer.mac || existingDevice?.mac || "",
     transportPort: peer.transportPort,
     quicPort: peer.quicPort,
     transportPublicKey: peer.transportPublicKey,

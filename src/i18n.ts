@@ -8,6 +8,7 @@ export const TEXT = {
     roles: {
       server: "服务端",
       client: "客户端",
+      peer: "对等",
       unset: "未设置",
     },
     common: {
@@ -44,12 +45,18 @@ export const TEXT = {
     onboarding: {
       eyebrow: "MyKVM setup",
       title: "选择这台设备的工作模式",
-      copy: "服务端负责发现并添加其它设备；客户端保持轻量运行，只接收服务端共享过来的鼠标和键盘。",
+      copy: "服务端负责发现并添加其它设备；客户端保持轻量运行，只接收服务端共享过来的鼠标和键盘；对等模式则双端都可互控。",
+      serverLabel: "Server",
       serverTitle: "服务端",
       serverCopy: "进入完整工作台，添加局域网设备并管理显示器布局。",
+      clientLabel: "Client",
       clientTitle: "客户端",
       clientCopy:
         "进入精简状态页，默认仅接收远端键鼠输入，适合被控设备常驻后台。",
+      peerLabel: "Peer",
+      peerTitle: "对等模式",
+      peerCopy:
+        "两台机器对等互控：双方都能把鼠标键盘划到对方屏幕上，也都能被对方控制。",
     },
     settings: {
       eyebrow: "Settings",
@@ -57,7 +64,7 @@ export const TEXT = {
       subtitle: "工作模式、传输端口、语言主题、剪贴板同步和本机状态。",
       roleTitle: "工作模式",
       roleCopy:
-        "服务端负责管理布局并捕获输入；客户端保持轻量常驻，接收远端键鼠。",
+        "服务端管理布局并捕获输入；客户端轻量常驻接收远端键鼠；对等模式双向互控。",
       pairedWith: "已配对",
       notPaired: "当前未配对",
       resetPairing: "解除配对",
@@ -69,7 +76,7 @@ export const TEXT = {
       screenSwitchTitle: "快捷切屏",
       screenSwitchRecording: "按下快捷键...",
       screenSwitchCopy:
-        "仅服务端注册。按方向快捷键把控制权切到对应方向的相邻客户端；控制远端时再按任意切屏快捷键切回本机。",
+        "服务端与对等模式注册。按方向快捷键把控制权切到对应方向的相邻屏幕；控制远端时再按任意切屏快捷键切回本机。",
       appearanceTitle: "配置",
       language: "语言",
       simplifiedChinese: "cn 中文简体",
@@ -91,6 +98,7 @@ export const TEXT = {
       fetchClientLogNoTarget: "没有在线的对端可拉取日志。",
       name: "名称",
       address: "地址",
+      localMac: "网卡 MAC",
       ports: "端口",
       peers: "发现设备",
       logDirectory: "日志目录",
@@ -123,6 +131,30 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "当前设备",
       clipboard: "剪贴板同步",
+      autoPairing: "局域网自动配对",
+      autoPairingCopy:
+        "同一局域网内的设备发现即自动互配，无需验证码（以设备证书为信任锚）。关闭后回退为验证码确认流程。",
+      lockOnLeave: "离开时锁定本机",
+      lockOnLeaveCopy:
+        "用鼠标把控制权划到别的机器时，自动锁定本机屏幕（公共环境隐私保护）。仅在本机主动发起切换时触发。",
+      fullscreenGuard: "全屏时暂停穿越",
+      fullscreenGuardCopy:
+        "本机有全屏应用（游戏/视频）在前台时暂停鼠标穿越，避免游戏中误切到另一台机器。",
+      historyEyebrow: "Clipboard",
+      historyTitle: "剪贴板历史",
+      historyCopy:
+        "点击条目写回本机剪贴板，并同步到当前控制的设备。历史会保存到本机，重启后仍在。",
+      historyEmpty: "暂无历史。跨机复制过的文本和文件会出现在这里（最多 20 条）。",
+      historyText: "文本",
+      historyFiles: "文件",
+      historyClear: "清空历史",
+      historyHotkey: "历史呼出快捷键",
+      historyHotkeyRecording: "按下组合键…",
+      historyHotkeyDisabled: "已停用",
+      cornerGuard: "角落防误切",
+      cornerGuardCopy:
+        "鼠标移到屏幕四角时不切换到相邻屏幕，避免点关闭按钮等角部操作误穿越；沿边缘移出角落即可正常切换。",
+      cornerGuardSize: "防护区大小 (px)",
       fileTransfer: "文件传输 (bate)",
       fileTransferCopy:
         "将文件或文件夹拖到相邻屏幕即可跨设备传输，落在哪个设备上就送到哪台。",
@@ -188,11 +220,25 @@ export const TEXT = {
       scanning: "扫描中",
       scanningTitle: "正在扫描局域网",
       scanningCopy: "正在搜索同网络下的 MyKVM 设备…",
+      autoPairingHint:
+        "局域网自动配对已开启：同一网络下发现的 MyKVM 设备会自动加入并互控；可在设置中关闭或改用验证码确认。",
       pair: "配对",
       repair: "重新配对",
+      wake: "唤醒",
+      wakeUnavailable: "该设备未上报网卡 MAC，无法唤醒",
+      cancelTransfer: "取消",
       fileTransferSent: "已发送",
       fileTransferSending: "发送中",
       fileTransferFailed: "发送失败",
+      transferHistoryTitle: "传输历史",
+      transferHistoryClear: "清空",
+      transferHistoryEmpty: "暂无传输记录。跨机发送或接收的文件会出现在这里（最近 50 条）。",
+      transferSent: "发送",
+      transferReceived: "接收",
+      transferResend: "重发",
+      queueResumeCopy: "上次有 {count} 个文件未传完（目标 {device}），是否继续？",
+      queueResumeContinue: "继续传输",
+      queueResumeDismiss: "忽略",
       pairingEyebrow: "PAIRING",
       serverPairingTitle: "输入客户端验证码",
       serverPairingCopy: "客户端屏幕上会显示 6 位验证码：",
@@ -225,6 +271,7 @@ export const TEXT = {
       probeFailed: "没有收到 mykvm 响应。",
       pairingCodeRequired: "请输入客户端显示的 6 位验证码。",
       pairingFailed: "配对失败。",
+      wakeFailed: "唤醒失败。",
       fileTransfer: "文件传输失败。",
       writeClipboard: "写入剪贴板失败。",
       checkUpdate: "检查更新失败。",
@@ -244,6 +291,7 @@ export const TEXT = {
     roles: {
       server: "Server",
       client: "Client",
+      peer: "Peer",
       unset: "Unset",
     },
     common: {
@@ -280,13 +328,19 @@ export const TEXT = {
     onboarding: {
       eyebrow: "MyKVM setup",
       title: "Choose this device role",
-      copy: "Server discovers and manages other devices; Client stays lightweight and receives shared mouse and keyboard input.",
+      copy: "Server discovers and manages other devices; Client stays lightweight and receives shared mouse and keyboard input; Peer mode lets both machines control each other.",
+      serverLabel: "Server",
       serverTitle: "Server",
       serverCopy:
         "Open the full workspace, add LAN devices, and manage the display layout.",
+      clientLabel: "Client",
       clientTitle: "Client",
       clientCopy:
         "Open the compact status page and receive remote keyboard and mouse input in the background.",
+      peerLabel: "Peer",
+      peerTitle: "Peer mode",
+      peerCopy:
+        "Two machines control each other: both can slide onto the other's screens with keyboard and mouse, and both can be controlled.",
     },
     settings: {
       eyebrow: "Settings",
@@ -295,7 +349,7 @@ export const TEXT = {
         "Role, transport port, language, theme, clipboard sync, and local status.",
       roleTitle: "Work Mode",
       roleCopy:
-        "Server manages layout and captures input; Client stays lightweight and receives remote input.",
+        "Server manages layout and captures input; Client stays lightweight and receives remote input; Peer mode controls in both directions.",
       pairedWith: "Paired with",
       notPaired: "Not paired",
       resetPairing: "Unpair",
@@ -307,7 +361,7 @@ export const TEXT = {
       screenSwitchTitle: "Quick switch",
       screenSwitchRecording: "Press shortcut...",
       screenSwitchCopy:
-        "Registered only on the server. Press a direction shortcut to jump to an adjacent client; while controlling a peer, press any quick-switch shortcut again to return to this machine.",
+        "Registered on server and peer. Press a direction shortcut to jump to an adjacent screen; while controlling a peer, press any quick-switch shortcut again to return to this machine.",
       appearanceTitle: "Configuration",
       language: "Language",
       simplifiedChinese: "cn 中文简体",
@@ -329,6 +383,7 @@ export const TEXT = {
       fetchClientLogNoTarget: "No online peer to fetch a log from.",
       name: "Name",
       address: "Address",
+      localMac: "NIC MAC",
       ports: "Actual Ports",
       peers: "Peers",
       logDirectory: "Log Folder",
@@ -361,6 +416,30 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "Active Device",
       clipboard: "Clipboard Sync",
+      autoPairing: "LAN Auto-Pairing",
+      autoPairingCopy:
+        "Automatically pair with devices discovered on the same LAN — no confirmation code (device certificates are the trust anchor). Turn off to fall back to the confirmation-code flow.",
+      lockOnLeave: "Lock screen on leave",
+      lockOnLeaveCopy:
+        "Automatically lock this machine's screen when you slide control onto another machine (privacy on shared spaces). Fires only when this machine initiates the switch.",
+      fullscreenGuard: "Pause crossing in fullscreen",
+      fullscreenGuardCopy:
+        "Pauses edge crossing while a fullscreen app (game/video) is foreground on this machine — accidental crossings are especially disruptive mid-game.",
+      historyEyebrow: "Clipboard",
+      historyTitle: "Clipboard History",
+      historyCopy:
+        "Click an entry to write it back to this machine's clipboard and sync it to the device you're controlling. History is saved on this machine and survives restarts.",
+      historyEmpty: "No history yet. Text and files copied across machines appear here (last 20).",
+      historyText: "Text",
+      historyFiles: "Files",
+      historyClear: "Clear history",
+      historyHotkey: "History popup hotkey",
+      historyHotkeyRecording: "Press a shortcut…",
+      historyHotkeyDisabled: "Disabled",
+      cornerGuard: "Corner Guard",
+      cornerGuardCopy:
+        "Keeps the cursor from crossing at the screen's four corners, so clicking a window's close button never throws it onto another machine; slide along the edge out of the corner to cross normally.",
+      cornerGuardSize: "Guard zone size (px)",
       fileTransfer: "File Transfer (bate)",
       fileTransferCopy:
         "Drag files or folders onto an adjacent screen to transfer them across devices — wherever they land is where they go.",
@@ -426,11 +505,25 @@ export const TEXT = {
       scanning: "Scanning",
       scanningTitle: "Scanning LAN",
       scanningCopy: "Searching for MyKVM devices on this network…",
+      autoPairingHint:
+        "LAN auto-pairing is on: MyKVM devices discovered on this network join automatically with mutual control. Disable it in Settings to switch back to confirmation codes.",
       pair: "Pair",
       repair: "Re-pair",
+      wake: "Wake",
+      wakeUnavailable: "This device never advertised a NIC MAC — wake is unavailable",
+      cancelTransfer: "Cancel",
       fileTransferSent: "Sent",
       fileTransferSending: "Sending",
       fileTransferFailed: "Failed",
+      transferHistoryTitle: "Transfer History",
+      transferHistoryClear: "Clear",
+      transferHistoryEmpty: "No transfers yet. Files sent or received across machines appear here (last 50).",
+      transferSent: "Sent",
+      transferReceived: "Received",
+      transferResend: "Resend",
+      queueResumeCopy: "The last session left {count} file(s) unfinished (target: {device}). Continue?",
+      queueResumeContinue: "Resume",
+      queueResumeDismiss: "Ignore",
       pairingEyebrow: "PAIRING",
       serverPairingTitle: "Enter Client Code",
       serverPairingCopy: "The client screen shows a 6-digit code:",
@@ -463,6 +556,7 @@ export const TEXT = {
       probeFailed: "No mykvm response was received.",
       pairingCodeRequired: "Enter the 6-digit code shown on the client.",
       pairingFailed: "Pairing failed.",
+      wakeFailed: "Wake-on-LAN failed.",
       fileTransfer: "File transfer failed.",
       writeClipboard: "Failed to write clipboard.",
       checkUpdate: "Failed to check for updates.",

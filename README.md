@@ -39,9 +39,9 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 
 ## Limitations
 
-- **Trusted LAN only.** There is no user pairing/PIN yet, and LAN discovery is plaintext and unauthenticated. Do not expose the ports to public or untrusted networks.
+- **Trusted LAN only.** Discovery is plaintext and unauthenticated: anyone on the LAN can send discovery packets, even though pairing adds a one-time confirmation code. Do not expose the ports to public or untrusted networks.
 - Input and clipboard ride an **encrypted QUIC/TLS** connection pinned to the peer's advertised certificate, but MyKVM is a prototype and is not hardened for hostile networks.
-- The clipboard syncs **text and images**, not files.
+- The clipboard syncs **text and images**. Files are transferred separately (see *Send files to devices* below), not through the clipboard.
 - macOS builds are **self-signed, not notarized** — expect a Gatekeeper prompt on first open.
 - Experimental software: the protocol and behavior may change between versions.
 
@@ -49,12 +49,16 @@ Move your cursor off the edge of one screen and it lands on the next machine. Yo
 
 ## Features
 
-- Runs in Server or Client mode.
+- Runs in Server, Client, or Peer mode (peer machines control each other bidirectionally).
 - Discovers nearby peers on the LAN.
 - Supports manual peer connection by host or IP.
+- Pairs devices with a one-time confirmation code shown on the controlled machine.
 - Detects local displays and lets you arrange multi-monitor layouts.
 - Shares keyboard and mouse input over an encrypted QUIC connection.
-- Syncs clipboard text and images over the same encrypted connection.
+- Corner guard keeps corner clicks (close buttons, Start menu) from accidentally crossing to another machine (configurable in Settings).
+- Syncs clipboard text and images over the same encrypted connection (images are PNG-compressed on the wire when that is smaller).
+- Clipboard file sync: copy files with Ctrl+C, press Ctrl+V on the other machine (lands in Downloads\MyKVM Transfers\Clipboard).
+- Send files to devices — including dragging them onto a remote machine's screen (Windows and macOS).
 - Provides light, dark, and system theme modes.
 - Includes English and Simplified Chinese UI.
 - Supports tray behavior for hiding and restoring the main window.
@@ -66,10 +70,10 @@ MyKVM is an experimental early release. It is useful for local testing and itera
 
 - License: MIT
 - Default ports: UDP `47833` (discovery) and UDP `47834` (QUIC transport)
-- Clipboard payload caps: 256 KB text, 32 MB image
+- Clipboard payload caps: 256 KB text, 32 MB image (PNG-compressed on the wire when smaller)
 - Transport security: input and clipboard run over a TLS 1.3 (QUIC) connection pinned to the peer's advertised certificate
-- Security model: trusted LAN prototype
-- Not yet included: user pairing/PIN, authenticated discovery, and production transport hardening
+- Security model: trusted LAN prototype; pairing uses a one-time confirmation code, but discovery itself stays unauthenticated
+- Not yet included: authenticated discovery and production transport hardening
 
 Do not expose the transport ports to public or untrusted networks.
 

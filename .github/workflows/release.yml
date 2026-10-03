@@ -436,6 +436,9 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Unit tests
+        run: npm run test
+
       - name: Check Tauri backend
         run: cargo check --manifest-path src-tauri/Cargo.toml
 

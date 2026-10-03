@@ -166,6 +166,10 @@ struct FileBuffer {
 
 struct FileBufferState {
     data: Vec<u8>,
+    // Contiguous bytes accepted so far. Chunks are strictly ordered; a resend
+    // whose range is already covered is dropped as a duplicate, and a gap is
+    // rejected so the transfer aborts instead of corrupting the stream.
+    received_bytes: u64,
     complete: bool,
     aborted: bool,
 }
@@ -177,6 +181,7 @@ impl FileBuffer {
             size,
             state: Mutex::new(FileBufferState {
                 data: Vec::new(),
+                received_bytes: 0,
                 complete: false,
                 aborted: false,
             }),
@@ -184,11 +189,30 @@ impl FileBuffer {
         }
     }
 
-    fn append(&self, bytes: &[u8]) {
-        if let Ok(mut state) = self.state.lock() {
-            state.data.extend_from_slice(bytes);
+    /// Append the next chunk at `offset`. Returns `false` for a gap (the
+    /// transfer is corrupt — the sender gives up). Duplicates (a resend whose
+    /// ACK was lost) are accepted as success without writing a second copy.
+    fn append_at(&self, offset: u64, bytes: &[u8]) -> bool {
+        let accepted = if let Ok(mut state) = self.state.lock() {
+            let end = offset.saturating_add(bytes.len() as u64);
+            if offset < state.received_bytes && end <= state.received_bytes {
+                // Duplicate: already on the stream.
+                true
+            } else if offset == state.received_bytes {
+                state.data.extend_from_slice(bytes);
+                state.received_bytes = end;
+                true
+            } else {
+                // Gap or overlap beyond the received prefix.
+                false
+            }
+        } else {
+            false
+        };
+        if accepted {
+            self.cond.notify_all();
         }
-        self.cond.notify_all();
+        accepted
     }
 
     fn finish(&self) {
@@ -258,16 +282,18 @@ pub fn session_wants(transfer_id: &str) -> bool {
     session_for(transfer_id).is_some()
 }
 
-pub fn feed_chunk(transfer_id: &str, data: &[u8]) -> bool {
+pub fn feed_chunk(transfer_id: &str, offset: u64, data: &[u8]) -> bool {
     let Some(session) = session_for(transfer_id) else {
         return false;
     };
     let Some(buffer) = session.by_transfer_id.get(transfer_id) else {
         return false;
     };
-    buffer.append(data);
-    session.touch();
-    true
+    let accepted = buffer.append_at(offset, data);
+    if accepted {
+        session.touch();
+    }
+    accepted
 }
 
 pub fn finish_file(transfer_id: &str) -> bool {
@@ -1040,5 +1066,40 @@ fn inject_left_button(down: bool) {
     };
     unsafe {
         SendInput(1, &mut input, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_buffer_deduplicates_retried_chunks_and_rejects_gaps() {
+        let buffer = FileBuffer::new("note.txt".into(), 11);
+
+        assert!(buffer.append_at(0, b"hello "));
+        // Resend of the same chunk (lost ACK): accepted as success, no second
+        // copy written.
+        assert!(buffer.append_at(0, b"hello "));
+        // A gap: bytes at offset 9 while only 6 are received.
+        assert!(!buffer.append_at(9, b"wo"));
+        // The missing chunk in order.
+        assert!(buffer.append_at(6, b"world"));
+
+        buffer.finish();
+        assert_eq!(buffer.received(), 11);
+        let mut out = [0_u8; 11];
+        let read = buffer.read_at(0, &mut out).expect("stream read");
+        assert_eq!(read, 11);
+        assert_eq!(&out, b"hello world");
+    }
+
+    #[test]
+    fn file_buffer_rejects_overlapping_resend_beyond_the_received_prefix() {
+        let buffer = FileBuffer::new("note.txt".into(), 8);
+
+        assert!(buffer.append_at(0, b"abc"));
+        // Offset 2 overlaps the received prefix but extends past it — corrupt.
+        assert!(!buffer.append_at(2, b"XY"));
     }
 }

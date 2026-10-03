@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
@@ -15,6 +15,7 @@ use std::{
 
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -23,6 +24,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 mod clipboard;
+mod discovery_signing;
 #[cfg(target_os = "windows")]
 pub mod headless_client;
 mod input;
@@ -69,6 +71,114 @@ const CLIPBOARD_IDLE_SLEEP_MS: u64 = 25;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
 // A peer that stays down doubles the wait each time, up to a minute.
 const CLIPBOARD_RETRY_MAX_MS: u64 = 60_000;
+
+// Event-driven clipboard wake (Windows): a hidden message-only window
+// receives WM_CLIPBOARDUPDATE and wakes the sync loop instantly instead of
+// the loop discovering a copy at its next throttled poll. Platforms without
+// a listener just use the wait as a plain sleep.
+static CLIPBOARD_WAKE_LOCK: Mutex<()> = Mutex::new(());
+static CLIPBOARD_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static CLIPBOARD_EVENT_PENDING: AtomicBool = AtomicBool::new(false);
+static CLIPBOARD_LISTENER_STARTED: OnceLock<()> = OnceLock::new();
+
+fn wait_for_clipboard_wake(idle: Duration) {
+    let guard = CLIPBOARD_WAKE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Timed wait: returns after `idle` or as soon as a clipboard event fires.
+    let (_guard, _timed_out) = CLIPBOARD_WAKE
+        .wait_timeout(guard, idle)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    drop(_guard);
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_clipboard_format_listener() {
+    use windows_sys::Win32::System::DataExchange::AddClipboardFormatListener;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+        TranslateMessage, HWND_MESSAGE, MSG, WNDCLASSW,
+    };
+
+    CLIPBOARD_LISTENER_STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("clipboard-listener".into())
+            .spawn(move || unsafe {
+                let class_name: Vec<u16> = "MyKvmClipboardListener\0"
+                    .encode_utf16()
+                    .collect();
+
+                unsafe extern "system" fn wndproc(
+                    hwnd: windows_sys::Win32::Foundation::HWND,
+                    msg: u32,
+                    wparam: windows_sys::Win32::Foundation::WPARAM,
+                    lparam: windows_sys::Win32::Foundation::LPARAM,
+                ) -> windows_sys::Win32::Foundation::LRESULT {
+                    if msg == 0x031D {
+                        // WM_CLIPBOARDUPDATE: clipboard content changed.
+                        CLIPBOARD_EVENT_PENDING.store(true, Ordering::Relaxed);
+                        if let Ok(guard) = CLIPBOARD_WAKE_LOCK.lock() {
+                            CLIPBOARD_WAKE.notify_all();
+                            drop(guard);
+                        }
+                    }
+                    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                }
+
+                let instance = GetModuleHandleW(std::ptr::null());
+                let class = WNDCLASSW {
+                    style: 0,
+                    lpfnWndProc: Some(wndproc),
+                    cbClsExtra: 0,
+                    cbWndExtra: 0,
+                    hInstance: instance,
+                    hIcon: std::ptr::null_mut(),
+                    hCursor: std::ptr::null_mut(),
+                    hbrBackground: std::ptr::null_mut(),
+                    lpszMenuName: std::ptr::null(),
+                    lpszClassName: class_name.as_ptr(),
+                };
+                if RegisterClassW(&class) == 0 {
+                    log::warn!("clipboard listener: RegisterClassW failed");
+                    return;
+                }
+                // HWND_MESSAGE parent: a message-only window — invisible, no
+                // taskbar entry, receives broadcast-free targeted messages.
+                let hwnd = CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    class_name.as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    std::ptr::null_mut(),
+                    instance,
+                    std::ptr::null(),
+                );
+                if hwnd.is_null() {
+                    log::warn!("clipboard listener: CreateWindowExW failed");
+                    return;
+                }
+                if AddClipboardFormatListener(hwnd) == 0 {
+                    log::warn!("clipboard listener: AddClipboardFormatListener failed");
+                    return;
+                }
+                let mut message: MSG = std::mem::zeroed();
+                while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            })
+            .expect("clipboard-listener thread");
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_clipboard_format_listener() {}
 // Progressive 50, 100, ... 450 ms (~2.25 s in all) outlasts another process
 // holding the clipboard open (PR #22).
 const CLIPBOARD_WRITE_ATTEMPTS: usize = 10;
@@ -95,6 +205,13 @@ const FILE_TRANSFER_PROGRESS_EVENT: &str = "file-transfer-progress";
 // Progress is emitted at most this often per file while sending (plus always on
 // completion) so a multi-GB transfer doesn't flood the webview with events.
 const FILE_TRANSFER_PROGRESS_INTERVAL_MS: u64 = 100;
+// Send retries per transfer packet: one lost ACK must not abort a multi-GB
+// transfer. The receiver tolerates duplicated chunks, which makes resends safe.
+const FILE_TRANSFER_SEND_ATTEMPTS: u32 = 3;
+const FILE_TRANSFER_RETRY_DELAY_MS: u64 = 250;
+// Cap on simultaneously staged incoming transfers, so a burst of "start"
+// packets cannot pile up unbounded .part files on disk.
+const MAX_CONCURRENT_INCOMING_TRANSFERS: usize = 4;
 
 #[cfg(target_os = "windows")]
 const SINGLE_INSTANCE_MUTEX_NAME: &str = "Local\\MyKVM_SingleInstance";
@@ -167,6 +284,10 @@ struct Device {
     name: String,
     platform: String,
     host: String,
+    // Local NIC MAC (coloneless hex) for Wake-on-LAN; persisted per device so
+    // an offline/sleeping machine stays wakeable.
+    #[serde(default)]
+    mac: String,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
     #[serde(default)]
@@ -249,6 +370,30 @@ struct LayoutState {
     clipboard_sync: bool,
     #[serde(default = "default_file_transfer_enabled")]
     file_transfer_enabled: bool,
+    // Corner guard: refuse edge crossings that start inside a dead zone around
+    // the local screen's four corners, so corner clicks (window close buttons,
+    // Start menu) never throw the cursor onto another machine.
+    #[serde(default = "default_corner_guard")]
+    corner_guard: bool,
+    #[serde(default = "default_corner_guard_size")]
+    corner_guard_size: u32,
+    // Open pairing: any discovered peer on the LAN is trusted and paired
+    // automatically (anchored on its transport certificate). Turning this off
+    // falls back to the manual confirmation-code flow.
+    #[serde(default = "default_auto_pairing")]
+    auto_pairing: bool,
+    // Lock this machine's screen when the user walks away with the cursor
+    // (opt-in; fires only on local-initiated edge crossings).
+    #[serde(default)]
+    lock_on_leave: bool,
+    // Pause edge crossing while a fullscreen app (game/video) is foreground on
+    // this machine — accidental crossings are especially disruptive there.
+    #[serde(default = "default_fullscreen_guard")]
+    fullscreen_guard: bool,
+    // Global hotkey that opens the clipboard-history popup. Empty string
+    // disables the popup hotkey entirely.
+    #[serde(default = "default_clipboard_history_shortcut")]
+    clipboard_history_shortcut: String,
     #[serde(default = "default_language")]
     language: String,
     #[serde(default = "default_theme_mode")]
@@ -299,6 +444,13 @@ struct PairedController {
     protocol_version: u16,
     cluster_id: String,
     paired_at_ms: u64,
+    // Last time this pair authorized traffic (input/file). Kept alongside
+    // pairedAtMs so the whitelist cap evicts least-recently-used pairs, not
+    // merely the oldest ones. Hot paths update the in-memory usage map (see
+    // PAIRED_CONTROLLER_LAST_USED); this field catches up whenever the layout
+    // is saved or the cap forces an eviction.
+    #[serde(default)]
+    last_used_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +473,9 @@ struct LanPeer {
     pairing_required: bool,
     host: String,
     ip: String,
+    // Local NIC MAC (coloneless hex), advertised so peers can send Wake-on-LAN.
+    #[serde(default)]
+    mac: String,
     #[serde(default = "default_transport_port")]
     transport_port: u16,
     #[serde(default)]
@@ -478,7 +633,24 @@ struct TransferFile {
     total_bytes: u64,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for IncomingFileTransfer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IncomingFileTransfer")
+            .field("origin_id", &self.origin_id)
+            .field("target_id", &self.target_id)
+            .field("file_name", &self.file_name)
+            .field("total_bytes", &self.total_bytes)
+            .field("received_bytes", &self.received_bytes)
+            .field("next_chunk_index", &self.next_chunk_index)
+            .field("temp_path", &self.temp_path)
+            .field("final_path", &self.final_path)
+            .field("staged", &self.staged)
+            .field("sha256_active", &self.sha256.is_some())
+            .finish()
+    }
+}
+
 struct IncomingFileTransfer {
     origin_id: String,
     target_id: String,
@@ -492,6 +664,9 @@ struct IncomingFileTransfer {
     // placer (which drops it into the folder under the cursor on release)
     // instead of leaving it at final_path.
     staged: bool,
+    // Running SHA-256 over the received bytes; compared against the sender's
+    // digest on the finish packet. None only if the hasher itself failed.
+    sha256: Option<ring::digest::Context>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,6 +757,20 @@ struct FileTransferPacket {
     // folder instead of the transfers folder.
     #[serde(default)]
     client_log: bool,
+    // SHA-256 of the whole file, attached to the "finish" packet by new
+    // senders. Absent (empty) from older senders — the receiver then skips
+    // verification, so mixed-version pairs keep working.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    file_sha256: Vec<u8>,
+    // Resume support (new senders only): a "start" whose ACK carries
+    // "ok:<offset>" continues from that byte offset into a matching .part the
+    // receiver kept. Absent on non-start packets and from older senders.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    resume_from: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 struct AppRuntime {
@@ -592,6 +781,9 @@ struct AppRuntime {
     peers: Arc<Mutex<Vec<LanPeer>>>,
     pairing_challenge: Arc<Mutex<Option<PairingChallenge>>>,
     file_transfers: Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    // Outgoing-send cancel flags keyed by transfer id; the send loop polls the
+    // flag per chunk and aborts the transfer when set.
+    transfer_cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     quic_transport: Mutex<Option<quic_transport::TransportHandle>>,
     discovery_stop: Mutex<Option<Arc<AtomicBool>>>,
     input_stop: Mutex<Option<Arc<AtomicBool>>>,
@@ -611,6 +803,7 @@ struct AppRuntime {
     input_events: Arc<AtomicU64>,
     clipboard_packets: Arc<AtomicU64>,
     runtime_toggle_shortcut: Mutex<Option<String>>,
+    clipboard_history_shortcut: Mutex<Option<String>>,
     runtime_toggle_menu_item: Mutex<Option<MenuItem<Wry>>>,
     screen_switch_request: Arc<Mutex<Option<input::SwitchDirection>>>,
     screen_switch_shortcuts: Mutex<ScreenSwitchHotkeys>,
@@ -633,6 +826,7 @@ impl AppRuntime {
             peers: Arc::new(Mutex::new(Vec::new())),
             pairing_challenge: Arc::new(Mutex::new(None)),
             file_transfers: Arc::new(Mutex::new(HashMap::new())),
+            transfer_cancels: Arc::new(Mutex::new(HashMap::new())),
             quic_transport: Mutex::new(None),
             discovery_stop: Mutex::new(None),
             input_stop: Mutex::new(None),
@@ -652,6 +846,7 @@ impl AppRuntime {
             input_events: Arc::new(AtomicU64::new(0)),
             clipboard_packets: Arc::new(AtomicU64::new(0)),
             runtime_toggle_shortcut: Mutex::new(None),
+            clipboard_history_shortcut: Mutex::new(None),
             runtime_toggle_menu_item: Mutex::new(None),
             screen_switch_request: Arc::new(Mutex::new(None)),
             screen_switch_shortcuts: Mutex::new(empty_screen_switch_hotkeys()),
@@ -799,6 +994,8 @@ impl AppRuntime {
             }
         });
 
+        // Stream handlers answer with the ACK string ("ok"/"ok:<offset>"/
+        // "reject"); the file-transfer arm negotiates resume offsets.
         let on_stream = Arc::new(move |payload: Vec<u8>, source| {
             if handle_pairing_stream_packet(
                 &payload,
@@ -809,7 +1006,7 @@ impl AppRuntime {
                 &peers_for_pairing,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return "ok".to_string();
             }
 
             // Snapshot the layout instead of holding the lock through the
@@ -820,7 +1017,7 @@ impl AppRuntime {
             // of ms per sync. Stream packets are rare; one clone is nothing.
             let layout = {
                 let Ok(layout) = layout_for_clipboard.lock() else {
-                    return false;
+                    return "reject".to_string();
                 };
                 layout.clone()
             };
@@ -828,7 +1025,7 @@ impl AppRuntime {
 
             if handle_drag_control_packet(&payload, &layout, &current_peer.id) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return "ok".to_string();
             }
 
             if handle_log_request_packet(
@@ -838,7 +1035,7 @@ impl AppRuntime {
                 &app_handle_for_file_transfer,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return "ok".to_string();
             }
 
             if handle_file_transfer_packet(
@@ -849,11 +1046,20 @@ impl AppRuntime {
                 &app_handle_for_file_transfer,
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
-                return true;
+                // A "start" that adopted a kept .part answers "ok:<offset>" so
+                // the sender continues from there instead of restarting.
+                let resume = FILE_RESUME_OFFER
+                    .lock()
+                    .ok()
+                    .and_then(|mut offer| offer.take());
+                return match resume {
+                    Some(offset) => format!("ok:{offset}"),
+                    None => "ok".to_string(),
+                };
             }
 
             if !clipboard_receive_enabled.load(Ordering::Relaxed) {
-                return false;
+                return "reject".to_string();
             }
             if handle_clipboard_packet(
                 &payload,
@@ -865,9 +1071,9 @@ impl AppRuntime {
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 clipboard_packets.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return "ok".to_string();
             }
-            false
+            "reject".to_string()
         });
 
         let identity_dir = self
@@ -939,6 +1145,7 @@ impl AppRuntime {
         let layout_state = Arc::clone(&self.layout);
         let pairing_challenge = Arc::clone(&self.pairing_challenge);
         let app_handle = self.app_handle.clone();
+        let config_path = self.config_path.clone();
         let input_receive_enabled = Arc::clone(&self.input_receive_enabled);
         let upgrading = Arc::clone(&self.upgrading);
         let transport_packets = Arc::clone(&self.transport_packets);
@@ -1048,10 +1255,20 @@ impl AppRuntime {
                                     &incoming.peer,
                                     source.ip().to_string(),
                                 ) {
-                                    let handle = app_handle.clone();
-                                    let _ = app_handle.run_on_main_thread(move || {
-                                        let _ = show_main_window_handle(&handle);
-                                    });
+                                    // Open pairing: no confirmation window —
+                                    // trust the requester immediately.
+                                    if !current_layout.auto_pairing {
+                                        let handle = app_handle.clone();
+                                        let _ = app_handle.run_on_main_thread(move || {
+                                            let _ = show_main_window_handle(&handle);
+                                        });
+                                    }
+                                    merge_peer(&peers, incoming.peer.clone());
+                                    auto_pair_discovered_peers(
+                                        &layout_state,
+                                        &config_path,
+                                        &peers,
+                                    );
                                     let _ = send_discovery_packet(
                                         &socket,
                                         "pair-challenge",
@@ -1069,6 +1286,14 @@ impl AppRuntime {
                             if peer_visible_to_layout(&current_layout, &incoming.peer) {
                                 merge_peer(&peers, incoming.peer.clone());
                                 sync_layout_peer_presence(&layout_state, &peers);
+                                // Open pairing: newly visible peers are trusted
+                                // and paired immediately (anchored on their
+                                // advertised transport certificate).
+                                auto_pair_discovered_peers(
+                                    &layout_state,
+                                    &config_path,
+                                    &peers,
+                                );
                                 let fixed = current_layout.devices.iter().find(|device| {
                                     device.source == "manual"
                                         && device_matches_peer(
@@ -1181,8 +1406,11 @@ impl AppRuntime {
 
     fn start_input(&self, layout: LayoutState) -> (NativeStageStatus, NativeStageStatus) {
         sync_layout_peer_presence(&self.layout, &self.peers);
+        // 'both' is the peer mode: capture (control) stays installed AND the
+        // receive gate opens, so the machine both controls and is controlled.
         self.input_receive_enabled.store(
-            layout.input_mode == "receive" && input::NATIVE_INPUT_SUPPORTED,
+            (layout.input_mode == "receive" || layout.input_mode == "both")
+                && input::NATIVE_INPUT_SUPPORTED,
             Ordering::Relaxed,
         );
         let native_layout = self.native_layout();
@@ -1247,6 +1475,10 @@ impl AppRuntime {
             self.stop_clipboard();
             return clipboard_disabled_status();
         }
+
+        // Event-driven wake source (Windows: WM_CLIPBOARDUPDATE listener);
+        // spawned once per process, idempotent.
+        spawn_clipboard_format_listener();
 
         let Ok(mut clipboard_stop) = self.clipboard_stop.lock() else {
             return NativeStageStatus {
@@ -1439,6 +1671,7 @@ fn save_layout(
     }
     sync_runtime_toggle_shortcut(&state.app_handle)?;
     sync_screen_switch_shortcuts(&state.app_handle)?;
+    sync_clipboard_history_shortcut(&state.app_handle)?;
     Ok(state.snapshot())
 }
 
@@ -1453,8 +1686,8 @@ fn merge_runtime_owned_layout_fields(
     incoming.cluster_id = current.cluster_id.clone();
     incoming.pair_secret = current.pair_secret.clone();
 
-    if current.machine_role == "client"
-        && incoming.machine_role == "client"
+    if role_receives_from_peers(&current.machine_role)
+        && role_receives_from_peers(&incoming.machine_role)
         && !current.paired_controllers.is_empty()
     {
         incoming.paired_controllers = current.paired_controllers.clone();
@@ -1488,8 +1721,8 @@ fn merge_remote_upgrading_fields(incoming: &mut LayoutState, current: &LayoutSta
 }
 
 fn merge_disk_layout_into_runtime(mut disk: LayoutState, current: &LayoutState) -> LayoutState {
-    if current.machine_role == "client"
-        && disk.machine_role == "client"
+    if role_receives_from_peers(&current.machine_role)
+        && role_receives_from_peers(&disk.machine_role)
         && disk.paired_controllers.is_empty()
         && !current.paired_controllers.is_empty()
     {
@@ -1526,6 +1759,11 @@ fn runtime_relevant_layout_changed(previous: &LayoutState, next: &LayoutState) -
     // or repositioning a device takes effect without tearing down the transport.
     // Restarting on every device edit is what forced users to stop/start the
     // server (and churned QUIC keys) before a freshly added client would work.
+    // corner_guard / corner_guard_size are intentionally NOT here: the capture
+    // paths read them live from the shared layout, so changing the guard must
+    // NOT restart the input runtime. A restart while the machine is being
+    // remotely controlled closes the receive gate for a moment — dropping the
+    // injected mouse-up makes native spinners auto-repeat and freezes input.
     previous.input_mode != next.input_mode
         || previous.machine_role != next.machine_role
         || previous.clipboard_sync != next.clipboard_sync
@@ -1888,11 +2126,47 @@ fn sync_runtime_toggle_shortcut(app: &AppHandle) -> Result<(), String> {
 }
 
 fn runtime_toggle_shortcut_for_layout(layout: &LayoutState) -> Result<Option<String>, String> {
-    if layout.machine_role != "server" {
+    // Peer machines capture too, so they get the quick start/stop hotkey.
+    if layout.machine_role != "server" && layout.machine_role != "peer" {
         return Ok(None);
     }
 
     canonical_runtime_toggle_shortcut(&layout.edge_switch_hotkey)
+}
+
+/// Register/unregister the clipboard-history popup hotkey so it follows the
+/// saved layout (an empty value unregisters it entirely).
+fn sync_clipboard_history_shortcut(app: &AppHandle) -> Result<(), String> {
+    let Some(state) = app.try_state::<AppRuntime>() else {
+        return Ok(());
+    };
+    let shortcut = state.layout_snapshot().clipboard_history_shortcut;
+    let normalized = normalize_clipboard_history_shortcut(&shortcut);
+    let mut current = state
+        .clipboard_history_shortcut
+        .lock()
+        .map_err(|_| "clipboard history shortcut lock poisoned".to_string())?;
+
+    if current.as_deref() == Some(normalized.as_str()) {
+        return Ok(());
+    }
+
+    if let Some(previous) = current.take() {
+        if let Err(error) = app.global_shortcut().unregister(previous.as_str()) {
+            log::warn!("failed to unregister clipboard-history shortcut {previous}: {error}");
+        }
+    }
+
+    if !normalized.is_empty() {
+        app.global_shortcut()
+            .register(normalized.as_str())
+            .map_err(|error| {
+                format!("failed to register clipboard-history shortcut {normalized}: {error}")
+            })?;
+        *current = Some(normalized);
+    }
+
+    Ok(())
 }
 
 /// Register/unregister the four direction hotkeys so they stay in sync with the
@@ -1938,7 +2212,7 @@ fn sync_screen_switch_shortcuts(app: &AppHandle) -> Result<(), String> {
 }
 
 fn screen_switch_shortcuts_for_layout(layout: &LayoutState) -> ScreenSwitchHotkeys {
-    if layout.machine_role != "server" {
+    if layout.machine_role != "server" && layout.machine_role != "peer" {
         return empty_screen_switch_hotkeys();
     }
 
@@ -1974,10 +2248,27 @@ fn route_global_shortcut(
     app: &AppHandle,
     shortcut: &tauri_plugin_global_shortcut::Shortcut,
 ) -> Result<(), String> {
+    // Clipboard-history popup: available in every role (it only touches the
+    // local clipboard; syncing stays gated by the control session). The
+    // accelerator itself is user-configurable (clipboard_history_shortcut).
+    let history_shortcut = app
+        .try_state::<AppRuntime>()
+        .map(|state| state.layout_snapshot().clipboard_history_shortcut)
+        .unwrap_or_default();
+    if let Ok(configured) = normalize_clipboard_history_shortcut(&history_shortcut)
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+    {
+        if shortcut == &configured {
+            let _ = app.emit("clipboard-history-toggle", ());
+            return Ok(());
+        }
+    }
+
     let Some(state) = app.try_state::<AppRuntime>() else {
         return Ok(());
     };
-    if state.layout_snapshot().machine_role != "server" {
+    let machine_role = state.layout_snapshot().machine_role;
+    if machine_role != "server" && machine_role != "peer" {
         return Ok(());
     }
 
@@ -2303,6 +2594,64 @@ fn send_files_to_device(
     send_files_to_device_inner(state.inner(), &device_id, &paths, DropMode::TransfersFolder)
 }
 
+/// Build a Wake-on-LAN magic packet: 6×0xFF followed by the target MAC
+/// repeated 16 times. `mac` is colonless (or colon-separated) hex.
+fn build_magic_packet(mac: &str) -> Result<Vec<u8>, String> {
+    let hex: String = mac.chars().filter(|ch| *ch != ':').collect();
+    if hex.len() != 12 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("无效的网卡 MAC 地址: {mac}"));
+    }
+    let mut bytes = Vec::with_capacity(6 + 16 * 6);
+    bytes.extend_from_slice(&[0xFF; 6]);
+    for _ in 0..16 {
+        for pair in hex.as_bytes().chunks(2) {
+            let value = u8::from_str_radix(std::str::from_utf8(pair).expect("2 hex chars"), 16)
+                .expect("validated hex");
+            bytes.push(value);
+        }
+    }
+    Ok(bytes)
+}
+
+/// Send a Wake-on-LAN magic packet for a saved device's MAC. Best effort: a
+/// sleeping machine's NIC listens for these broadcasts on UDP port 9.
+#[tauri::command]
+fn wake_device(device_id: String, state: tauri::State<'_, AppRuntime>) -> Result<(), String> {
+    let layout = state.layout_snapshot();
+    let device = layout
+        .devices
+        .iter()
+        .find(|device| device.id == device_id)
+        .ok_or_else(|| format!("未找到设备 {device_id}"))?;
+    if device.mac.trim().is_empty() {
+        return Err(format!(
+            "设备 {} 未上报网卡 MAC（两端都需要本版本以上），无法唤醒。",
+            device.name
+        ));
+    }
+
+    let packet = build_magic_packet(&device.mac)?;
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0")
+        .map_err(|error| format!("Wake-on-LAN 套接字创建失败: {error}"))?;
+    socket.set_broadcast(true).ok();
+    // NICs listen on 7 or 9 (and port 0 in some stacks); blast all three.
+    let mut sent = false;
+    for port in [9, 7, 0] {
+        if socket
+            .send_to(&packet, format!("255.255.255.255:{port}"))
+            .is_ok()
+        {
+            sent = true;
+        }
+    }
+    if sent {
+        log::info!("Wake-on-LAN packet sent for device {} mac={}", device.name, device.mac);
+        Ok(())
+    } else {
+        Err("Wake-on-LAN 广播发送失败。".into())
+    }
+}
+
 fn send_files_to_device_inner(
     state: &AppRuntime,
     device_id: &str,
@@ -2331,6 +2680,25 @@ fn send_files_to_device_inner(
     let mut file_count = 0_usize;
     let mut byte_count = 0_u64;
 
+    // Queue-level resume (user-initiated sends only): remember which inputs
+    // completed so an interrupted session can resume the remainder after a
+    // restart. Directories stay queued until every file within them is sent;
+    // the .part per-file resume makes re-sends of those cheap.
+    let track_queue = drop_mode == DropMode::TransfersFolder;
+    if track_queue {
+        start_pending_queue(PendingTransferQueue {
+            device_id: device_id.to_string(),
+            device_name: target.name.clone(),
+            paths: paths.to_vec(),
+            completed: Vec::new(),
+        });
+    }
+
+    // One cancel flag covers the whole send session; every file's transfer id
+    // maps to it so the frontend can cancel by the id shown in the toast.
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let mut session_transfer_ids = Vec::with_capacity(total_files);
+
     for (index, file) in files.iter().enumerate() {
         let reporter = FileTransferProgressReporter {
             app: &state.app_handle,
@@ -2338,20 +2706,71 @@ fn send_files_to_device_inner(
             file_index: index + 1,
             file_count: total_files,
         };
-        let packet_count = send_transfer_file(
+        let transfer_id = new_transfer_id("file");
+        session_transfer_ids.push(transfer_id.clone());
+        if let Ok(mut cancels) = state.transfer_cancels.lock() {
+            cancels.insert(transfer_id.clone(), Arc::clone(&cancel_flag));
+        }
+        let paths_for_history = vec![file.path.display().to_string()];
+        let send_result = send_transfer_file(
             &quic_transport,
             &local_peer.id,
             &target,
             file,
-            &new_transfer_id("file"),
+            &transfer_id,
             drop_mode,
             Some(&reporter),
-        )?;
+            Some(&cancel_flag),
+        );
+        if let Ok(mut cancels) = state.transfer_cancels.lock() {
+            cancels.remove(&transfer_id);
+        }
+        let packet_count = match send_result {
+            Ok(packet_count) => {
+                record_transfer_history(TransferHistoryEntry {
+                    id: 0,
+                    direction: "send".into(),
+                    device_id: device_id.to_string(),
+                    device_name: target.name.clone(),
+                    file_name: file.name.clone(),
+                    file_count: total_files,
+                    total_bytes: file.total_bytes,
+                    ok: true,
+                    error: None,
+                    at_ms: 0,
+                    paths: paths_for_history,
+                });
+                packet_count
+            }
+            Err(error) => {
+                record_transfer_history(TransferHistoryEntry {
+                    id: 0,
+                    direction: "send".into(),
+                    device_id: device_id.to_string(),
+                    device_name: target.name.clone(),
+                    file_name: file.name.clone(),
+                    file_count: total_files,
+                    total_bytes: file.total_bytes,
+                    ok: false,
+                    error: Some(error.clone()),
+                    at_ms: 0,
+                    paths: paths_for_history,
+                });
+                return Err(error);
+            }
+        };
         state
             .transport_packets
             .fetch_add(packet_count, Ordering::Relaxed);
         file_count += 1;
         byte_count = byte_count.saturating_add(file.total_bytes);
+        if track_queue {
+            mark_pending_queue_file_done(&file.path.display().to_string());
+        }
+    }
+
+    if track_queue {
+        clear_pending_queue();
     }
 
     Ok(FileTransferSummary {
@@ -2359,6 +2778,315 @@ fn send_files_to_device_inner(
         file_count,
         byte_count,
     })
+}
+
+/// Frontend cancel for an in-flight outgoing transfer: flips the session's
+/// cancel flag; the send loop aborts on its next chunk boundary.
+#[tauri::command]
+fn cancel_file_transfer(
+    transfer_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<(), String> {
+    let flag = state
+        .transfer_cancels
+        .lock()
+        .ok()
+        .and_then(|cancels| cancels.get(&transfer_id).cloned());
+    match flag {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        None => Err("该传输已结束或不存在。".into()),
+    }
+}
+
+// --- transfer history --------------------------------------------------------
+// The last N finished transfers (sent or received), for the Transfers panel.
+// Small metadata only (no file bytes), persisted as JSON in the config dir.
+const TRANSFER_HISTORY_CAP: usize = 50;
+const TRANSFER_HISTORY_FILE: &str = "transfer-history.json";
+static TRANSFER_HISTORY: Mutex<Vec<TransferHistoryEntry>> = Mutex::new(Vec::new());
+static TRANSFER_HISTORY_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn set_transfer_history_dir(dir: PathBuf) {
+    let _ = TRANSFER_HISTORY_DIR.set(dir);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferHistoryEntry {
+    id: u64,
+    /// "send" | "receive".
+    direction: String,
+    device_id: String,
+    device_name: String,
+    file_name: String,
+    file_count: usize,
+    total_bytes: u64,
+    ok: bool,
+    error: Option<String>,
+    at_ms: u64,
+    /// Source paths (send entries only) so the panel can offer a resend.
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+static TRANSFER_HISTORY_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Record a finished transfer (newest first) and persist the list. Failures
+/// are data-loss-free: a failed persist only costs the entry across restarts.
+fn record_transfer_history(mut entry: TransferHistoryEntry) {
+    entry.id = TRANSFER_HISTORY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    entry.at_ms = now_ms();
+    if let Ok(mut history) = TRANSFER_HISTORY.lock() {
+        history.insert(0, entry);
+        history.truncate(TRANSFER_HISTORY_CAP);
+        if let Some(dir) = TRANSFER_HISTORY_DIR.get() {
+            let snapshot = history.clone();
+            let json = serde_json::to_string_pretty(&snapshot)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    let tmp = dir.join("transfer-history.json.tmp");
+                    let path = dir.join(TRANSFER_HISTORY_FILE);
+                    fs::write(&tmp, text)
+                        .and_then(|()| fs::rename(&tmp, &path))
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = json {
+                log::warn!("transfer history persist failed: {error}");
+            }
+        }
+    }
+}
+
+fn load_transfer_history_from(dir: &Path) {
+    let Ok(text) = fs::read_to_string(dir.join(TRANSFER_HISTORY_FILE)) else {
+        return;
+    };
+    let Ok(loaded) = serde_json::from_str::<Vec<TransferHistoryEntry>>(&text) else {
+        log::warn!("transfer history file unreadable; starting empty");
+        return;
+    };
+    let next_id = loaded
+        .iter()
+        .map(|entry| entry.id + 1)
+        .max()
+        .unwrap_or(1);
+    TRANSFER_HISTORY_NEXT_ID.store(next_id, Ordering::Relaxed);
+    if let Ok(mut history) = TRANSFER_HISTORY.lock() {
+        *history = loaded;
+    }
+}
+
+#[tauri::command]
+fn list_transfer_history() -> Vec<TransferHistoryEntry> {
+    TRANSFER_HISTORY
+        .lock()
+        .map(|history| history.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn clear_transfer_history() {
+    if let Ok(mut history) = TRANSFER_HISTORY.lock() {
+        history.clear();
+    }
+    if let Some(dir) = TRANSFER_HISTORY_DIR.get() {
+        let _ = fs::remove_file(dir.join(TRANSFER_HISTORY_FILE));
+    }
+}
+
+/// One-click resend of a failed send entry (same target, same source paths).
+#[tauri::command]
+fn resend_transfer_history_entry(
+    id: u64,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<FileTransferSummary, String> {
+    let entry = TRANSFER_HISTORY
+        .lock()
+        .map_err(|_| "transfer history lock poisoned".to_string())?
+        .iter()
+        .find(|entry| entry.id == id)
+        .cloned()
+        .ok_or_else(|| "该记录已不存在。".to_string())?;
+    if entry.direction != "send" || entry.paths.is_empty() {
+        return Err("只有本机发出的传输可以重发。".into());
+    }
+    let paths = entry.paths;
+    send_files_to_device_inner(
+        state.inner(),
+        &entry.device_id,
+        &paths,
+        DropMode::TransfersFolder,
+    )
+}
+
+// --- pending transfer queue --------------------------------------------------
+// What a user-initiated send session has (and has not) finished, persisted
+// under the config dir. On startup a leftover queue means the last session was
+// interrupted; the frontend offers to resume the remaining inputs once.
+const PENDING_QUEUE_FILE: &str = "pending-queue.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingTransferQueue {
+    device_id: String,
+    device_name: String,
+    /// The original user-picked inputs (files or directories).
+    paths: Vec<String>,
+    /// Fully-sent expanded file paths (exact-match against `paths`).
+    completed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingQueueSummary {
+    device_name: String,
+    remaining: usize,
+    total: usize,
+}
+
+static PENDING_QUEUE: Mutex<Option<PendingTransferQueue>> = Mutex::new(None);
+
+fn pending_queue_path() -> Option<PathBuf> {
+    TRANSFER_HISTORY_DIR
+        .get()
+        .map(|dir| dir.join(PENDING_QUEUE_FILE))
+}
+
+fn write_pending_queue_snapshot(queue: &PendingTransferQueue) {
+    let Some(path) = pending_queue_path() else {
+        return;
+    };
+    let json = serde_json::to_string_pretty(queue)
+        .map_err(|error| error.to_string())
+        .and_then(|text| {
+            let tmp = path.with_extension("json.tmp");
+            fs::write(&tmp, text)
+                .and_then(|()| fs::rename(&tmp, &path))
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = json {
+        log::warn!("pending queue persist failed: {error}");
+    }
+}
+
+fn start_pending_queue(queue: PendingTransferQueue) {
+    if let Ok(mut slot) = PENDING_QUEUE.lock() {
+        *slot = Some(queue.clone());
+    }
+    write_pending_queue_snapshot(&queue);
+}
+
+fn mark_pending_queue_file_done(path: &str) {
+    let Ok(mut slot) = PENDING_QUEUE.lock() else {
+        return;
+    };
+    let Some(queue) = slot.as_mut() else {
+        return;
+    };
+    queue.completed.push(path.to_string());
+    write_pending_queue_snapshot(queue);
+}
+
+fn clear_pending_queue() {
+    if let Ok(mut slot) = PENDING_QUEUE.lock() {
+        *slot = None;
+    }
+    if let Some(path) = pending_queue_path() {
+        let _ = fs::remove_file(&path);
+    }
+}
+
+fn load_pending_queue_from(dir: &Path) {
+    let Ok(text) = fs::read_to_string(dir.join(PENDING_QUEUE_FILE)) else {
+        return;
+    };
+    let Ok(queue) = serde_json::from_str::<PendingTransferQueue>(&text) else {
+        log::warn!("pending queue file unreadable; ignoring");
+        return;
+    };
+    let remaining = queue
+        .paths
+        .iter()
+        .filter(|path| !queue.completed.contains(path))
+        .count();
+    if remaining == 0 {
+        return;
+    }
+    log::info!(
+        "interrupted transfer queue found: {} of {} input(s) remain for {}",
+        remaining,
+        queue.paths.len(),
+        queue.device_name
+    );
+    if let Ok(mut slot) = PENDING_QUEUE.lock() {
+        *slot = Some(queue);
+    }
+}
+
+fn pending_queue_summary() -> Option<PendingQueueSummary> {
+    let queue = PENDING_QUEUE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())?;
+    let remaining = queue
+        .paths
+        .iter()
+        .filter(|path| !queue.completed.contains(path))
+        .count();
+    (remaining > 0).then(|| PendingQueueSummary {
+        device_name: queue.device_name,
+        remaining,
+        total: queue.paths.len(),
+    })
+}
+
+/// The frontend polls this once at startup (and listens for the
+/// "transfer-queue-resume" event) to offer continuing an interrupted send.
+#[tauri::command]
+fn read_pending_transfer_queue() -> Option<PendingQueueSummary> {
+    pending_queue_summary()
+}
+
+/// Ignore the interrupted queue: forget it for good (the prompt reappears
+/// never — the user chose to drop those files).
+#[tauri::command]
+fn dismiss_pending_transfer_queue() {
+    clear_pending_queue();
+}
+
+/// Resume the interrupted queue: send every input that did not fully
+/// complete. The resume runs through the normal send path, so it re-creates
+/// its own (smaller) queue and the per-file .part resume picks up partial
+/// files where they stopped.
+#[tauri::command]
+fn resume_pending_transfer_queue(
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<FileTransferSummary, String> {
+    let queue = PENDING_QUEUE
+        .lock()
+        .map_err(|_| "pending queue lock poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| "没有待恢复的传输。".to_string())?;
+    let completed = queue.completed.clone();
+    let remaining: Vec<String> = queue
+        .paths
+        .iter()
+        .filter(|path| !completed.contains(path))
+        .cloned()
+        .collect();
+    if remaining.is_empty() {
+        clear_pending_queue();
+        return Err("没有待恢复的传输。".into());
+    }
+    send_files_to_device_inner(
+        state.inner(),
+        &queue.device_id,
+        &remaining,
+        DropMode::TransfersFolder,
+    )
 }
 
 /// Ask an online peer (a client, or the paired controller) for its recent log.
@@ -2526,6 +3254,7 @@ async fn scan_lan_peers(state: tauri::State<'_, AppRuntime>) -> Result<Discovery
         merge_peer(&state.peers, peer);
     }
     prune_stale_peers(&state.peers);
+    auto_pair_discovered_peers(&state.layout, &state.config_path, &state.peers);
     sync_layout_peer_presence(&state.layout, &state.peers);
 
     Ok(state.discovery_status())
@@ -2545,6 +3274,7 @@ fn probe_lan_peer(host: String, state: tauri::State<'_, AppRuntime>) -> Result<L
     }
     let peer = probe_for_peer(&local_peer, &host, discovery_base_port(&layout))?;
     merge_peer(&state.peers, peer.clone());
+    auto_pair_discovered_peers(&state.layout, &state.config_path, &state.peers);
     sync_layout_peer_presence(&state.layout, &state.peers);
     Ok(peer)
 }
@@ -2560,14 +3290,30 @@ fn request_lan_pairing(
         .lock()
         .map_err(|_| "layout state lock poisoned".to_string())?
         .clone();
-    if layout.machine_role != "server" {
-        return Err("只有服务端可以发起配对。".into());
+    if layout.machine_role != "server" && layout.machine_role != "peer" {
+        return Err("只有服务端或对等模式可以发起配对。".into());
     }
 
     let mut local_peer = local_peer_from_layout(&layout);
     if let Some(transport) = state.quic_transport_handle() {
         apply_transport_to_peer(&mut local_peer, &transport);
     }
+
+    // Open pairing short-circuit: if the peer is already reachable AND has us
+    // paired (pairing_required=false), there is nothing to negotiate — the
+    // code challenge flow would only produce a confusing "no pairing
+    // challenge received" error (the auto-paired peer replies without a code).
+    if layout.auto_pairing {
+        let peer = probe_for_peer(&local_peer, &host, discovery_base_port(&layout))?;
+        if !peer.pairing_required && is_paired_controller(&layout, &peer) {
+            log::info!("auto-pairing: peer {host} is already paired; skipping the challenge flow");
+            merge_peer(&state.peers, peer.clone());
+            auto_pair_discovered_peers(&state.layout, &state.config_path, &state.peers);
+            sync_layout_peer_presence(&state.layout, &state.peers);
+            return Ok(peer);
+        }
+    }
+
     let peer = match request_pairing_for_peer(&local_peer, &host, discovery_base_port(&layout)) {
         Ok(peer) => peer,
         Err(error) => {
@@ -2591,8 +3337,8 @@ fn confirm_lan_pairing(
         .lock()
         .map_err(|_| "layout state lock poisoned".to_string())?
         .clone();
-    if layout.machine_role != "server" {
-        return Err("只有服务端可以确认配对。".into());
+    if layout.machine_role != "server" && layout.machine_role != "peer" {
+        return Err("只有服务端或对等模式可以确认配对。".into());
     }
 
     let mut local_peer = local_peer_from_layout(&layout);
@@ -2614,6 +3360,25 @@ fn confirm_lan_pairing(
             return Err(error);
         }
     };
+
+    // The initiator records the responder too. Pairing used to be
+    // server-authoritative: the server authorized everything with its own
+    // cluster/secret and never stored the client. In peer mode the initiator
+    // also RECEIVES input, so it needs the same strict authorization the
+    // client has — which is anchored on paired_controllers.
+    let snapshot = {
+        let mut current = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        append_paired_controller(&mut current, &peer);
+        upsert_paired_peer_device(&mut current, &peer);
+        current.clone()
+    };
+    if let Err(error) = write_layout_to_disk(&state.config_path, &snapshot) {
+        log::warn!("pairing failed to persist layout: {error}");
+    }
+
     merge_peer(&state.peers, peer.clone());
     sync_layout_peer_presence(&state.layout, &state.peers);
     Ok(peer)
@@ -2817,6 +3582,15 @@ pub fn acquire_single_instance() -> bool {
     let already_exists =
         unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
     if already_exists {
+        // The fail path is silent at the UI level (main.rs just exits), which
+        // reads as "double-clicking the new exe did nothing" — most often an
+        // OLD install still running in the tray while a NEW portable exe was
+        // launched. Say so in the log; the old instance's window is raised.
+        log::warn!(
+            "another MyKVM instance is already running (single-instance mutex \
+             held); this new binary did NOT start — exit the old one from its \
+             tray icon first"
+        );
         unsafe {
             CloseHandle(mutex);
         }
@@ -3294,6 +4068,45 @@ pub fn run() {
                 log::info!("file logging enabled at {}", log_dir.display());
             }
 
+            // Identity wiring for the discovery signing key (next to the QUIC
+            // transport identity) and the file-clipboard landing dir. NOTE:
+            // this is the ONLY .setup() on this builder — a second .setup()
+            // call silently replaces this one in Tauri 2, which is exactly how
+            // these wirings were lost the first time. Wired AFTER the log
+            // plugin registers so the lines above are visible in the log.
+            if let Some(config_path) = app.path().app_config_dir().ok() {
+                if let Some(parent) = config_path.parent() {
+                    discovery_signing::set_identity_dir(parent.to_path_buf());
+                    log::info!("discovery signing identity dir: {}", parent.display());
+                    // Clipboard history persists next to the identity dir.
+                    set_clipboard_history_dir(parent.to_path_buf());
+                    let history_dir = parent.to_path_buf();
+                    std::thread::spawn(move || load_clipboard_history_from(&history_dir));
+                    // Transfer history shares the dir; load is tiny and sync.
+                    set_transfer_history_dir(parent.to_path_buf());
+                    load_transfer_history_from(&parent);
+                    // An interrupted send queue from a previous run? Offer a
+                    // resume through the frontend.
+                    load_pending_queue_from(&parent);
+                    if let Some(summary) = pending_queue_summary() {
+                        let _ = app.emit("transfer-queue-resume", &summary);
+                    }
+                }
+            }
+            let files_root = app
+                .path()
+                .download_dir()
+                .or_else(|_| app.path().app_data_dir())
+                .map(|base| base.join("MyKVM Transfers").join("Clipboard"))
+                .ok();
+            match files_root {
+                Some(dir) => {
+                    log::info!("file-clipboard landing dir: {}", dir.display());
+                    clipboard::set_files_dir(dir);
+                }
+                None => log::error!("file-clipboard landing dir could not be resolved"),
+            }
+
             let config_dir = app
                 .path()
                 .app_config_dir()
@@ -3359,6 +4172,11 @@ pub fn run() {
             }
             if let Err(error) = sync_screen_switch_shortcuts(app.handle()) {
                 log::warn!("failed to register screen switch shortcuts: {error}");
+            }
+            // Clipboard-history popup hotkey: user-configurable, registered
+            // from the saved layout (and re-synced on every layout save).
+            if let Err(error) = sync_clipboard_history_shortcut(app.handle()) {
+                log::warn!("failed to register clipboard-history shortcut: {error}");
             }
             #[cfg(target_os = "windows")]
             apply_custom_chrome(app.handle())?;
@@ -3536,6 +4354,17 @@ pub fn run() {
             send_secure_attention,
             send_files_to_device,
             fetch_client_log,
+            wake_device,
+            cancel_file_transfer,
+            read_clipboard_history,
+            restore_clipboard_history,
+            clear_clipboard_history,
+            list_transfer_history,
+            clear_transfer_history,
+            resend_transfer_history_entry,
+            read_pending_transfer_queue,
+            dismiss_pending_transfer_queue,
+            resume_pending_transfer_queue,
             sync_window_chrome,
             minimize_main_window,
             hide_main_window,
@@ -3779,7 +4608,11 @@ fn load_layout_from_disk(path: &PathBuf) -> Option<LayoutState> {
 }
 
 fn write_layout_to_disk(path: &PathBuf, layout: &LayoutState) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(layout)
+    // Fold the in-memory LRU clock into the snapshot's controller entries so
+    // persisted whitelist ages survive restarts (cheap: at most 8 entries).
+    let mut snapshot = layout.clone();
+    fold_paired_controller_usage(&mut snapshot.paired_controllers);
+    let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|error| format!("failed to serialize layout: {error}"))?;
 
     fs::write(path, json)
@@ -4957,6 +5790,12 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
         file_transfer_enabled: default_file_transfer_enabled(),
+        corner_guard: default_corner_guard(),
+        corner_guard_size: default_corner_guard_size(),
+        auto_pairing: default_auto_pairing(),
+        lock_on_leave: default_lock_on_leave(),
+        fullscreen_guard: default_fullscreen_guard(),
+        clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -4972,6 +5811,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
             name: local_device_name(),
             platform: current_platform().into(),
             host: local_host_label(),
+            mac: local_mac_address(),
             transport_port,
             quic_port,
             transport_public_key: String::new(),
@@ -5000,6 +5840,12 @@ fn detect_fallback_layout() -> LayoutState {
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
         file_transfer_enabled: default_file_transfer_enabled(),
+        corner_guard: default_corner_guard(),
+        corner_guard_size: default_corner_guard_size(),
+        auto_pairing: default_auto_pairing(),
+        lock_on_leave: default_lock_on_leave(),
+        fullscreen_guard: default_fullscreen_guard(),
+        clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -5309,6 +6155,16 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         paired_controllers: normalize_paired_controllers(saved_layout.paired_controllers),
         clipboard_sync: saved_layout.clipboard_sync,
         file_transfer_enabled: saved_layout.file_transfer_enabled,
+        auto_pairing: saved_layout.auto_pairing,
+        lock_on_leave: saved_layout.lock_on_leave,
+        fullscreen_guard: saved_layout.fullscreen_guard,
+        clipboard_history_shortcut: normalize_clipboard_history_shortcut(
+            &saved_layout.clipboard_history_shortcut,
+        ),
+        corner_guard: saved_layout.corner_guard,
+        corner_guard_size: saved_layout
+            .corner_guard_size
+            .min(crate::input::CORNER_GUARD_MAX_PX),
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
@@ -5437,6 +6293,103 @@ fn local_ip_list() -> Option<String> {
             .filter(|ip| Some(ip) != primary.as_ref()),
     );
     (!ips.is_empty()).then(|| ips.join(", "))
+}
+
+/// This machine's primary NIC MAC, colonless lowercase hex (Wake-on-LAN target).
+/// Probed once; multicast or all-zero addresses are skipped.
+fn local_mac_address() -> String {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // Windows: prefer the adapter that owns the discovery IP — the
+            // first adapter is often virtual (Hyper-V/VPN) and its MAC can
+            // never wake the real machine.
+            #[cfg(target_os = "windows")]
+            if let Some(mac) = windows_discovery_adapter_mac() {
+                return Some(mac);
+            }
+            let mac = mac_address::get_mac_address().ok().flatten()?;
+            let bytes = mac.bytes();
+            if bytes == [0; 6] || bytes[0] & 0x01 != 0 {
+                return None;
+            }
+            Some(mac.to_string().replace(':', "").to_lowercase())
+        })
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Windows: the hardware MAC of the adapter that owns the discovery IPv4
+/// address, via GetAdaptersAddresses. None when no adapter matches.
+#[cfg(target_os = "windows")]
+fn windows_discovery_adapter_mac() -> Option<String> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+
+    const AF_INET: u32 = 2;
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    const PHYSICAL_MIN_LEN: usize = 6;
+    let discovery_ip = local_ip_address()?;
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 16 * 1024_u32;
+    let buffer = loop {
+        let mut buffer = vec![0_u8; size as usize];
+        let status = unsafe {
+            GetAdaptersAddresses(
+                AF_INET,
+                flags,
+                std::ptr::null(),
+                buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut size,
+            )
+        };
+        if status == ERROR_BUFFER_OVERFLOW {
+            continue; // `size` now holds the required length.
+        }
+        if status != 0 {
+            log::debug!("GetAdaptersAddresses failed: {status}");
+            return None;
+        }
+        break buffer;
+    };
+
+    let mut adapter_cursor = buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !adapter_cursor.is_null() {
+        let adapter = unsafe { &*adapter_cursor };
+        let mac_len = adapter.PhysicalAddressLength as usize;
+        if mac_len >= PHYSICAL_MIN_LEN {
+            let mut unicast_cursor = adapter.FirstUnicastAddress;
+            while !unicast_cursor.is_null() {
+                let unicast = unsafe { &*unicast_cursor };
+                let sockaddr = unicast.Address.lpSockaddr;
+                if !sockaddr.is_null() && unsafe { (*sockaddr).sa_family } == AF_INET as u16 {
+                    // SOCKADDR_IN: family(2) + port(2) + IPv4(4).
+                    let octets =
+                        unsafe { std::slice::from_raw_parts((sockaddr as *const u8).add(4), 4) };
+                    let ip = format!(
+                        "{}.{}.{}.{}",
+                        octets[0], octets[1], octets[2], octets[3]
+                    );
+                    if ip == discovery_ip {
+                        let bytes = &adapter.PhysicalAddress[..PHYSICAL_MIN_LEN];
+                        if bytes == [0; 6] || bytes[0] & 0x01 != 0 {
+                            return None; // zeroed or multicast — not wakeable.
+                        }
+                        return Some(
+                            bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+                        );
+                    }
+                }
+                unicast_cursor = unicast.Next;
+            }
+        }
+        adapter_cursor = adapter.Next;
+    }
+
+    None
 }
 
 fn local_ip_address() -> Option<String> {
@@ -5586,6 +6539,39 @@ fn default_clipboard_sync() -> bool {
     false
 }
 
+fn default_corner_guard() -> bool {
+    true
+}
+
+fn default_corner_guard_size() -> u32 {
+    32
+}
+
+fn default_auto_pairing() -> bool {
+    true
+}
+
+fn default_lock_on_leave() -> bool {
+    false
+}
+
+fn default_fullscreen_guard() -> bool {
+    true
+}
+
+/// Accept the frontend's recorded accelerator (e.g. "Ctrl+Alt+H"); an empty or
+/// unparseable value disables the popup hotkey.
+fn normalize_clipboard_history_shortcut(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    match raw.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+        Ok(_) => raw.to_ascii_lowercase(),
+        Err(_) => default_clipboard_history_shortcut(),
+    }
+}
+
 fn default_file_transfer_enabled() -> bool {
     true
 }
@@ -5673,16 +6659,18 @@ fn preferred_quic_port(discovery_port: u16) -> u16 {
 }
 
 fn normalize_input_mode(mode: &str) -> String {
-    if mode == "receive" {
-        "receive".into()
-    } else {
-        "control".into()
+    match mode {
+        "receive" => "receive".into(),
+        // Peer mode: capture local input AND accept remote input at the same
+        // time. Unknown values stay on the conservative control-only default.
+        "both" => "both".into(),
+        _ => "control".into(),
     }
 }
 
 fn normalize_machine_role(role: &str) -> String {
     match role {
-        "server" | "client" => role.into(),
+        "server" | "client" | "peer" => role.into(),
         _ => "unset".into(),
     }
 }
@@ -5705,15 +6693,79 @@ fn normalize_pair_secret(pair_secret: &str) -> String {
     }
 }
 
+// Hard cap on the paired-controller whitelist: with open pairing, discovery
+// could otherwise grow the list unboundedly. Beyond the cap the least
+// recently used pairs are dropped first (pairedAtMs only breaks ties).
+const MAX_PAIRED_CONTROLLERS: usize = 8;
+
+/// In-memory "last authorized traffic" clock per controller identity
+/// (transport public key, falling back to the device id). Input packets hit
+/// the authorization path at up to ~125 Hz, so usage is recorded here instead
+/// of mutating the layout on every packet; the value is folded into
+/// `PairedController.last_used_ms` when the whitelist is normalized (cap hit)
+/// or when the layout is persisted.
+static PAIRED_CONTROLLER_LAST_USED: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn paired_controller_usage_map() -> &'static Mutex<HashMap<String, u64>> {
+    PAIRED_CONTROLLER_LAST_USED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn paired_controller_usage_key(transport_public_key: &str, device_id: &str) -> String {
+    let public_key = transport_public_key.trim();
+    if !public_key.is_empty() {
+        format!("pk:{public_key}")
+    } else {
+        format!("id:{}", device_id.trim())
+    }
+}
+
+/// Record a successful authorization for a paired controller. Cheap by
+/// design: one lock + map insert, no disk I/O.
+pub(crate) fn touch_paired_controller_usage(transport_public_key: &str, device_id: &str) {
+    let key = paired_controller_usage_key(transport_public_key, device_id);
+    if key == "pk:" || key == "id:" {
+        return;
+    }
+    if let Ok(mut usage) = paired_controller_usage_map().lock() {
+        usage.insert(key, now_ms());
+    }
+}
+
+fn paired_controller_last_used(controller: &PairedController) -> u64 {
+    let key = paired_controller_usage_key(&controller.transport_public_key, &controller.id);
+    if let Ok(usage) = paired_controller_usage_map().lock() {
+        if let Some(last_used) = usage.get(&key) {
+            return controller.last_used_ms.max(*last_used);
+        }
+    }
+    controller.last_used_ms
+}
+
+/// Flush recorded usage into the entries themselves so a layout snapshot
+/// saved right after this call carries fresh LRU clocks to disk.
+fn fold_paired_controller_usage(controllers: &mut [PairedController]) {
+    for controller in controllers.iter_mut() {
+        controller.last_used_ms = paired_controller_last_used(controller);
+    }
+}
+
 fn normalize_paired_controllers(controllers: Vec<PairedController>) -> Vec<PairedController> {
-    controllers
+    let mut controllers: Vec<PairedController> = controllers
         .into_iter()
         .filter(|controller| {
             !controller.id.trim().is_empty()
                 && !controller.transport_public_key.trim().is_empty()
                 && !controller.cluster_id.trim().is_empty()
         })
-        .collect()
+        .collect();
+    fold_paired_controller_usage(&mut controllers);
+    if controllers.len() > MAX_PAIRED_CONTROLLERS {
+        controllers.sort_by_key(|controller| {
+            std::cmp::Reverse(controller.last_used_ms.max(controller.paired_at_ms))
+        });
+        controllers.truncate(MAX_PAIRED_CONTROLLERS);
+    }
+    controllers
 }
 
 fn normalize_language(language: &str) -> String {
@@ -5855,6 +6907,18 @@ struct ClipboardFormat {
     text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image: Option<ClipboardImage>,
+    // File-clipboard payload ("fileList" kind): file name + base64 content per
+    // entry. Defaulted so older peers' packets decode; older peers ignore the
+    // kind entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files: Vec<ClipboardFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardFileEntry {
+    name: String,
+    data_base64: String,
 }
 
 fn clipboard_packet_from_content(
@@ -5880,30 +6944,90 @@ fn clipboard_packet_from_content(
                 kind: "plainText".into(),
                 text: text.clone(),
                 image: None,
+                files: Vec::new(),
             }],
             text,
             image: None,
             sequence,
         },
-        ClipboardContent::Image(image) => ClipboardPacket {
-            protocol: CLIPBOARD_PROTOCOL.into(),
-            origin_id,
-            origin_transport_public_key,
-            target_id,
-            cluster_id,
-            pair_secret,
-            signature,
-            formats: vec![ClipboardFormat {
-                kind: "imageRgba".into(),
+        ClipboardContent::Image(image) => {
+            // Prefer PNG on the wire: a screenshot compresses from ~14 MB of raw
+            // RGBA to a few hundred KB. Fall back to the legacy raw format when
+            // encoding fails or PNG is not actually smaller (tiny images). The
+            // signature stays computed on the canonical RGBA content, so echo
+            // suppression is unchanged for both peers.
+            let wire_image = clipboard::encode_png(&image)
+                .filter(|png_base64| png_base64.len() < image.rgba_base64.len())
+                .map(|png_base64| clipboard::ClipboardImage {
+                    width: image.width,
+                    height: image.height,
+                    rgba_base64: String::new(),
+                    png_base64,
+                })
+                .unwrap_or(image);
+            let kind = if wire_image.png_base64.is_empty() {
+                "imageRgba"
+            } else {
+                "imagePng"
+            };
+            ClipboardPacket {
+                protocol: CLIPBOARD_PROTOCOL.into(),
+                origin_id,
+                origin_transport_public_key,
+                target_id,
+                cluster_id,
+                pair_secret,
+                signature,
+                formats: vec![ClipboardFormat {
+                    kind: kind.into(),
+                    text: String::new(),
+                    image: Some(wire_image),
+                    files: Vec::new(),
+                }],
                 text: String::new(),
-                image: Some(image),
-            }],
-            text: String::new(),
-            // The formats envelope is supported by the current stable release.
-            // Keep accepting the legacy alias, but do not send a second bitmap.
-            image: None,
-            sequence,
-        },
+                // The formats envelope is supported by the current stable release.
+                // Keep accepting the legacy alias, but do not send a second bitmap.
+                image: None,
+                sequence,
+            }
+        }
+        ClipboardContent::Files(files) => {
+            // File contents ride inline as base64; the 24 MB decoded budget
+            // (is_oversized) keeps the wire payload inside the 48 MB stream
+            // limit. The signature is name+size based, so echo suppression
+            // never re-hashes file contents per poll.
+            let total_bytes = files.iter().map(|file| file.data.len()).sum::<usize>();
+            log::info!(
+                "file-clipboard: sending {} file(s), {} bytes decoded",
+                files.len(),
+                total_bytes
+            );
+            let entries = files
+                .iter()
+                .map(|file| ClipboardFileEntry {
+                    name: file.name.clone(),
+                    data_base64: BASE64_STANDARD.encode(&file.data),
+                })
+                .collect::<Vec<_>>();
+            ClipboardPacket {
+                protocol: CLIPBOARD_PROTOCOL.into(),
+                origin_id,
+                origin_transport_public_key,
+                target_id,
+                cluster_id,
+                pair_secret,
+                signature,
+                formats: vec![ClipboardFormat {
+                    kind: "fileList".into(),
+                    text: String::new(),
+                    image: None,
+                    files: entries,
+                }],
+                text: String::new(),
+                image: None,
+                sequence,
+            }
+        }
     }
 }
 
@@ -5933,13 +7057,18 @@ fn run_clipboard_sync(
 
     while !stop.load(Ordering::Relaxed) {
         let Some(target) = input::current_clipboard_target(&clipboard_target) else {
-            thread::sleep(Duration::from_millis(120));
+            wait_for_clipboard_wake(Duration::from_millis(120));
             last_poll = Instant::now() - Duration::from_secs(1);
             continue;
         };
 
-        if last_poll.elapsed() < Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS) {
-            thread::sleep(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
+        // A WM_CLIPBOARDUPDATE event bypasses the poll throttle so the copy
+        // reaches the peer within milliseconds of the OS clipboard changing.
+        let event_wake = CLIPBOARD_EVENT_PENDING.swap(false, Ordering::Relaxed);
+        if last_poll.elapsed() < Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS)
+            && !event_wake
+        {
+            wait_for_clipboard_wake(Duration::from_millis(CLIPBOARD_IDLE_SLEEP_MS));
             continue;
         }
         last_poll = Instant::now();
@@ -5961,6 +7090,20 @@ fn run_clipboard_sync(
             .filter(|version| Some(*version) == clipboard::change_count())
             .map(|version| (version, target.device_id.clone(), target.addr.clone()));
         let signature = content.signature();
+
+        // Received-file echo: the local clipboard points at files we just
+        // wrote for a peer payload; their name+size signature matches until
+        // the user copies something else.
+        if let ClipboardContent::Files(_) = &content {
+            let is_received_echo = FILES_LAST_RECEIVED_SIG
+                .lock()
+                .map(|guard| guard.as_deref() == Some(signature.as_str()))
+                .unwrap_or(false);
+            if is_received_echo {
+                last_failed = None;
+                continue;
+            }
+        }
 
         // If this is the content we just wrote after receiving a peer packet,
         // suppress it. A different signature during the grace window is treated
@@ -6026,6 +7169,7 @@ fn run_clipboard_sync(
         }
 
         sequence = sequence.saturating_add(1);
+        remember_clipboard_history(&content);
         let packet = clipboard_packet_from_content(
             content,
             local_peer_id.clone(),
@@ -6128,12 +7272,341 @@ fn arm_clipboard_echo_guard(clipboard_echo_until: &Arc<Mutex<Option<Instant>>>) 
 }
 
 fn write_clipboard_content_with_retry(content: &ClipboardContent) -> Result<(), String> {
-    retry_clipboard_content_write(
+    let result = retry_clipboard_content_write(
         content,
         CLIPBOARD_WRITE_ATTEMPTS,
         Duration::from_millis(CLIPBOARD_WRITE_RETRY_DELAY_MS),
         clipboard::write_content,
-    )
+    );
+    if result.is_ok() {
+        if let ClipboardContent::Files(_) = content {
+            // Remember this payload's signature: after writing, the local
+            // clipboard points at the landed files whose name+size signature
+            // is identical to what we just accepted — the poll must not send
+            // it straight back (the path-free signature makes this cheap).
+            if let Ok(mut guard) = FILES_LAST_RECEIVED_SIG.lock() {
+                *guard = Some(content.signature());
+            }
+        }
+        remember_clipboard_history(content);
+    }
+    result
+}
+
+// Signature of the most recently RECEIVED file-clipboard payload; the poll
+// loop skips it until the user copies something else.
+static FILES_LAST_RECEIVED_SIG: Mutex<Option<String>> = Mutex::new(None);
+
+// --- clipboard history ------------------------------------------------------
+// The last N clipboard payloads that crossed this machine (sent or received),
+// newest first, for the Ctrl+Shift+V history popup. Persisted (messagepack,
+// debounced) under the config dir so entries survive app restarts.
+const CLIPBOARD_HISTORY_CAP: usize = 20;
+const CLIPBOARD_HISTORY_TEXT_PREVIEW_BYTES: usize = 8 * 1024;
+const CLIPBOARD_HISTORY_FILE_BYTES: usize = 4 * 1024 * 1024;
+const CLIPBOARD_HISTORY_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const CLIPBOARD_HISTORY_FILE: &str = "clipboard-history.bin";
+/// Hotkey default for the clipboard-history popup (user-configurable via
+/// `clipboard_history_shortcut` in the layout).
+pub fn default_clipboard_history_shortcut() -> String {
+    "ctrl+shift+v".into()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardHistoryEntry {
+    id: u64,
+    kind: String, // "text" | "files"
+    /// Text content, or a one-line preview for file entries.
+    text: String,
+    /// File names for file entries (empty for text).
+    file_names: Vec<String>,
+    total_bytes: usize,
+    at_ms: u64,
+    /// Full payload for restore (kept out of the serialized view).
+    #[serde(skip)]
+    content: ClipboardContent,
+}
+
+static CLIPBOARD_HISTORY: Mutex<Vec<ClipboardHistoryEntry>> = Mutex::new(Vec::new());
+static CLIPBOARD_HISTORY_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn remember_clipboard_history(content: &ClipboardContent) {
+    let (kind, text, file_names, total_bytes) = match content {
+        ClipboardContent::Text(text) => (
+            "text",
+            text.chars().take(CLIPBOARD_HISTORY_TEXT_PREVIEW_BYTES * 4).collect::<String>(),
+            Vec::new(),
+            text.len(),
+        ),
+        ClipboardContent::Files(files) => {
+            let total = files.iter().map(|file| file.data.len()).sum::<usize>();
+            let preview = files
+                .first()
+                .map(|file| file.name.clone())
+                .unwrap_or_default();
+            (
+                "files",
+                preview,
+                files.iter().map(|file| file.name.clone()).collect(),
+                total,
+            )
+        }
+        ClipboardContent::Image(_) => return, // images stay out of history (memory heavy)
+    };
+    if total_bytes > CLIPBOARD_HISTORY_FILE_BYTES {
+        return;
+    }
+
+    let id = CLIPBOARD_HISTORY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let entry = ClipboardHistoryEntry {
+        id,
+        kind: kind.into(),
+        text,
+        file_names,
+        total_bytes,
+        at_ms: now_ms(),
+        content: match content {
+            ClipboardContent::Text(text) => ClipboardContent::Text(text.clone()),
+            ClipboardContent::Files(files) => ClipboardContent::Files(files.clone()),
+            ClipboardContent::Image(_) => return,
+        },
+    };
+
+    if let Ok(mut history) = CLIPBOARD_HISTORY.lock() {
+        history.insert(0, entry);
+        history.truncate(CLIPBOARD_HISTORY_CAP);
+        // Total-memory guard: drop oldest entries until within budget.
+        while history
+            .iter()
+            .map(|entry| entry.total_bytes)
+            .sum::<usize>()
+            > CLIPBOARD_HISTORY_TOTAL_BYTES
+            && history.len() > 1
+        {
+            history.pop();
+        }
+    }
+    schedule_clipboard_history_persist();
+}
+
+// Persistence: one messagepack file (metadata + payloads — binary stays raw,
+// no base64 bloat), written atomically via tmp+rename by a single background
+// thread that coalesces bursts. If the directory was never configured
+// (tests/edge runs), the history simply stays in memory.
+static CLIPBOARD_HISTORY_DIR: OnceLock<PathBuf> = OnceLock::new();
+static CLIPBOARD_HISTORY_PERSIST_DIRTY: Mutex<bool> = Mutex::new(false);
+static CLIPBOARD_HISTORY_PERSIST_SIGNALED: std::sync::Condvar = std::sync::Condvar::new();
+static CLIPBOARD_HISTORY_PERSIST_THREAD: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn set_clipboard_history_dir(dir: PathBuf) {
+    let _ = CLIPBOARD_HISTORY_DIR.set(dir);
+}
+
+/// MessagePack image of the in-memory history (id/kind/text/fileNames/…).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedClipboardHistory {
+    version: u32,
+    next_id: u64,
+    entries: Vec<PersistedClipboardEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedClipboardEntry {
+    id: u64,
+    kind: String,
+    text: String,
+    file_names: Vec<String>,
+    total_bytes: usize,
+    at_ms: u64,
+    content: PersistedClipboardContent,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum PersistedClipboardContent {
+    Text(String),
+    Files(Vec<PersistedClipboardFile>),
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedClipboardFile {
+    name: String,
+    data: Vec<u8>,
+}
+
+fn clipboard_history_file_path() -> Option<PathBuf> {
+    CLIPBOARD_HISTORY_DIR
+        .get()
+        .map(|dir| dir.join(CLIPBOARD_HISTORY_FILE))
+}
+
+fn persist_clipboard_history() {
+    let Some(path) = clipboard_history_file_path() else {
+        return;
+    };
+    let snapshot = match CLIPBOARD_HISTORY.lock() {
+        Ok(history) => PersistedClipboardHistory {
+            version: 1,
+            next_id: CLIPBOARD_HISTORY_NEXT_ID.load(Ordering::Relaxed),
+            entries: history
+                .iter()
+                .map(|entry| PersistedClipboardEntry {
+                    id: entry.id,
+                    kind: entry.kind.clone(),
+                    text: entry.text.clone(),
+                    file_names: entry.file_names.clone(),
+                    total_bytes: entry.total_bytes,
+                    at_ms: entry.at_ms,
+                    content: match &entry.content {
+                        ClipboardContent::Text(text) => {
+                            PersistedClipboardContent::Text(text.clone())
+                        }
+                        ClipboardContent::Files(files) => PersistedClipboardContent::Files(
+                            files
+                                .iter()
+                                .map(|file| PersistedClipboardFile {
+                                    name: file.name.clone(),
+                                    data: file.data.clone(),
+                                })
+                                .collect(),
+                        ),
+                        ClipboardContent::Image(_) => PersistedClipboardContent::Text(String::new()),
+                    },
+                })
+                .collect(),
+        },
+        Err(_) => return,
+    };
+    let Ok(bytes) = rmp_serde::to_vec_named(&snapshot) else {
+        log::warn!("clipboard history persist failed: could not serialize");
+        return;
+    };
+    let tmp_path = path.with_extension("bin.tmp");
+    if let Err(error) = fs::write(&tmp_path, &bytes).and_then(|()| fs::rename(&tmp_path, &path)) {
+        log::warn!("clipboard history persist failed: {error}");
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+fn load_clipboard_history_from(dir: &Path) {
+    let path = dir.join(CLIPBOARD_HISTORY_FILE);
+    let Ok(bytes) = fs::read(&path) else {
+        return; // no history yet (or unreadable): start empty
+    };
+    let Ok(snapshot) = rmp_serde::from_slice::<PersistedClipboardHistory>(&bytes) else {
+        log::warn!("clipboard history file unreadable; starting empty ({})", path.display());
+        return;
+    };
+    if snapshot.version != 1 {
+        return;
+    }
+    let mut loaded = Vec::with_capacity(snapshot.entries.len());
+    for entry in snapshot.entries {
+        let content = match entry.content {
+            PersistedClipboardContent::Text(text) => ClipboardContent::Text(text),
+            PersistedClipboardContent::Files(files) => ClipboardContent::Files(
+                files
+                    .into_iter()
+                    .map(|file| crate::clipboard::ClipboardFile {
+                        name: file.name,
+                        data: file.data,
+                    })
+                    .collect(),
+            ),
+        };
+        loaded.push(ClipboardHistoryEntry {
+            id: entry.id,
+            kind: entry.kind,
+            text: entry.text,
+            file_names: entry.file_names,
+            total_bytes: entry.total_bytes,
+            at_ms: entry.at_ms,
+            content,
+        });
+    }
+    CLIPBOARD_HISTORY_NEXT_ID.store(snapshot.next_id.max(1), Ordering::Relaxed);
+    if let Ok(mut history) = CLIPBOARD_HISTORY.lock() {
+        *history = loaded;
+    }
+    log::info!("clipboard history restored from disk");
+}
+
+/// Coalescing persist: a single background thread waits for a dirty signal,
+/// waits a further 2s for the burst to finish, then writes once.
+fn ensure_clipboard_history_persist_thread() {
+    CLIPBOARD_HISTORY_PERSIST_THREAD.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("clipboard-history-persist".into())
+            .spawn(|| loop {
+                {
+                    let mut dirty = CLIPBOARD_HISTORY_PERSIST_DIRTY
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !*dirty {
+                        dirty = CLIPBOARD_HISTORY_PERSIST_SIGNALED
+                            .wait(dirty)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                }
+                // Debounce window: more copies landing inside it reuse this
+                // single write instead of scheduling their own.
+                thread::sleep(Duration::from_secs(2));
+                if let Ok(mut dirty) = CLIPBOARD_HISTORY_PERSIST_DIRTY.lock() {
+                    *dirty = false;
+                }
+                persist_clipboard_history();
+            })
+            .expect("clipboard-history persist thread");
+    });
+}
+
+fn schedule_clipboard_history_persist() {
+    if clipboard_history_file_path().is_none() {
+        return;
+    }
+    ensure_clipboard_history_persist_thread();
+    if let Ok(mut dirty) = CLIPBOARD_HISTORY_PERSIST_DIRTY.lock() {
+        *dirty = true;
+    }
+    CLIPBOARD_HISTORY_PERSIST_SIGNALED.notify_one();
+}
+
+#[tauri::command]
+fn read_clipboard_history() -> Vec<ClipboardHistoryEntry> {
+    CLIPBOARD_HISTORY
+        .lock()
+        .map(|history| history.clone())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn restore_clipboard_history(id: u64) -> Result<(), String> {
+    let content = CLIPBOARD_HISTORY
+        .lock()
+        .map_err(|_| "history lock poisoned".to_string())?
+        .iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| match &entry.content {
+            ClipboardContent::Text(text) => ClipboardContent::Text(text.clone()),
+            ClipboardContent::Files(files) => ClipboardContent::Files(files.clone()),
+            ClipboardContent::Image(image) => ClipboardContent::Image(image.clone()),
+        })
+        .ok_or_else(|| "该条目已不存在（历史已滚动）。".to_string())?;
+
+    // Write to the local clipboard; the existing sync loop carries it to the
+    // peer the same way a fresh copy would.
+    write_clipboard_content_with_retry(&content)
+}
+
+#[tauri::command]
+fn clear_clipboard_history() {
+    if let Ok(mut history) = CLIPBOARD_HISTORY.lock() {
+        history.clear();
+    }
+    // Remove the persisted copy too, so a restart cannot resurrect it.
+    if let Some(path) = clipboard_history_file_path() {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 fn retry_clipboard_content_write<F>(
@@ -6222,6 +7695,10 @@ where
         return false;
     };
     if content.is_oversized() {
+        log::warn!(
+            "clipboard receive skipped: payload exceeds the size budget ({} bytes)",
+            content.signature()
+        );
         return false;
     }
 
@@ -6327,6 +7804,35 @@ fn clipboard_content_from_format(format: ClipboardFormat) -> Option<ClipboardCon
     match format.kind.as_str() {
         "plainText" if !format.text.is_empty() => Some(ClipboardContent::Text(format.text)),
         "imageRgba" => format.image.map(ClipboardContent::Image),
+        // PNG payloads decode back to the canonical RGBA form. Pre-PNG peers
+        // ignore this kind entirely, so a mixed-version cluster degrades to
+        // "images don't cross" instead of corrupting either clipboard.
+        "imagePng" => match format.image {
+            Some(image) if !image.png_base64.is_empty() => {
+                clipboard::decode_png(&image.png_base64, image.width, image.height)
+                    .map(ClipboardContent::Image)
+            }
+            _ => None,
+        },
+        // Copied files: decode back into the canonical in-memory form. Older
+        // peers ignore this kind (mixed-version pairs just don't sync files).
+        "fileList" if !format.files.is_empty() => {
+            let files = format
+                .files
+                .into_iter()
+                .map(|entry| {
+                    BASE64_STANDARD
+                        .decode(entry.data_base64.as_bytes())
+                        .map(|data| clipboard::ClipboardFile {
+                            name: entry.name,
+                            data,
+                        })
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .ok()?;
+            Some(ClipboardContent::Files(files))
+        }
         _ => None,
     }
 }
@@ -6335,25 +7841,31 @@ fn clipboard_packet_authorized(layout: &LayoutState, packet: &ClipboardPacket) -
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
     {
         return false;
     }
 
-    if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
+    if role_receives_from_peers(&layout.machine_role) {
         // Mirror input-packet authorization (packet_authorized_fields): match on
         // the STABLE transport public key first, then the id, then the legacy
         // "local-device" fallback. Matching by id alone silently rejected a
         // controller whose derived peer id had drifted (LAN IP change) even
         // though its key was unchanged — which is why input kept working while
-        // clipboard from that controller stopped.
+        // clipboard from that controller stopped. The shared pair secret is
+        // kept as a fallback for older peers that never joined the paired-
+        // controller whitelist (confirmation-code era pairings); auto-paired
+        // peers never learn each other's secret, so the whitelist is what
+        // authorizes them. An unpaired machine (empty whitelist) therefore
+        // still requires the secret — its cluster id is advertised, not secret.
         let key = packet.origin_transport_public_key.trim();
         return layout.paired_controllers.iter().any(|controller| {
             (!key.is_empty() && controller.transport_public_key == key)
                 || controller.id == packet.origin_id
         }) || (layout.paired_controllers.len() == 1
             && packet.origin_id == "local-device"
-            && !key.is_empty());
+            && !key.is_empty())
+            || (!layout.pair_secret.trim().is_empty()
+                && packet.pair_secret == layout.pair_secret);
     }
 
     true
@@ -6396,7 +7908,7 @@ fn file_transfer_target_for_device(
         });
     }
 
-    if layout.machine_role == "client" {
+    if role_receives_from_peers(&layout.machine_role) {
         if let Some(controller) = layout
             .paired_controllers
             .iter()
@@ -6513,6 +8025,7 @@ fn send_transfer_file(
     transfer_id: &str,
     drop_mode: DropMode,
     reporter: Option<&FileTransferProgressReporter>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<u64, String> {
     if let Some(reporter) = reporter {
         reporter.emit(transfer_id, file, 0, false, None);
@@ -6526,6 +8039,7 @@ fn send_transfer_file(
         drop_mode,
         transfer_id,
         reporter,
+        cancel,
     );
 
     if let Some(reporter) = reporter {
@@ -6551,32 +8065,57 @@ fn send_transfer_file_bytes(
     drop_mode: DropMode,
     transfer_id: &str,
     reporter: Option<&FileTransferProgressReporter>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<u64, String> {
     let mut packet_count = 0_u64;
 
-    send_file_transfer_packet(
-        quic_transport,
+    // Start negotiation: the receiver answers "ok" (fresh) or "ok:<offset>"
+    // (it kept a .part from an interrupted attempt of this file). Retries
+    // cover a lost ACK; the receiver tolerates duplicated starts.
+    let start_packet = file_transfer_packet(
+        "start",
+        transfer_id,
+        origin_id,
         target,
-        file_transfer_packet(
-            "start",
-            transfer_id,
-            origin_id,
-            target,
-            &file.name,
-            file.total_bytes,
-            0,
-            0,
-            Vec::new(),
-            drop_mode,
-        ),
-    )?;
-    packet_count += 1;
+        &file.name,
+        file.total_bytes,
+        0,
+        0,
+        Vec::new(),
+        drop_mode,
+    );
+    let resume_from =
+        send_file_transfer_start(quic_transport, target, start_packet, cancel)?;
 
     let mut file_handle = fs::File::open(&file.path)
         .map_err(|error| format!("无法打开文件 {}: {error}", file.path.display()))?;
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    // Resume: hash the source prefix [0, resume_from) so the finish digest
+    // still covers the whole file, then continue reading from there.
+    if resume_from > 0 {
+        file_handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("续传定位失败: {error}"))?;
+        let mut fed = 0_u64;
+        let mut prefix = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
+        while fed < resume_from {
+            let want = ((resume_from - fed) as usize).min(prefix.len());
+            let read = file_handle
+                .read(&mut prefix[..want])
+                .map_err(|error| format!("续传读取失败: {error}"))?;
+            if read == 0 {
+                return Err("源文件比已接收部分短，无法续传。".into());
+            }
+            hasher.update(&prefix[..read]);
+            fed += read as u64;
+        }
+        file_handle
+            .seek(SeekFrom::Start(resume_from))
+            .map_err(|error| format!("续传定位失败: {error}"))?;
+    }
     let mut buffer = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
-    let mut offset = 0_u64;
-    let mut chunk_index = 0_u64;
+    let mut offset = resume_from;
+    let mut chunk_index = resume_from / FILE_TRANSFER_CHUNK_BYTES as u64;
     let mut last_progress = Instant::now();
     loop {
         let read = file_handle
@@ -6585,7 +8124,11 @@ fn send_transfer_file_bytes(
         if read == 0 {
             break;
         }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err("用户已取消传输".into());
+        }
         let data = buffer[..read].to_vec();
+        hasher.update(&data);
         send_file_transfer_packet(
             quic_transport,
             target,
@@ -6601,6 +8144,7 @@ fn send_transfer_file_bytes(
                 data,
                 drop_mode,
             ),
+            cancel,
         )?;
         packet_count += 1;
         offset = offset.saturating_add(read as u64);
@@ -6613,22 +8157,22 @@ fn send_transfer_file_bytes(
         }
     }
 
-    send_file_transfer_packet(
-        quic_transport,
+    // The finish packet carries the whole-file digest so the receiver can
+    // verify integrity before moving the file into place.
+    let mut finish_packet = file_transfer_packet(
+        "finish",
+        transfer_id,
+        origin_id,
         target,
-        file_transfer_packet(
-            "finish",
-            transfer_id,
-            origin_id,
-            target,
-            &file.name,
-            file.total_bytes,
-            chunk_index,
-            offset,
-            Vec::new(),
-            drop_mode,
-        ),
-    )?;
+        &file.name,
+        file.total_bytes,
+        chunk_index,
+        offset,
+        Vec::new(),
+        drop_mode,
+    );
+    finish_packet.file_sha256 = hasher.finish().as_ref().to_vec();
+    send_file_transfer_packet(quic_transport, target, finish_packet, cancel)?;
     packet_count += 1;
 
     Ok(packet_count)
@@ -6677,23 +8221,81 @@ fn file_transfer_packet(
         drop_to_desktop: drop_mode == DropMode::Desktop,
         drag_drop: drop_mode == DropMode::DragDrop,
         client_log: drop_mode == DropMode::ClientLog,
+        file_sha256: Vec::new(),
+        resume_from: 0,
     }
+}
+
+/// Send the "start" packet and parse the receiver's reply: "ok" (fresh) or
+/// "ok:<offset>" (the receiver kept a .part from an interrupted attempt).
+/// Retries cover a lost ACK — the receiver tolerates duplicated starts.
+fn send_file_transfer_start(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &FileTransferTarget,
+    start_packet: FileTransferPacket,
+    cancel: Option<&AtomicBool>,
+) -> Result<u64, String> {
+    let payload = encode_wire_packet(&start_packet)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let mut last_error = String::new();
+    for attempt in 0..FILE_TRANSFER_SEND_ATTEMPTS {
+        if cancelled() {
+            return Err("用户已取消传输".into());
+        }
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(FILE_TRANSFER_RETRY_DELAY_MS));
+        }
+        match quic_transport.send_stream_expect_ack_reply(peer.clone(), payload.clone()) {
+            Ok(reply) => {
+                let reply_str = String::from_utf8_lossy(&reply);
+                if let Some(offset) = reply_str
+                    .strip_prefix("ok:")
+                    .and_then(|offset| offset.trim().parse::<u64>().ok())
+                {
+                    return Ok(offset);
+                }
+                return Ok(0);
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(format!("文件传输失败: {last_error}"))
 }
 
 fn send_file_transfer_packet(
     quic_transport: &quic_transport::TransportHandle,
     target: &FileTransferTarget,
     packet: FileTransferPacket,
-) -> Result<(), String> {
-    let payload = encode_wire_packet(&packet)?;
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {    let payload = encode_wire_packet(&packet)?;
     let peer = quic_transport.peer(
         target.addr.clone(),
         target.transport_public_key.clone(),
         target.protocol_version,
     );
-    quic_transport
-        .send_stream_expect_ack(peer, payload)
-        .map_err(|error| format!("文件传输失败: {error}"))
+    // A packet that actually landed but whose ACK was lost is safe to resend:
+    // the receiver accepts duplicated chunks as success, and the finish packet
+    // carries a SHA-256 that catches any content divergence.
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let mut last_error = String::new();
+    for attempt in 0..FILE_TRANSFER_SEND_ATTEMPTS {
+        if cancelled() {
+            return Err("用户已取消传输".into());
+        }
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(FILE_TRANSFER_RETRY_DELAY_MS));
+        }
+        match quic_transport.send_stream_expect_ack(peer.clone(), payload.clone()) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(format!("文件传输失败: {last_error}"))
 }
 
 // Control channel for ShareMouse-style native drag-drop onto a Windows client.
@@ -6921,21 +8523,20 @@ fn handle_drag_control_packet(
     if !layout.file_transfer_enabled {
         return true;
     }
-    // Reuse the file-transfer trust checks: same cluster, same pair secret, and
-    // (on a client) an origin we are paired to.
+    // Reuse the file-transfer trust checks: same cluster, and an origin we are
+    // paired to (the shared pair secret is the fallback for older peers).
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
     {
         return true;
     }
-    if layout.machine_role == "client"
-        && !layout.paired_controllers.is_empty()
+    if role_receives_from_peers(&layout.machine_role)
         && !layout
             .paired_controllers
             .iter()
             .any(|controller| controller.id == packet.origin_id)
+        && packet.pair_secret != layout.pair_secret
     {
         return true;
     }
@@ -7303,16 +8904,15 @@ fn handle_log_request_packet(
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
     {
         return true;
     }
-    if layout.machine_role == "client"
-        && !layout.paired_controllers.is_empty()
+    if role_receives_from_peers(&layout.machine_role)
         && !layout
             .paired_controllers
             .iter()
             .any(|controller| controller.id == packet.origin_id)
+        && packet.pair_secret != layout.pair_secret
     {
         return true;
     }
@@ -7390,7 +8990,7 @@ fn handle_decoded_file_transfer_packet(
     if windows_drag::session_wants(&packet.transfer_id) {
         return match packet.kind.as_str() {
             "start" => true,
-            "chunk" => windows_drag::feed_chunk(&packet.transfer_id, &packet.data),
+            "chunk" => windows_drag::feed_chunk(&packet.transfer_id, packet.offset, &packet.data),
             "finish" => windows_drag::finish_file(&packet.transfer_id),
             _ => false,
         };
@@ -7410,16 +9010,41 @@ fn start_incoming_file_transfer(
     receive_root: &Path,
     drop_root: Option<&Path>,
 ) -> bool {
+    let resumed = start_incoming_file_transfer_resumed(
+        packet,
+        transfers,
+        receive_root,
+        drop_root,
+    );
+    // Resume negotiation is read by the stream arm right after a "start" is
+    // accepted: Some(offset) answers "ok:<offset>", None answers "ok". Every
+    // accepted start refreshes the slot so a stale offset can never leak into
+    // the next transfer.
+    *FILE_RESUME_OFFER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = resumed;
+    resumed.is_some()
+}
+
+/// The offset a just-accepted "start" will resume from (None = fresh/0).
+static FILE_RESUME_OFFER: Mutex<Option<u64>> = Mutex::new(None);
+
+fn start_incoming_file_transfer_resumed(
+    packet: FileTransferPacket,
+    transfers: &Arc<Mutex<HashMap<String, IncomingFileTransfer>>>,
+    receive_root: &Path,
+    drop_root: Option<&Path>,
+) -> Option<u64> {
     if packet.transfer_id.trim().is_empty()
         || packet.origin_id.trim().is_empty()
         || packet.total_bytes > FILE_TRANSFER_MAX_FILE_BYTES
         || !packet.data.is_empty()
     {
-        return false;
+        return None;
     }
 
     let Some(file_name) = sanitize_transfer_file_name(&packet.file_name) else {
-        return false;
+        return None;
     };
 
     if let Err(error) = fs::create_dir_all(receive_root) {
@@ -7427,7 +9052,7 @@ fn start_incoming_file_transfer(
             "file transfer receive failed: could not create {}: {error}",
             receive_root.display()
         );
-        return false;
+        return None;
     }
 
     // The finalize root overrides the transfers folder (Desktop, or the hidden
@@ -7444,16 +9069,49 @@ fn start_incoming_file_transfer(
         file_name
     ));
 
+    // Interrupted-Transfer recovery: a .part left by an earlier attempt of the
+    // SAME file (name + size match, at least one chunk, not overfull) is
+    // adopted and the transfer continues from its length instead of starting
+    // over. Other leftovers stay put: adopting a stale prefix can only ever
+    // end in the finish-time SHA-256 rejecting the transfer, and deleting
+    // eagerly risks racing a concurrent transfer of the same file name.
+    let mut resume_from = 0_u64;
+    let adoptable = find_resumable_part(receive_root, &file_name, packet.total_bytes);
+    if let Some(old_part) = adoptable {
+        if fs::rename(&old_part, &temp_path).is_err() {
+            if fs::copy(&old_part, &temp_path).is_err() {
+                return None;
+            }
+            let _ = fs::remove_file(&old_part);
+        }
+        resume_from = fs::metadata(&temp_path).map(|meta| meta.len()).unwrap_or(0);
+        log::info!(
+            "file transfer resuming {} at offset {} ({} bytes kept)",
+            packet.transfer_id,
+            resume_from,
+            resume_from
+        );
+    }
+
     if let Ok(mut transfers) = transfers.lock() {
+        if !transfers.contains_key(&packet.transfer_id)
+            && transfers.len() >= MAX_CONCURRENT_INCOMING_TRANSFERS
+        {
+            log::warn!(
+                "file transfer start rejected: {} transfers already in flight",
+                transfers.len()
+            );
+            return None;
+        }
         if let Some(previous) = transfers.remove(&packet.transfer_id) {
             let _ = fs::remove_file(previous.temp_path);
         }
     } else {
-        return false;
+        return None;
     }
 
-    if fs::File::create(&temp_path).is_err() {
-        return false;
+    if resume_from == 0 && fs::File::create(&temp_path).is_err() {
+        return None;
     }
 
     // A ShareMouse-style drag: hold the file for release-time placement.
@@ -7462,25 +9120,83 @@ fn start_incoming_file_transfer(
         drag_place::begin(&packet.file_name);
     }
 
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    // Feed the adopted prefix so the finish-time digest covers the whole file.
+    if resume_from > 0 {
+        let Ok(mut part) = fs::File::open(&temp_path) else {
+            let _ = fs::remove_file(&temp_path);
+            return None;
+        };
+        let mut fed = 0_u64;
+        let mut feed = vec![0_u8; FILE_TRANSFER_CHUNK_BYTES];
+        while fed < resume_from {
+            let want = ((resume_from - fed) as usize).min(feed.len());
+            match part.read(&mut feed[..want]) {
+                Ok(0) => break,
+                Ok(read) => {
+                    hasher.update(&feed[..read]);
+                    fed += read as u64;
+                }
+                Err(_) => {
+                    let _ = fs::remove_file(&temp_path);
+                    return None;
+                }
+            }
+        }
+        if fed != resume_from {
+            let _ = fs::remove_file(&temp_path);
+            return None;
+        }
+    }
+
     let transfer = IncomingFileTransfer {
         origin_id: packet.origin_id.clone(),
         target_id: packet.target_id.clone(),
         file_name,
         total_bytes: packet.total_bytes,
-        received_bytes: 0,
-        next_chunk_index: 0,
+        received_bytes: resume_from,
+        next_chunk_index: resume_from / FILE_TRANSFER_CHUNK_BYTES as u64,
         temp_path,
         final_path,
         staged: packet.drag_drop,
+        sha256: Some(hasher),
     };
 
     transfers
         .lock()
         .map(|mut transfers| {
             transfers.insert(packet.transfer_id, transfer);
-            true
+            Some(resume_from)
         })
-        .unwrap_or(false)
+        .unwrap_or(None)
+}
+
+/// A kept .part from an interrupted attempt of the same file: name suffix and
+/// total size must match, at least one chunk received, never overfull.
+fn find_resumable_part(
+    receive_root: &Path,
+    file_name: &str,
+    total_bytes: u64,
+) -> Option<PathBuf> {
+    let suffix = format!("-{}.part", file_name);
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in fs::read_dir(receive_root).ok()? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let name = path.file_name()?.to_string_lossy().to_string();
+        if !name.starts_with(".mykvm-") || !name.ends_with(&suffix) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let len = meta.len();
+        if len == 0 || len > total_bytes {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
+            best = Some((len, path));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 fn append_incoming_file_transfer_chunk(
@@ -7500,7 +9216,22 @@ fn append_incoming_file_transfer_chunk(
         || packet.target_id != transfer.target_id
         || packet.file_name != transfer.file_name
         || packet.total_bytes != transfer.total_bytes
-        || packet.chunk_index != transfer.next_chunk_index
+    {
+        return false;
+    }
+    if packet.chunk_index < transfer.next_chunk_index
+        && packet
+            .offset
+            .saturating_add(packet.data.len() as u64)
+            <= transfer.received_bytes
+    {
+        // A retried packet whose original already landed (its ACK was lost).
+        // Accepting the duplicate as success is safe: bytes for that range are
+        // already on disk, and the finish packet's SHA-256 catches any content
+        // divergence between the copies.
+        return true;
+    }
+    if packet.chunk_index != transfer.next_chunk_index
         || packet.offset != transfer.received_bytes
         || transfer
             .received_bytes
@@ -7518,6 +9249,9 @@ fn append_incoming_file_transfer_chunk(
         log::warn!("file transfer chunk write failed: {error}");
         return false;
     }
+    if let Some(hasher) = transfer.sha256.as_mut() {
+        hasher.update(&packet.data);
+    }
 
     transfer.received_bytes = transfer
         .received_bytes
@@ -7533,11 +9267,11 @@ fn finish_incoming_file_transfer(
     if !packet.data.is_empty() {
         return false;
     }
-    let (temp_path, final_path, file_name, total_bytes, staged) = {
-        let Ok(transfers) = transfers.lock() else {
+    let (temp_path, final_path, file_name, total_bytes, staged, received_digest) = {
+        let Ok(mut transfers) = transfers.lock() else {
             return false;
         };
-        let Some(transfer) = transfers.get(&packet.transfer_id) else {
+        let Some(transfer) = transfers.get_mut(&packet.transfer_id) else {
             return false;
         };
         if packet.origin_id != transfer.origin_id
@@ -7556,8 +9290,42 @@ fn finish_incoming_file_transfer(
             transfer.file_name.clone(),
             transfer.total_bytes,
             transfer.staged,
+            transfer.sha256.take().map(|hasher| hasher.finish()),
         )
     };
+
+    // New senders attach the whole-file digest; verify it before the file is
+    // placed. A mismatch means the transfer is corrupt — drop it entirely
+    // rather than landing a broken file at the final location.
+    if !packet.file_sha256.is_empty()
+        && received_digest
+            .map(|digest| digest.as_ref() != packet.file_sha256.as_slice())
+            .unwrap_or(true)
+    {
+        log::error!(
+            "file transfer {} integrity check failed: dropping {}",
+            packet.transfer_id,
+            file_name
+        );
+        let _ = fs::remove_file(&temp_path);
+        if let Ok(mut transfers) = transfers.lock() {
+            transfers.remove(&packet.transfer_id);
+        }
+        record_transfer_history(TransferHistoryEntry {
+            id: 0,
+            direction: "receive".into(),
+            device_id: packet.origin_id.clone(),
+            device_name: packet.origin_id.clone(),
+            file_name,
+            file_count: 1,
+            total_bytes,
+            ok: false,
+            error: Some("SHA-256 校验失败，已丢弃".into()),
+            at_ms: 0,
+            paths: Vec::new(),
+        });
+        return false;
+    }
 
     // The staging dir and the final dir can sit on different volumes (e.g. a
     // redirected Desktop), where rename fails — fall back to copy + delete.
@@ -7579,6 +9347,37 @@ fn finish_incoming_file_transfer(
                 drag_place::stage(final_path.clone());
                 return true;
             }
+            // Windows: a staged file that nobody will place (DragDrop mode is
+            // only staged here when no native drag session consumed it — e.g.
+            // an edge-drag from a Windows controller) must not rot in the
+            // hidden staging dir; move it up into the visible transfers root.
+            #[cfg(target_os = "windows")]
+            if staged {
+                let visible = final_path
+                    .parent()
+                    .and_then(|staging| staging.parent())
+                    .map(|root| unique_transfer_destination(root, &file_name));
+                if let Some(visible) = visible {
+                    match fs::rename(&final_path, &visible).or_else(|_| {
+                        fs::copy(&final_path, &visible).map(|_| {
+                            let _ = fs::remove_file(&final_path);
+                        })
+                    }) {
+                        Ok(()) => {
+                            log::info!(
+                                "received file transfer {} bytes={} path={}",
+                                file_name,
+                                total_bytes,
+                                visible.display()
+                            );
+                            return true;
+                        }
+                        Err(error) => {
+                            log::warn!("failed to move staged drag file: {error}");
+                        }
+                    }
+                }
+            }
             let _ = staged;
             log::info!(
                 "received file transfer {} bytes={} path={}",
@@ -7586,10 +9385,36 @@ fn finish_incoming_file_transfer(
                 total_bytes,
                 final_path.display()
             );
+            record_transfer_history(TransferHistoryEntry {
+                id: 0,
+                direction: "receive".into(),
+                device_id: packet.origin_id.clone(),
+                device_name: packet.origin_id.clone(),
+                file_name,
+                file_count: 1,
+                total_bytes,
+                ok: true,
+                error: None,
+                at_ms: 0,
+                paths: vec![final_path.display().to_string()],
+            });
             true
         }
         Err(error) => {
             log::warn!("file transfer finalize failed: {error}");
+            record_transfer_history(TransferHistoryEntry {
+                id: 0,
+                direction: "receive".into(),
+                device_id: packet.origin_id.clone(),
+                device_name: packet.origin_id.clone(),
+                file_name,
+                file_count: 1,
+                total_bytes,
+                ok: false,
+                error: Some(error.to_string()),
+                at_ms: 0,
+                paths: Vec::new(),
+            });
             false
         }
     }
@@ -7599,16 +9424,21 @@ fn file_transfer_packet_authorized(layout: &LayoutState, packet: &FileTransferPa
     if layout.cluster_id.trim().is_empty()
         || layout.pair_secret.trim().is_empty()
         || packet.cluster_id != layout.cluster_id
-        || packet.pair_secret != layout.pair_secret
     {
         return false;
     }
 
-    if layout.machine_role == "client" && !layout.paired_controllers.is_empty() {
-        return layout
+    if role_receives_from_peers(&layout.machine_role) {
+        let matched = layout
             .paired_controllers
             .iter()
-            .any(|controller| controller.id == packet.origin_id);
+            .find(|controller| controller.id == packet.origin_id);
+        if let Some(controller) = matched {
+            // LRU bookkeeping for the whitelist cap: authorization is a use.
+            touch_paired_controller_usage(&controller.transport_public_key, &controller.id);
+            return true;
+        }
+        return packet.pair_secret == layout.pair_secret;
     }
 
     true
@@ -7738,6 +9568,23 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
     let local_transport_port = layout.transport_port;
     let local_quic_port = layout.quic_port;
     let cluster_id = layout.cluster_id.clone();
+    let local_screens = local_screens_of(layout);
+    // Snapshot the reachability fields so a change (peer came online, went
+    // ready, moved address) can invalidate the input-targets cache immediately
+    // instead of waiting out its 250ms TTL.
+    let reachability_before: Vec<(String, bool, bool, String)> = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+        .map(|device| {
+            (
+                device.id.clone(),
+                device.online,
+                device.input_ready,
+                device.host.clone(),
+            )
+        })
+        .collect();
     for device in &mut layout.devices {
         if device.role == "local" {
             device.online = true;
@@ -7752,7 +9599,7 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
             .iter()
             .find(|peer| device_matches_peer(device, peer, &cluster_id));
         if let Some(peer) = peer {
-            update_device_from_peer(device, peer);
+            update_device_from_peer(device, peer, &local_screens);
         } else {
             device.online = false;
             device.input_ready = false;
@@ -7760,6 +9607,26 @@ fn apply_peer_presence(layout: &mut LayoutState, peers: &[LanPeer]) {
                 device.upgrading = false;
             }
         }
+    }
+
+    // A peer coming online / going ready / moving address changes the input
+    // targets — drop the capture-side cache so crossing works on the next
+    // mouse push instead of after the TTL.
+    let reachability_changed = reachability_before != layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+        .map(|device| {
+            (
+                device.id.clone(),
+                device.online,
+                device.input_ready,
+                device.host.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if reachability_changed {
+        input::invalidate_input_targets_cache();
     }
 
     refresh_paired_controller_addresses(layout, peers);
@@ -7843,6 +9710,193 @@ fn peer_device_id(peer: &LanPeer) -> String {
     }
 }
 
+// Colors for devices added by the backend (manual adds get theirs from the
+// frontend palette; keep both lists aligned cosmetically).
+const DEVICE_PALETTE: [&str; 8] = [
+    "#2f7af8", "#7c3aed", "#be123c", "#0891b2", "#16a34a", "#d97706", "#db2777", "#4b5563",
+];
+
+/// Insert (or refresh) the layout's device entry for a paired peer. This is
+/// what makes REVERSE control possible: the accepting side gets a device with
+/// the initiator's screens, so its capture stack can build crossing targets
+/// toward the initiator just like the server does toward its clients.
+fn upsert_paired_peer_device(layout: &mut LayoutState, peer: &LanPeer) {
+    let device_id = peer_device_id(peer);
+    let local_screens = local_screens_of(layout);
+    if let Some(device) = layout.devices.iter_mut().find(|device| {
+        (!device.transport_public_key.trim().is_empty()
+            && device.transport_public_key == peer.transport_public_key)
+            || device.id == device_id
+    }) {
+        update_device_from_peer(device, peer, &local_screens);
+        return;
+    }
+
+    let name = if peer.name.trim().is_empty() {
+        device_id.clone()
+    } else {
+        peer.name.clone()
+    };
+    let role = match peer.machine_role.as_str() {
+        "server" => "server",
+        "peer" => "peer",
+        _ => "client",
+    };
+    layout.devices.push(Device {
+        id: device_id.clone(),
+        name,
+        platform: normalize_peer_platform(&peer.platform).into(),
+        host: peer.host.clone(),
+        mac: peer.mac.clone(),
+        transport_port: peer.transport_port,
+        quic_port: peer.quic_port,
+        transport_public_key: peer.transport_public_key.clone(),
+        protocol_version: peer.protocol_version,
+        color: DEVICE_PALETTE[layout.devices.len() % DEVICE_PALETTE.len()].into(),
+        online: true,
+        input_ready: peer.input_ready,
+        upgrading: false,
+        upgrading_until_ms: 0,
+        role: role.into(),
+        source: "detected".into(),
+        screens: screens_from_peer(peer, &device_id, &[], &local_screens),
+    });
+}
+
+/// Append `controller` to the layout's paired-controllers list unless an entry
+/// with the same id or transport key is already present (re-pairing a known
+/// peer refreshes its entry instead of duplicating it).
+fn append_paired_controller(layout: &mut LayoutState, peer: &LanPeer) {
+    let exists = layout.paired_controllers.iter().any(|controller| {
+        controller.id == peer.id
+            || (!controller.transport_public_key.trim().is_empty()
+                && controller.transport_public_key == peer.transport_public_key)
+    });
+    // Re-confirming a pair is a use: it refreshes the LRU clock so an actively
+    // re-paired device is not evicted as stale.
+    let last_used_ms = if exists {
+        layout
+            .paired_controllers
+            .iter()
+            .find(|controller| {
+                controller.id == peer.id
+                    || (!controller.transport_public_key.trim().is_empty()
+                        && controller.transport_public_key == peer.transport_public_key)
+            })
+            .map(|controller| controller.last_used_ms.max(now_ms()))
+            .unwrap_or_else(now_ms)
+    } else {
+        now_ms()
+    };
+    let controller = PairedController {
+        id: peer.id.clone(),
+        name: peer.name.clone(),
+        host: peer.host.clone(),
+        ip: peer.ip.clone(),
+        transport_public_key: peer.transport_public_key.clone(),
+        protocol_version: peer.protocol_version,
+        cluster_id: layout.cluster_id.clone(),
+        paired_at_ms: now_ms(),
+        last_used_ms,
+    };
+    if exists {
+        if let Some(existing) = layout
+            .paired_controllers
+            .iter_mut()
+            .find(|controller| {
+                controller.id == peer.id
+                    || (!controller.transport_public_key.trim().is_empty()
+                        && controller.transport_public_key == peer.transport_public_key)
+            })
+        {
+            *existing = controller;
+        }
+    } else {
+        layout.paired_controllers.push(controller);
+    }
+}
+
+/// Open pairing: trust every discovered peer on the LAN. For each visible peer
+/// carrying a transport public key that is not paired yet, record it as a
+/// paired controller and add its device entry, so both sides can control each
+/// other without any manual step. Cluster ids converge deterministically: an
+/// unpaired machine adopts its peer's cluster; when both are unpaired both
+/// adopt the lexicographically smaller id (each side computes the same answer
+/// locally, no negotiation needed). Returns true when anything changed.
+fn auto_pair_discovered_peers(
+    layout_state: &Arc<Mutex<LayoutState>>,
+    config_path: &PathBuf,
+    peers: &Arc<Mutex<Vec<LanPeer>>>,
+) -> bool {
+    let candidates = {
+        let Ok(peers) = peers.lock() else {
+            return false;
+        };
+        peers.clone()
+    };
+
+    let mut changed = false;
+    let Ok(mut layout) = layout_state.lock() else {
+        return false;
+    };
+    if !layout.auto_pairing {
+        return false;
+    }
+
+    for peer in candidates {
+        if peer.transport_public_key.trim().is_empty() || is_paired_controller(&layout, &peer) {
+            continue;
+        }
+
+        // Cluster convergence (only matters while we have no pairing of our
+        // own — once paired we keep our cluster and newcomers adopt it).
+        if layout.paired_controllers.is_empty() && !peer.cluster_id.trim().is_empty() {
+            let peer_cluster = peer.cluster_id.trim();
+            let peer_unpaired = peer.pairing_required;
+            let adopted = if peer_unpaired {
+                let local = layout.cluster_id.trim();
+                // Both sides unpaired: converge on the smaller id. The peer
+                // computes the same minimum on its side and both announce the
+                // converged cluster on their next heartbeat.
+                if peer_cluster < local {
+                    peer_cluster.to_string()
+                } else {
+                    local.to_string()
+                }
+            } else {
+                peer_cluster.to_string()
+            };
+            if !adopted.is_empty() && adopted != layout.cluster_id {
+                layout.cluster_id = adopted;
+            }
+        }
+
+        append_paired_controller(&mut layout, &peer);
+        upsert_paired_peer_device(&mut layout, &peer);
+        if layout.paired_controllers.len() > MAX_PAIRED_CONTROLLERS {
+            layout.paired_controllers =
+                normalize_paired_controllers(std::mem::take(&mut layout.paired_controllers));
+            log::warn!(
+                "open pairing hit the controller cap ({}); oldest pairs were dropped",
+                MAX_PAIRED_CONTROLLERS
+            );
+        }
+        changed = true;
+        log::info!("auto-paired with discovered peer id={} name={}", peer.id, peer.name);
+    }
+
+    if changed {
+        let snapshot = layout.clone();
+        drop(layout);
+        if let Err(error) = write_layout_to_disk(config_path, &snapshot) {
+            log::warn!("auto-pairing failed to persist layout: {error}");
+        }
+        return true;
+    }
+
+    false
+}
+
 fn sanitize_id(value: &str) -> String {
     value
         .trim()
@@ -7859,7 +9913,22 @@ fn sanitize_id(value: &str) -> String {
         .to_string()
 }
 
-fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
+/// This machine's own screens (the local device's entry), for peer-screen
+/// placement decisions.
+fn local_screens_of(layout: &LayoutState) -> Vec<Screen> {
+    layout
+        .devices
+        .iter()
+        .filter(|device| device.role == "local")
+        .flat_map(|device| device.screens.iter().cloned())
+        .collect()
+}
+
+fn update_device_from_peer(
+    device: &mut Device,
+    peer: &LanPeer,
+    local_screens: &[Screen],
+) {
     device.online = true;
     device.input_ready = peer.input_ready;
     if device.source != "manual" {
@@ -7872,6 +9941,9 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.transport_port = peer.transport_port;
     device.quic_port = normalize_quic_port(peer.transport_port, peer.quic_port);
     device.transport_public_key = peer.transport_public_key.clone();
+    if !peer.mac.trim().is_empty() {
+        device.mac = peer.mac.trim().to_string();
+    }
     device.protocol_version = peer.protocol_version;
     if !peer.platform.trim().is_empty() {
         device.platform = normalize_peer_platform(&peer.platform).into();
@@ -7880,7 +9952,7 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
         device.name = peer.name.clone();
     }
     if !peer.screens.is_empty() {
-        device.screens = screens_from_peer(peer, &device.id, &device.screens);
+        device.screens = screens_from_peer(peer, &device.id, &device.screens, local_screens);
     }
     if peer.upgrading && !device.upgrading {
         device.upgrading_until_ms = now_ms() + 120_000;
@@ -7888,7 +9960,20 @@ fn update_device_from_peer(device: &mut Device, peer: &LanPeer) {
     device.upgrading = peer.upgrading;
 }
 
-fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen]) -> Vec<Screen> {
+/// Peer screens land on THIS machine's canvas without overlapping the local
+/// screens: the whole peer arrangement is placed just right of the local
+/// screens' rightmost edge (mirroring the frontend's manual-add placement).
+/// Existing per-screen positions are preserved ONLY when they don't collide
+/// with the local screens — a collision means the arrangement was
+/// auto-generated (never user-dragged to a valid spot) and must be re-placed,
+/// otherwise the peer's screens overlap ours and no crossing target can exist
+/// (build_input_targets skips overlapping pairs; touching_edge finds no edge).
+fn screens_from_peer(
+    peer: &LanPeer,
+    device_id: &str,
+    existing_screens: &[Screen],
+    local_screens: &[Screen],
+) -> Vec<Screen> {
     if peer.screens.is_empty() {
         return existing_screens.to_vec();
     }
@@ -7905,7 +9990,8 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
         .map(|screen| screen.y)
         .min()
         .unwrap_or_default();
-    peer.screens
+    let mut screens = peer
+        .screens
         .iter()
         .enumerate()
         .map(|(index, peer_screen)| {
@@ -7932,7 +10018,54 @@ fn screens_from_peer(peer: &LanPeer, device_id: &str, existing_screens: &[Screen
                 is_primary: peer_screen.is_primary,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    // Re-place when the arrangement collides with the local screens (or when
+    // there is no arrangement yet): shift the whole peer group so its left
+    // edge sits at the local screens' rightmost edge, preserving the peer's
+    // internal relative layout.
+    let collides = screens.is_empty()
+        || local_screens.iter().any(|local| {
+            screens
+                .iter()
+                .any(|remote| screens_overlap_(local, remote))
+        });
+    let has_user_arrangement = existing_screens
+        .iter()
+        .any(|screen| !screens_overlap_with_any(screen, local_screens));
+    if collides || !has_user_arrangement {
+        let local_max_right = local_screens
+            .iter()
+            .map(|screen| screen.x + screen.width)
+            .max()
+            .unwrap_or_default() as i64;
+        let remote_min_x = screens
+            .iter()
+            .map(|screen| screen.x as i64)
+            .min()
+            .unwrap_or_default();
+        let shift = local_max_right - remote_min_x;
+        for screen in &mut screens {
+            screen.x = (screen.x as i64 + shift) as i32;
+        }
+    }
+
+    screens
+}
+
+/// Overlap test for placement decisions (strict bounds, same rule as
+/// build_input_targets' skip).
+fn screens_overlap_(a: &Screen, b: &Screen) -> bool {
+    a.x < b.x + b.width
+        && a.x + a.width > b.x
+        && a.y < b.y + b.height
+        && a.y + a.height > b.y
+}
+
+fn screens_overlap_with_any(screen: &Screen, others: &[Screen]) -> bool {
+    others
+        .iter()
+        .any(|other| screens_overlap_(screen, other))
 }
 
 fn unique_peer_screen_id(device_id: &str, screen: &LanPeerScreen, index: usize) -> String {
@@ -7976,6 +10109,12 @@ struct DiscoveryPacket {
     pair_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pairing_error: Option<String>,
+    // HMAC-SHA256 over the payload with the sender's discovery signing key
+    // (generated alongside the transport identity). Empty from older peers —
+    // unsigned packets are still accepted (the field is defaulted), signed
+    // packets that fail verification are dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signature: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -8016,6 +10155,7 @@ fn local_peer_from_layout(layout: &LayoutState) -> LanPeer {
         pairing_required: pairing_required(layout),
         host,
         ip,
+        mac: local_mac_address(),
         transport_port: layout.transport_port,
         quic_port: normalize_quic_port(layout.transport_port, layout.quic_port),
         transport_public_key: local_device
@@ -8054,11 +10194,25 @@ fn warm_quic_peer(transport: &quic_transport::TransportHandle, peer: &LanPeer) {
 }
 
 fn pairing_required(layout: &LayoutState) -> bool {
-    layout.machine_role == "client" && layout.paired_controllers.is_empty()
+    // Clients and peers both need at least one paired controller before they
+    // can be reached; a peer without controllers is as invisible as a client
+    // without one.
+    (layout.machine_role == "client" || layout.machine_role == "peer")
+        && layout.paired_controllers.is_empty()
+}
+
+/// Roles that can RECEIVE content from peers enforce strict origin
+/// authorization (the origin must be a paired controller). The server keeps
+/// its historical cluster/secret-only behavior toward its clients.
+fn role_receives_from_peers(role: &str) -> bool {
+    role == "client" || role == "peer"
 }
 
 fn advertised_cluster_id(layout: &LayoutState) -> String {
-    if pairing_required(layout) {
+    // With open pairing there is no secret to protect, so an unpaired machine
+    // still advertises its local cluster: that lets two fresh machines adopt
+    // a common cluster deterministically (see auto_pair_discovered_peers).
+    if pairing_required(layout) && !layout.auto_pairing {
         String::new()
     } else {
         layout.cluster_id.clone()
@@ -8392,14 +10546,41 @@ fn encode_discovery_payload(
         pair_cluster_id: pairing.cluster_id,
         pair_secret: pairing.secret,
         pairing_error: pairing.error,
+        signature: Vec::new(),
     };
+    let mut packet = packet;
+    // HMAC-SHA256 over the deterministic identity fields with the local
+    // discovery signing key. A receiver verifies against the peer's ADVERTISED
+    // id + transport public key, so a forged packet cannot claim a trusted
+    // identity even though discovery itself is plaintext.
+    packet.signature = discovery_signing::sign(
+        &packet.kind,
+        &packet.peer.id,
+        &packet.peer.transport_public_key,
+    );
     encode_wire_packet(&packet)
         .map_err(|error| format!("failed to encode discovery packet: {error}"))
 }
 
 fn decode_discovery_packet(payload: &[u8]) -> Option<DiscoveryPacket> {
     let packet = decode_wire_packet::<DiscoveryPacket>(payload)?;
-    (packet.protocol == DISCOVERY_PROTOCOL).then_some(packet)
+    if packet.protocol != DISCOVERY_PROTOCOL {
+        return None;
+    }
+    if !discovery_signing::verify(
+        &packet.signature,
+        &packet.kind,
+        &packet.peer.id,
+        &packet.peer.transport_public_key,
+    ) {
+        log::debug!(
+            "dropping discovery packet with invalid signature: kind={} peer={}",
+            packet.kind,
+            packet.peer.id
+        );
+        return None;
+    }
+    Some(packet)
 }
 
 fn peer_from_discovery_packet(
@@ -8507,7 +10688,9 @@ fn active_peers(peers: &Arc<Mutex<Vec<LanPeer>>>, local_peer_id: &str) -> Vec<La
 
 fn peer_visible_to_layout(layout: &LayoutState, peer: &LanPeer) -> bool {
     if peer.pairing_required {
-        return layout.machine_role == "server";
+        // Servers AND peers can reach unpaired receivers — a peer needs to
+        // discover its counterpart to initiate pairing in the first place.
+        return layout.machine_role == "server" || layout.machine_role == "peer";
     }
 
     let cluster_id = layout.cluster_id.trim();
@@ -8516,7 +10699,7 @@ fn peer_visible_to_layout(layout: &LayoutState, peer: &LanPeer) -> bool {
 
 fn peer_visible_to_local_peer(local_peer: &LanPeer, peer: &LanPeer) -> bool {
     if peer.pairing_required {
-        return local_peer.machine_role == "server";
+        return local_peer.machine_role == "server" || local_peer.machine_role == "peer";
     }
 
     let cluster_id = local_peer.cluster_id.trim();
@@ -8528,11 +10711,11 @@ fn should_reply_to_discovery(layout: &LayoutState, peer: &LanPeer) -> bool {
         return true;
     }
 
-    if layout.machine_role == "client" && pairing_required(layout) {
+    if role_receives_from_peers(&layout.machine_role) && pairing_required(layout) {
         return peer.machine_role == "server";
     }
 
-    layout.machine_role == "client" && is_paired_controller(layout, peer)
+    role_receives_from_peers(&layout.machine_role) && is_paired_controller(layout, peer)
 }
 
 fn is_paired_controller(layout: &LayoutState, peer: &LanPeer) -> bool {
@@ -8568,7 +10751,12 @@ fn text_matches(left: &str, right: &str) -> bool {
 }
 
 fn pair_challenge_usable_for_local_peer(local_peer: &LanPeer, peer: &LanPeer) -> bool {
-    if !peer.machine_role.trim().is_empty() && peer.machine_role != "client" {
+    // Receivers are clients and peers; a server never accepts a pairing
+    // challenge (servers initiate).
+    if !peer.machine_role.trim().is_empty()
+        && peer.machine_role != "client"
+        && peer.machine_role != "peer"
+    {
         return false;
     }
     if peer.pairing_required {
@@ -8685,11 +10873,18 @@ fn begin_pairing_challenge(
     requester: &LanPeer,
     requester_ip: String,
 ) -> bool {
-    if layout.machine_role != "client" {
+    if layout.machine_role != "client" && layout.machine_role != "peer" {
         return false;
     }
-    if requester.machine_role != "server" {
+    if requester.machine_role != "server" && requester.machine_role != "peer" {
         return false;
+    }
+    // Open pairing accepts the handshake without a challenge: the caller still
+    // answers with a pair-challenge packet (so an older initiator can proceed
+    // to the confirm step) but no code is generated and no window pops up —
+    // complete_pairing_from_confirm skips verification for auto-paired peers.
+    if layout.auto_pairing {
+        return true;
     }
     // Accept a fresh handshake when we have no pairing yet, OR when the
     // requester looks like a controller we were already paired with. Repair
@@ -8757,11 +10952,19 @@ fn complete_pairing_from_confirm(
     let code = code.unwrap_or_default();
     let cluster_id = cluster_id.unwrap_or_default();
     let pair_secret = pair_secret.unwrap_or_default();
-    if code.trim().is_empty() || cluster_id.trim().is_empty() || pair_secret.trim().is_empty() {
+    let auto_pairing = {
+        let Ok(layout) = layout_state.lock() else {
+            return Err("layout state lock poisoned".to_string());
+        };
+        layout.auto_pairing
+    };
+    if !auto_pairing
+        && (code.trim().is_empty() || cluster_id.trim().is_empty() || pair_secret.trim().is_empty())
+    {
         return Err("配对请求缺少验证码或组信息。".into());
     }
 
-    {
+    if !auto_pairing {
         let mut challenge = pairing_challenge
             .lock()
             .map_err(|_| "pairing challenge lock poisoned".to_string())?;
@@ -8792,23 +10995,23 @@ fn complete_pairing_from_confirm(
         let mut layout = layout_state
             .lock()
             .map_err(|_| "layout state lock poisoned".to_string())?;
-        if layout.machine_role != "client" {
-            return Err("只有客户端可以接受服务端配对。".into());
+        if layout.machine_role != "client" && layout.machine_role != "peer" {
+            return Err("只有客户端或对等模式可以接受配对。".into());
         }
 
         layout.cluster_id = cluster_id.trim().into();
         layout.pair_secret = pair_secret.trim().into();
-        layout.input_mode = "receive".into();
-        layout.paired_controllers = vec![PairedController {
-            id: requester.id.clone(),
-            name: requester.name.clone(),
-            host: requester.host.clone(),
-            ip: requester.ip.clone(),
-            transport_public_key: requester.transport_public_key.clone(),
-            protocol_version: requester.protocol_version,
-            cluster_id: layout.cluster_id.clone(),
-            paired_at_ms: now_ms(),
-        }];
+        // Peer machines keep capturing: they accept the initiator's control
+        // AND stay able to control back. Clients stay receive-only.
+        layout.input_mode = if layout.machine_role == "peer" {
+            "both".into()
+        } else {
+            "receive".into()
+        };
+        append_paired_controller(&mut layout, requester);
+        // Give the accepting side a device entry for the initiator so its own
+        // layout editor and capture stack can cross INTO the initiator too.
+        upsert_paired_peer_device(&mut layout, requester);
         layout.clone()
     };
 
@@ -9120,6 +11323,114 @@ mod tests {
         }
     }
 
+    fn paired_controller_entry(id: &str, paired_at_ms: u64, last_used_ms: u64) -> PairedController {
+        PairedController {
+            id: id.into(),
+            name: format!("peer-{id}"),
+            host: format!("host-{id}"),
+            ip: "10.0.0.1".into(),
+            transport_public_key: format!("pk-{id}"),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms,
+            last_used_ms,
+        }
+    }
+
+    #[test]
+    fn whitelist_cap_evicts_least_recently_used_first() {
+        // peer-0 was paired FIRST but never authorized any traffic; peers 1..8
+        // were paired later and are in active use. The cap must evict peer-0
+        // (recency of use), not whichever pair happens to be oldest.
+        let mut controllers = vec![paired_controller_entry("peer-0", 1, 0)];
+        for index in 1..9usize {
+            controllers.push(paired_controller_entry(
+                &format!("peer-{index}"),
+                900_000 + index as u64,
+                500_000 + 100 * index as u64,
+            ));
+        }
+
+        let kept = normalize_paired_controllers(controllers);
+        assert_eq!(kept.len(), MAX_PAIRED_CONTROLLERS);
+        assert!(
+            kept.iter().all(|controller| controller.id != "peer-0"),
+            "the never-used first pair must be evicted before any used pair"
+        );
+        assert!(kept.iter().any(|controller| controller.id == "peer-8"));
+    }
+
+    #[test]
+    fn whitelist_usage_map_refreshes_lru_clock() {
+        let controller = paired_controller_entry("peer-live", 10, 20);
+        let key =
+            paired_controller_usage_key(&controller.transport_public_key, &controller.id);
+        // Simulate a fresh authorization via the in-memory usage map.
+        if let Ok(mut usage) = paired_controller_usage_map().lock() {
+            usage.insert(key, 9_999);
+        }
+        assert_eq!(paired_controller_last_used(&controller), 9_999);
+        // A recorded use older than the stored clock never lowers it.
+        if let Ok(mut usage) = paired_controller_usage_map().lock() {
+            usage.insert(
+                paired_controller_usage_key(&controller.transport_public_key, &controller.id),
+                5,
+            );
+        }
+        assert_eq!(paired_controller_last_used(&controller), 20);
+        if let Ok(mut usage) = paired_controller_usage_map().lock() {
+            usage.remove("pk:pk-peer-live");
+        }
+    }
+
+    #[test]
+    fn pending_queue_summary_tracks_completed_inputs() {
+        start_pending_queue(PendingTransferQueue {
+            device_id: "peer-a".into(),
+            device_name: "Machine B".into(),
+            paths: vec!["C:/a.zip".into(), "C:/b.zip".into(), "C:/docs".into()],
+            completed: Vec::new(),
+        });
+        let summary = pending_queue_summary().expect("a fresh queue must be resumable");
+        assert_eq!(summary.remaining, 3);
+        assert_eq!(summary.total, 3);
+
+        mark_pending_queue_file_done("C:/a.zip");
+        let summary = pending_queue_summary().expect("a partially done queue must remain");
+        assert_eq!(summary.remaining, 2);
+
+        clear_pending_queue();
+        assert!(pending_queue_summary().is_none());
+    }
+
+    #[test]
+    fn transfer_history_round_trips_newest_first_with_cap() {
+        for index in 0..(TRANSFER_HISTORY_CAP + 10) {
+            record_transfer_history(TransferHistoryEntry {
+                id: 0,
+                direction: "send".into(),
+                device_id: "peer-a".into(),
+                device_name: "Machine B".into(),
+                file_name: format!("file-{index}.txt"),
+                file_count: 1,
+                total_bytes: 100 + index as u64,
+                ok: index % 2 == 0,
+                error: None,
+                at_ms: 0,
+                paths: vec![format!("C:/f/{index}.txt")],
+            });
+        }
+        let recorded = list_transfer_history();
+        assert_eq!(recorded.len(), TRANSFER_HISTORY_CAP);
+        // Newest first: the most recent entry (last recorded) is at the top.
+        assert_eq!(recorded[0].file_name, format!("file-{}.txt", TRANSFER_HISTORY_CAP + 9));
+        assert!(recorded[0].id > recorded[1].id);
+        // Clean the shared list for other tests / reruns.
+        if let Ok(mut history) = TRANSFER_HISTORY.lock() {
+            history.clear();
+        }
+    }
+
     /// A drag pulled off one controlled machine can be relayed onward to
     /// another only while it is still in the user's hand. `is_active` stays
     /// true for seconds after the release so files still in flight get placed,
@@ -9337,6 +11648,7 @@ mod tests {
                     name: "Local".into(),
                     platform: "macos".into(),
                     host: "local / 10.0.0.1".into(),
+                    mac: String::new(),
                     transport_port: 47833,
                     quic_port: 47834,
                     transport_public_key: "local-public-key".into(),
@@ -9355,6 +11667,7 @@ mod tests {
                     name: "Client".into(),
                     platform: "windows".into(),
                     host: "client / 10.0.0.2".into(),
+                    mac: "aabbccddeeff".into(),
                     transport_port: 47833,
                     quic_port: 47834,
                     transport_public_key: "peer-public-key".into(),
@@ -9378,6 +11691,12 @@ mod tests {
             paired_controllers: Vec::new(),
             clipboard_sync: false,
             file_transfer_enabled: true,
+            auto_pairing: true,
+            lock_on_leave: false,
+            fullscreen_guard: false,
+            clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
+            corner_guard: false,
+            corner_guard_size: 0,
             language: "cn".into(),
             theme_mode: "system".into(),
             performance_monitor: false,
@@ -9401,6 +11720,7 @@ mod tests {
             pairing_required: false,
             host: "client".into(),
             ip: "10.0.0.2".into(),
+            mac: "aabbccddeeff".into(),
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "peer-public-key".into(),
@@ -9546,6 +11866,7 @@ mod tests {
             protocol_version: peer.protocol_version,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
+            last_used_ms: 0,
         }];
         let trusted = layout.paired_controllers[0].clone();
         let mut impostor = peer.clone();
@@ -9642,6 +11963,7 @@ mod tests {
     fn pairing_challenge_rejects_second_requester_while_active() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
+        layout.auto_pairing = false;
         layout.paired_controllers.clear();
         let challenge = Arc::new(Mutex::new(None));
         let mut first = test_peer();
@@ -9672,6 +11994,7 @@ mod tests {
     fn pairing_challenge_accepts_known_requester_after_identity_rotation() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
+        layout.auto_pairing = false;
         layout.paired_controllers = vec![PairedController {
             id: "server-old-id".into(),
             name: "Server".into(),
@@ -9681,6 +12004,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
         let challenge = Arc::new(Mutex::new(None));
         let mut requester = test_peer();
@@ -9717,6 +12041,7 @@ mod tests {
     fn pairing_challenge_refreshes_code_after_failed_attempt() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
+        layout.auto_pairing = false;
         layout.paired_controllers.clear();
         let challenge = Arc::new(Mutex::new(None));
         let mut requester = test_peer();
@@ -9783,6 +12108,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
 
         assert!(should_send_public_announce(&layout));
@@ -9804,6 +12130,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: current.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
 
         let mut stale_settings = current.clone();
@@ -9854,6 +12181,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: current.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
         let mut disk = current.clone();
         disk.cluster_id = "empty-disk-cluster".into();
@@ -9871,6 +12199,7 @@ mod tests {
     fn pairing_confirm_stream_saves_paired_controller() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
+        layout.auto_pairing = false;
         layout.cluster_id = "client-old-cluster".into();
         layout.pair_secret = "client-old-secret".into();
         layout.paired_controllers.clear();
@@ -9932,6 +12261,7 @@ mod tests {
     fn pairing_confirm_stream_rejects_wrong_code() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
+        layout.auto_pairing = false;
         layout.paired_controllers.clear();
 
         let mut server = test_peer();
@@ -9993,6 +12323,302 @@ mod tests {
     }
 
     #[test]
+    fn pairing_confirm_stream_writes_peer_pairing_both_ways() {
+        let mut layout = test_layout();
+        layout.machine_role = "peer".into();
+        layout.cluster_id = "peer-old-cluster".into();
+        layout.pair_secret = "peer-old-secret".into();
+        layout.paired_controllers.clear();
+
+        let mut other = test_peer();
+        other.id = "peer-10-0-0-3".into();
+        other.name = "OtherPeer".into();
+        other.machine_role = "peer".into();
+        other.ip = "10.0.0.3".into();
+        other.transport_public_key = "other-public-key".into();
+
+        let layout_state = Arc::new(Mutex::new(layout));
+        let pairing_challenge = Arc::new(Mutex::new(Some(PairingChallenge {
+            code: "123456".into(),
+            requester_id: other.id.clone(),
+            requester_name: other.name.clone(),
+            requester_ip: other.ip.clone(),
+            requester_host: other.host.clone(),
+            requester_public_key: other.transport_public_key.clone(),
+            requester_protocol_version: other.protocol_version,
+            expires_at: Instant::now() + Duration::from_secs(60),
+            expires_at_ms: now_ms() + 60_000,
+            attempts: 0,
+        })));
+        let config_path =
+            std::env::temp_dir().join(format!("mykvm-peer-pairing-test-{}.json", now_ms()));
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let payload = encode_discovery_payload(
+            "pair-confirm",
+            &other,
+            DiscoveryPairingFields {
+                code: Some("123456".into()),
+                cluster_id: Some("shared-cluster".into()),
+                secret: Some("shared-secret".into()),
+                error: None,
+            },
+        )
+        .expect("pair-confirm should encode");
+
+        assert!(handle_pairing_stream_packet(
+            &payload,
+            SocketAddr::from(([10, 0, 0, 3], 52001)),
+            &layout_state,
+            &pairing_challenge,
+            &config_path,
+            &peers,
+        ));
+
+        let saved = layout_state.lock().expect("layout lock").clone();
+        // Peer mode keeps capturing: input stays bidirectional.
+        assert_eq!(saved.input_mode, "both");
+        assert_eq!(saved.cluster_id, "shared-cluster");
+        assert_eq!(saved.pair_secret, "shared-secret");
+        // The accepting side records the initiator as a paired controller AND
+        // gets a device entry for it, so its capture stack can cross INTO the
+        // initiator (reverse control).
+        assert_eq!(saved.paired_controllers.len(), 1);
+        assert_eq!(saved.paired_controllers[0].id, other.id);
+        let device = saved
+            .devices
+            .iter()
+            .find(|device| device.id == peer_device_id(&other))
+            .expect("peer device entry");
+        assert_eq!(device.transport_public_key, other.transport_public_key);
+        assert!(
+            !device.screens.is_empty(),
+            "the initiator's screens must come along for reverse crossing"
+        );
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn auto_pair_adopts_discovered_peer_and_its_cluster() {
+        let mut layout = test_layout();
+        layout.machine_role = "server".into();
+        layout.cluster_id = "cluster-zzz".into();
+        layout.paired_controllers.clear();
+
+        let mut peer = test_peer();
+        peer.id = "fresh-client-10-0-0-9".into();
+        peer.name = "FreshClient".into();
+        peer.machine_role = "client".into();
+        peer.ip = "10.0.0.9".into();
+        peer.transport_public_key = "fresh-client-key".into();
+        peer.cluster_id = "cluster-aaa".into();
+        peer.pairing_required = false;
+
+        let layout_state = Arc::new(Mutex::new(layout));
+        let config_path =
+            std::env::temp_dir().join(format!("mykvm-auto-pair-{}.json", now_ms()));
+        let peers = Arc::new(Mutex::new(vec![peer.clone()]));
+
+        assert!(auto_pair_discovered_peers(&layout_state, &config_path, &peers));
+
+        let saved = layout_state.lock().expect("layout lock").clone();
+        assert_eq!(
+            saved.paired_controllers.len(),
+            1,
+            "the discovered peer joins the whitelist"
+        );
+        assert_eq!(saved.paired_controllers[0].id, peer.id);
+        assert!(
+            saved
+                .devices
+                .iter()
+                .any(|device| device.id == peer_device_id(&peer)),
+            "the peer's device entry comes along for reverse control"
+        );
+        // The peer is already paired (pairing_required=false), so we adopt its
+        // cluster outright.
+        assert_eq!(saved.cluster_id, "cluster-aaa");
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn auto_pair_converges_to_the_smaller_cluster_when_both_unpaired() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.cluster_id = "cluster-bbb".into();
+        layout.paired_controllers.clear();
+
+        let mut peer = test_peer();
+        peer.id = "other-client-10-0-0-8".into();
+        peer.machine_role = "peer".into();
+        peer.transport_public_key = "other-key".into();
+        peer.cluster_id = "cluster-aaa".into();
+        peer.pairing_required = true;
+
+        let layout_state = Arc::new(Mutex::new(layout));
+        let config_path =
+            std::env::temp_dir().join(format!("mykvm-auto-pair-min-{}.json", now_ms()));
+        let peers = Arc::new(Mutex::new(vec![peer]));
+
+        assert!(auto_pair_discovered_peers(&layout_state, &config_path, &peers));
+        let saved = layout_state.lock().expect("layout lock").clone();
+        // Both sides are unpaired: converge on the lexicographically smaller id.
+        assert_eq!(saved.cluster_id, "cluster-aaa");
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn auto_pairing_disabled_leaves_everything_alone() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.cluster_id = "cluster-zzz".into();
+        layout.paired_controllers.clear();
+        layout.auto_pairing = false;
+
+        let mut peer = test_peer();
+        peer.id = "fresh-client-10-0-0-7".into();
+        peer.machine_role = "client".into();
+        peer.transport_public_key = "fresh-client-key".into();
+        peer.cluster_id = "cluster-aaa".into();
+
+        let layout_state = Arc::new(Mutex::new(layout));
+        let config_path =
+            std::env::temp_dir().join(format!("mykvm-auto-pair-off-{}.json", now_ms()));
+        let peers = Arc::new(Mutex::new(vec![peer]));
+
+        assert!(!auto_pair_discovered_peers(&layout_state, &config_path, &peers));
+        let saved = layout_state.lock().expect("layout lock").clone();
+        assert!(saved.paired_controllers.is_empty());
+        assert_eq!(saved.cluster_id, "cluster-zzz");
+        assert_eq!(saved.devices.len(), 2, "no device entries were added");
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn auto_pair_skips_peers_without_a_transport_key() {
+        let mut layout = test_layout();
+        layout.machine_role = "server".into();
+        layout.paired_controllers.clear();
+
+        let mut peer = test_peer();
+        peer.id = "no-key-peer".into();
+        peer.transport_public_key = String::new();
+        peer.cluster_id = "cluster-aaa".into();
+
+        let layout_state = Arc::new(Mutex::new(layout));
+        let config_path =
+            std::env::temp_dir().join(format!("mykvm-auto-pair-nokey-{}.json", now_ms()));
+        let peers = Arc::new(Mutex::new(vec![peer]));
+
+        assert!(!auto_pair_discovered_peers(&layout_state, &config_path, &peers));
+        let saved = layout_state.lock().expect("layout lock").clone();
+        assert!(saved.paired_controllers.is_empty());
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn paired_controllers_cap_drops_the_oldest() {
+        let mut controllers = Vec::new();
+        for index in 0..(MAX_PAIRED_CONTROLLERS + 3) {
+            controllers.push(PairedController {
+                id: format!("controller-{index}"),
+                name: format!("Controller {index}"),
+                host: "host".into(),
+                ip: "10.0.0.1".into(),
+                transport_public_key: format!("key-{index}"),
+                protocol_version: quic_transport::PROTOCOL_VERSION,
+                cluster_id: "cluster-test".into(),
+                paired_at_ms: index as u64,
+                last_used_ms: 0,
+            });
+        }
+
+        let normalized = normalize_paired_controllers(controllers);
+
+        assert_eq!(normalized.len(), MAX_PAIRED_CONTROLLERS);
+        // Newest survive (highest pairedAtMs), oldest are dropped.
+        assert!(normalized.iter().all(|c| c.paired_at_ms >= 3));
+        assert!(normalized.iter().any(|c| c.id == "controller-10"));
+        assert!(!normalized.iter().any(|c| c.id == "controller-0"));
+    }
+
+    #[test]
+    fn peer_layout_authorizes_only_paired_controllers() {
+        let mut layout = test_layout();
+        layout.machine_role = "peer".into();
+        layout.cluster_id = "cluster-test".into();
+        layout.pair_secret = "secret-test".into();
+        layout.paired_controllers.clear();
+
+        let mut packet = ClipboardPacket {
+            protocol: CLIPBOARD_PROTOCOL.into(),
+            origin_id: "controller-1".into(),
+            origin_transport_public_key: "controller-key".into(),
+            target_id: "local-device".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "wrong-secret".into(),
+            signature: "text:hi".into(),
+            formats: vec![],
+            text: String::new(),
+            image: None,
+            sequence: 1,
+        };
+
+        // A wrong pair secret is rejected outright (the cluster/secret gate).
+        assert!(!clipboard_packet_authorized(&layout, &packet));
+
+        // No paired controllers yet: a packet carrying the CORRECT secret is
+        // accepted the same way legacy unpaired clients were (the secret is
+        // only shared during pairing, so knowing it means the peer paired).
+        packet.pair_secret = "secret-test".into();
+        assert!(clipboard_packet_authorized(&layout, &packet));
+
+        layout.paired_controllers.push(PairedController {
+            id: "controller-1".into(),
+            name: "Controller".into(),
+            host: "controller.local".into(),
+            ip: "10.0.0.9".into(),
+            transport_public_key: "controller-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: 1,
+            last_used_ms: 0,
+        });
+        assert!(clipboard_packet_authorized(&layout, &packet));
+
+        // A different origin with a wrong secret is rejected even with the
+        // right cluster.
+        packet.origin_id = "stranger".into();
+        packet.origin_transport_public_key = "stranger-key".into();
+        packet.pair_secret = "wrong-secret".into();
+        assert!(!clipboard_packet_authorized(&layout, &packet));
+    }
+
+    #[test]
+    fn peer_role_and_both_mode_normalize_and_require_pairing() {
+        assert_eq!(normalize_machine_role("peer"), "peer");
+        assert_eq!(normalize_machine_role("bogus"), "unset");
+        assert_eq!(normalize_input_mode("both"), "both");
+        assert_eq!(normalize_input_mode("weird"), "control");
+
+        let mut layout = test_layout();
+        layout.machine_role = "peer".into();
+        layout.paired_controllers.clear();
+        assert!(pairing_required(&layout), "unpaired peer requires pairing");
+        layout.paired_controllers.push(PairedController {
+            id: "controller-1".into(),
+            name: "Controller".into(),
+            host: "controller.local".into(),
+            ip: "10.0.0.9".into(),
+            transport_public_key: "controller-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            cluster_id: "cluster-test".into(),
+            paired_at_ms: 1,
+            last_used_ms: 0,
+        });
+        assert!(!pairing_required(&layout));
+    }
+
+    #[test]
     fn clipboard_packet_requires_paired_controller_on_client() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
@@ -10005,6 +12631,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
@@ -10012,20 +12639,31 @@ mod tests {
             origin_transport_public_key: String::new(),
             target_id: "local-device".into(),
             cluster_id: layout.cluster_id.clone(),
-            pair_secret: layout.pair_secret.clone(),
+            pair_secret: "attacker-secret".into(),
             signature: "text:hello".into(),
             formats: vec![ClipboardFormat {
                 kind: "plainText".into(),
                 text: "hello".into(),
                 image: None,
+                files: Vec::new(),
             }],
             text: "hello".into(),
             image: None,
             sequence: 1,
         };
 
-        assert!(!clipboard_packet_authorized(&layout, &packet));
+        assert!(
+            !clipboard_packet_authorized(&layout, &packet),
+            "an origin outside the whitelist with a wrong secret is rejected"
+        );
+        // The shared secret alone still authorizes (fallback for peers paired
+        // through the confirmation-code flow, which never join the whitelist).
+        packet.pair_secret = layout.pair_secret.clone();
+        assert!(clipboard_packet_authorized(&layout, &packet));
+        // A whitelisted origin is trusted even without the secret (open-pairing
+        // peers never learn each other's secret).
         packet.origin_id = "server-10-0-0-1".into();
+        packet.pair_secret = "attacker-secret".into();
         assert!(clipboard_packet_authorized(&layout, &packet));
     }
 
@@ -10046,6 +12684,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
         let mut packet = ClipboardPacket {
             protocol: CLIPBOARD_PROTOCOL.into(),
@@ -10060,6 +12699,7 @@ mod tests {
                 kind: "plainText".into(),
                 text: "hi".into(),
                 image: None,
+                files: Vec::new(),
             }],
             text: "hi".into(),
             image: None,
@@ -10071,10 +12711,16 @@ mod tests {
             "a drifted id with the paired transport key must still be authorized"
         );
         packet.origin_transport_public_key = "attacker-key".into();
+        packet.pair_secret = "attacker-secret".into();
         assert!(
             !clipboard_packet_authorized(&layout, &packet),
-            "neither the id nor the key matches — must be rejected"
+            "neither the id nor the key matches and the secret is wrong — rejected"
         );
+        // Confirmation-code-era fallback: a peer holding the shared secret but
+        // missing from the whitelist (e.g. an older controller) is still trusted.
+        packet.origin_transport_public_key = "attacker-key".into();
+        packet.pair_secret = layout.pair_secret.clone();
+        assert!(clipboard_packet_authorized(&layout, &packet));
     }
 
     #[test]
@@ -10083,11 +12729,13 @@ mod tests {
             width: 2,
             height: 1,
             rgba_base64: "AAAAAAAAAAA=".into(),
+            png_base64: String::new(),
         });
         let second = ClipboardContent::Image(ClipboardImage {
             width: 2,
             height: 1,
             rgba_base64: "AQEBAQEBAQE=".into(),
+            png_base64: String::new(),
         });
 
         assert_ne!(first.signature(), second.signature());
@@ -10135,11 +12783,18 @@ mod tests {
     fn clipboard_image_packet_fits_transport_stream_budget() {
         let raw_rgba_bytes = 3840 * 2160 * 4;
         let encoded_len = raw_rgba_bytes / 3 * 4;
+        // The last byte makes this invalid base64 so the PNG-preferring sender
+        // falls back to the legacy raw format: this test asserts the WORST-CASE
+        // legacy packet still fits the stream budget. PNG-encoding 8M pixels
+        // here would be slow and would shrink the packet under test.
+        let mut fake_rgba = "A".repeat(encoded_len);
+        fake_rgba.replace_range(encoded_len - 1.., "!");
         let packet = clipboard_packet_from_content(
             ClipboardContent::Image(ClipboardImage {
                 width: 3840,
                 height: 2160,
-                rgba_base64: "A".repeat(encoded_len),
+                rgba_base64: fake_rgba,
+                png_base64: String::new(),
             }),
             "local-device".into(),
             String::new(),
@@ -10156,6 +12811,80 @@ mod tests {
             payload.len(),
             quic_transport::MAX_STREAM_BYTES
         );
+    }
+
+    #[test]
+    fn clipboard_image_packet_prefers_png_when_it_is_smaller() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        // 16x16 solid color: PNG must compress far below the raw 1 KB RGBA.
+        let rgba = vec![0x40u8; 16 * 16 * 4];
+        let image = ClipboardImage {
+            width: 16,
+            height: 16,
+            rgba_base64: BASE64.encode(rgba),
+            png_base64: String::new(),
+        };
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Image(image),
+            "local-device".into(),
+            String::new(),
+            "peer-device".into(),
+            "cluster-test".into(),
+            "secret-test".into(),
+            1,
+        );
+
+        assert_eq!(packet.formats.len(), 1);
+        assert_eq!(packet.formats[0].kind, "imagePng");
+        assert!(packet.formats[0].image.as_ref().is_some_and(|wire| {
+            !wire.png_base64.is_empty() && wire.rgba_base64.is_empty()
+        }));
+
+        // Round trip: the receiving side must decode back to the canonical
+        // RGBA content with the identical signature (echo suppression relies
+        // on both ends computing the same signature).
+        let payload = encode_wire_packet(&packet).expect("packet encode");
+        let decoded = decode_wire_packet::<ClipboardPacket>(&payload).expect("packet decode");
+        let content =
+            clipboard_content_from_packet(decoded).expect("png format should decode to content");
+        match content {
+            ClipboardContent::Image(back) => {
+                assert_eq!(back.width, 16);
+                assert_eq!(back.height, 16);
+                assert_eq!(
+                    back.rgba_base64,
+                    BASE64.encode(vec![0x40u8; 16 * 16 * 4])
+                );
+                assert!(back.png_base64.is_empty());
+            }
+            other => panic!("expected image content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clipboard_image_packet_keeps_legacy_rgba_when_png_is_not_smaller() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+        // A 1x1 pixel: the PNG container overhead exceeds the 4 raw bytes, so
+        // the sender must keep the legacy imageRgba format.
+        let packet = clipboard_packet_from_content(
+            ClipboardContent::Image(ClipboardImage {
+                width: 1,
+                height: 1,
+                rgba_base64: BASE64.encode([1u8, 2, 3, 4]),
+                png_base64: String::new(),
+            }),
+            "local-device".into(),
+            String::new(),
+            "peer-device".into(),
+            "cluster-test".into(),
+            "secret-test".into(),
+            1,
+        );
+
+        assert_eq!(packet.formats.len(), 1);
+        assert_eq!(packet.formats[0].kind, "imageRgba");
     }
 
     #[test]
@@ -10212,6 +12941,7 @@ mod tests {
                 kind: "plainText".into(),
                 text: "hello".into(),
                 image: None,
+                files: Vec::new(),
             }],
             text: String::new(),
             image: None,
@@ -10429,6 +13159,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
         let peers = vec![LanPeer {
             id: "peer-server-10-0-0-1".into(),
@@ -10439,6 +13170,7 @@ mod tests {
             pairing_required: false,
             host: "server.local".into(),
             ip: "10.0.0.1".into(),
+            mac: "aabbccddeeff".into(),
             transport_port: 52000,
             quic_port: 52001,
             transport_public_key: "server-public-key".into(),
@@ -10484,6 +13216,102 @@ mod tests {
             fs::read_to_string(root.join("note.txt")).expect("received file"),
             "hello world"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_resumes_from_adopted_part() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-resume");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        // A .part left behind by an interrupted attempt of the same file. The
+        // old transfer id in the file name must not block adoption.
+        fs::write(root.join(".mykvm-old-transfer-note.txt.part"), b"hello ")
+            .expect("stale part should write");
+
+        for packet in [
+            test_file_transfer_packet("start", "new-transfer", "note.txt", 11, 0, 0, b""),
+            // Offset 6 is only valid if the adopted .part was honored: a fresh
+            // transfer expects the first chunk at offset 0. The resumed sender
+            // continues inside chunk 0 because offset 6 is within its range.
+            test_file_transfer_packet("chunk", "new-transfer", "note.txt", 11, 0, 6, b"world"),
+            test_file_transfer_packet("finish", "new-transfer", "note.txt", 11, 1, 11, b""),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload,
+                &layout,
+                "local-device",
+                &transfers,
+                &root
+            ));
+        }
+
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("resumed file"),
+            "hello world"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_ignores_part_larger_than_the_transfer() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-stale-part");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        fs::write(root.join(".mykvm-old-transfer-note.txt.part"), b"stale bytes!!")
+            .expect("stale part should write");
+
+        let start = test_file_transfer_packet("start", "fresh-transfer", "note.txt", 5, 0, 0, b"");
+        let start_payload = encode_wire_packet(&start).expect("start should encode");
+        assert!(handle_file_transfer_packet_with_root(
+            &start_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+
+        // A fresh start must resume from zero: offset 6 is past every chunk.
+        let beyond = test_file_transfer_packet(
+            "chunk",
+            "fresh-transfer",
+            "note.txt",
+            5,
+            1,
+            6,
+            b"world",
+        );
+        let beyond_payload = encode_wire_packet(&beyond).expect("chunk should encode");
+        assert!(!handle_file_transfer_packet_with_root(
+            &beyond_payload,
+            &layout,
+            "local-device",
+            &transfers,
+            &root
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn find_resumable_part_prefers_largest_within_budget() {
+        let root = temp_test_dir("resume-part-scan");
+        fs::write(root.join(".mykvm-a-note.txt.part"), b"abc").expect("a should write");
+        fs::write(root.join(".mykvm-b-note.txt.part"), b"abcde").expect("b should write");
+        fs::write(root.join(".mykvm-c-other.txt.part"), b"abcdefghij").expect("c should write");
+        fs::write(root.join(".mykvm-d-note.txt.part"), b"").expect("d should write");
+
+        assert_eq!(
+            find_resumable_part(&root, "note.txt", 11),
+            Some(root.join(".mykvm-b-note.txt.part"))
+        );
+        assert_eq!(
+            find_resumable_part(&root, "note.txt", 4),
+            Some(root.join(".mykvm-a-note.txt.part"))
+        );
+        assert_eq!(find_resumable_part(&root, "note.txt", 2), None);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -10552,6 +13380,135 @@ mod tests {
     }
 
     #[test]
+    fn file_transfer_finish_verifies_sha256() {
+        use ring::digest;
+
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-hash");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+        let correct_hash = digest::digest(&digest::SHA256, b"hello world").as_ref().to_vec();
+
+        // Correct digest: the file lands.
+        let mut finish = test_file_transfer_packet("finish", "transfer-h1", "ok.txt", 11, 2, 11, b"");
+        finish.file_sha256 = correct_hash.clone();
+        for packet in [
+            test_file_transfer_packet("start", "transfer-h1", "ok.txt", 11, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-h1", "ok.txt", 11, 0, 0, b"hello "),
+            test_file_transfer_packet("chunk", "transfer-h1", "ok.txt", 11, 1, 6, b"world"),
+            finish,
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload, &layout, "local-device", &transfers, &root
+            ));
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("ok.txt")).expect("verified file"),
+            "hello world"
+        );
+
+        // Wrong digest: finish is rejected, the .part file is dropped, and
+        // nothing lands at the final location.
+        let mut finish = test_file_transfer_packet("finish", "transfer-h2", "bad.txt", 5, 1, 5, b"");
+        finish.file_sha256 = vec![0_u8; 32];
+        for packet in [
+            test_file_transfer_packet("start", "transfer-h2", "bad.txt", 5, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-h2", "bad.txt", 5, 0, 0, b"hello"),
+            finish,
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            let accepted = handle_file_transfer_packet_with_root(
+                &payload, &layout, "local-device", &transfers, &root
+            );
+            if packet.kind == "finish" {
+                assert!(!accepted, "a corrupted finish must be rejected");
+            } else {
+                assert!(accepted);
+            }
+        }
+        assert!(!root.join("bad.txt").exists(), "corrupt file must not land");
+        assert!(
+            transfers
+                .lock()
+                .expect("transfers lock")
+                .is_empty(),
+            "a rejected transfer must not linger in the map"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_accepts_retried_duplicate_chunk() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-dup");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for packet in [
+            test_file_transfer_packet("start", "transfer-dup", "note.txt", 11, 0, 0, b""),
+            test_file_transfer_packet("chunk", "transfer-dup", "note.txt", 11, 0, 0, b"hello "),
+            // The same chunk arrives again (its first ACK was lost): accepted
+            // as success, without writing a second copy.
+            test_file_transfer_packet("chunk", "transfer-dup", "note.txt", 11, 0, 0, b"hello "),
+            test_file_transfer_packet("chunk", "transfer-dup", "note.txt", 11, 1, 6, b"world"),
+            test_file_transfer_packet("finish", "transfer-dup", "note.txt", 11, 2, 11, b""),
+        ] {
+            let payload = encode_wire_packet(&packet).expect("file packet should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload, &layout, "local-device", &transfers, &root
+            ));
+        }
+
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("received file"),
+            "hello world"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_transfer_caps_concurrent_incoming_transfers() {
+        let layout = test_layout();
+        let root = temp_test_dir("file-transfer-cap");
+        let transfers = Arc::new(Mutex::new(HashMap::new()));
+
+        for index in 0..MAX_CONCURRENT_INCOMING_TRANSFERS {
+            let start = test_file_transfer_packet(
+                "start",
+                &format!("transfer-cap-{index}"),
+                &format!("file-{index}.txt"),
+                0,
+                0,
+                0,
+                b"",
+            );
+            let payload = encode_wire_packet(&start).expect("start should encode");
+            assert!(handle_file_transfer_packet_with_root(
+                &payload, &layout, "local-device", &transfers, &root
+            ));
+        }
+
+        let overflow = test_file_transfer_packet(
+            "start",
+            "transfer-cap-overflow",
+            "overflow.txt",
+            0,
+            0,
+            0,
+            b"",
+        );
+        let payload = encode_wire_packet(&overflow).expect("start should encode");
+        assert!(
+            !handle_file_transfer_packet_with_root(
+                &payload, &layout, "local-device", &transfers, &root
+            ),
+            "a start beyond the concurrency cap must be rejected"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn file_transfer_sanitizes_received_file_names() {
         assert_eq!(
             sanitize_transfer_file_name("../bad:name?.txt").as_deref(),
@@ -10592,6 +13549,8 @@ mod tests {
             drop_to_desktop: false,
             drag_drop: false,
             client_log: false,
+            file_sha256: Vec::new(),
+            resume_from: 0,
         }
     }
 
@@ -10620,6 +13579,23 @@ mod tests {
             preferred_lan_ipv4(&addresses),
             Some(Ipv4Addr::new(192, 168, 66, 106))
         );
+    }
+
+    #[test]
+    fn magic_packet_builds_six_ff_plus_sixteen_macs() {
+        let packet = build_magic_packet("aabbccddeeff").expect("packet");
+        assert_eq!(packet.len(), 102);
+        assert_eq!(&packet[..6], &[0xFF; 6]);
+        assert_eq!(&packet[6..12], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(&packet[96..102], &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+
+        // Colon-separated form and mixed case are normalized.
+        let spaced = build_magic_packet("AA:BB:CC:DD:EE:FF").expect("packet");
+        assert_eq!(spaced, packet);
+
+        assert!(build_magic_packet("nothex").is_err());
+        assert!(build_magic_packet("aabbccddeef").is_err(), "5 bytes");
+        assert!(build_magic_packet("").is_err());
     }
 
     #[test]
@@ -10728,6 +13704,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: now_ms(),
+            last_used_ms: 0,
         }];
 
         let targets = known_peer_discovery_targets(&layout, DISCOVERY_PORT);

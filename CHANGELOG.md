@@ -10,6 +10,36 @@ release will reuse them).
 
 ### Added
 
+- Clipboard history is saved on this machine and survives restarts; the popup hotkey is now configurable in Settings (with a "clear history" button in the popup itself).
+- Transfer history: the last 50 finished transfers (sent and received) are listed on the Devices tab, with one-click resend for failed sends. The list is persisted and clearable.
+- Interrupted multi-file sends can be resumed: after a restart, a banner offers to send the files that never finished (the per-file resume from the previous release picks up partial files where they stopped).
+- Clipboard sync is event-driven on Windows: a copy now reaches the other machine within milliseconds of Ctrl+C, instead of up to 150 ms later on the next poll.
+- macOS: the fullscreen crossing guard now works on macOS too (it was Windows-only) — a fullscreen app or video pauses edge crossing so games are never interrupted.
+- When the paired-controller whitelist hits its cap of 8, the least recently used pair is evicted instead of merely the oldest one; actively used pairs are never dropped.
+- Fullscreen guard: while a fullscreen app (game/video) is foreground on this machine, edge crossing is paused so a stray mouse push never yanks you out mid-game. On by default; toggle in Settings.
+- File clipboard: copy files with Ctrl+C on one machine and press Ctrl+V on the other to paste them. Received files land in Downloads\MyKVM Transfers\Clipboard and the local clipboard points at them automatically. Total size per copy is capped at 24 MB. Requires both sides on this version or newer.
+- Clipboard history: the last 20 synced clipboards (text and file lists, ~64 MB budget) are kept per machine. Press Ctrl+Shift+V anywhere to open a picker and restore an earlier entry to the local clipboard, which syncs it to the other side like any other copy.
+- File transfers can be cancelled: the progress toast gets a Cancel button that stops the sender right away instead of waiting for the file to finish.
+- Interrupted file transfers resume: if a transfer is cut off (sleep, app restart, network drop), the receiver keeps the partial file and the next attempt of the same file (same name and size) continues from where it stopped instead of restarting. The finish-time SHA-256 still verifies the complete file.
+- Edge-dragged files between two Windows machines now land in Downloads\MyKVM Transfers instead of a hidden staging folder.
+
+### Fixed
+
+- Startup wiring (discovery signing key, file-clipboard landing directory) could be silently skipped when a second `.setup()` registration replaced the first — received file-clipboard payloads then failed with "landing directory is not configured". Both wirings now live in the single setup hook and are logged at startup.
+- Keyboard shortcuts pressed while typing fast no longer break: key events that ride the same datagram are now tracked on the controlled machine's held-state ledger, so an IME chord like Alt+Q (WeChat voice input) is no longer released the instant it is injected.
+- After a restart the two machines sync their key/mouse readiness right away: a peer coming online refreshes the controlling machine's target list immediately instead of waiting for the next announce cycle, so crossing works without clicking around or re-pairing. Re-pairing a machine that is already auto-paired no longer waits for a confirmation code that never comes ("no pairing challenge received").
+- Peer mode: screens of a newly paired machine are now placed to the right of the local screens instead of on top of them, so both directions of crossing work right after pairing instead of only one.
+- Corner guard fixes: changing the guard size in Settings no longer freezes the spinner or restarts input on both machines, and the guard now also protects the return path (B → A) instead of only the forward one.
+- Deliberately skipped low-level hook events no longer look like a dead hook, so the input hooks are no longer torn down and reinstalled dozens of times during a normal remote session.
+
+- Open pairing: devices discovered on the same LAN are paired automatically — no confirmation code. Trust is anchored on each device's certificate (whitelist-first authorization, the shared pair secret stays as a legacy fallback); a new "LAN Auto-Pairing" toggle in Settings switches back to the confirmation-code flow, and the cap on paired controllers is 8.
+- Wake-on-LAN: devices now advertise their NIC MAC, and each device in the Devices tab gets a Wake button that wakes a sleeping machine.
+- Optional screen lock on leave (off by default): when you slide control onto another machine, this machine locks itself — privacy for shared spaces.
+- Discovery packets are now signed (HMAC-SHA256 bound to the sender's identity), so a forged announce claiming a trusted device is dropped. Unsigned packets from older peers are still accepted.
+- Keyboard batching: key events that queue while a datagram is in flight ride the next one, cutting packet rate for fast typists and auto-repeat without added latency (batches flush within 12 ms).
+
+- Corner guard: the cursor no longer crosses to another machine when a push starts inside a dead zone around the local screen's four corners — clicking a window's close button or the Start menu can no longer throw your cursor onto the other screen. On by default (32 px zones); adjust the zone size or turn it off in Settings. Sliding along the edge out of the corner crosses normally, and screen-switch hotkeys are unaffected.
+- Peer mode: two machines can control each other. Pick "Peer" during setup (or switch work modes in Settings), pair the two machines once, and each side can slide its mouse and keyboard onto the other's screens — and receive the other's input too. While one side is driving, local input stays local and any in-flight control session hands over, so the two directions never fight. Screen-switch hotkeys and the lock-screen input service work in peer mode as well. Requires both sides on this version or newer.
 - Manually added peers keep their selected connection IP, including after pairing, rediscovery, and address changes (#26).
 - Drag-and-drop files across machines (ShareMouse-style, experimental): drag files on the machine that owns the keyboard and mouse onto a controlled machine. Controlling Windows → Mac: drag files toward the screen edge that borders the Mac — a document icon follows the cursor onto the Mac, and releasing over an open Finder folder drops the files there (otherwise the Desktop). Controlling Mac → Windows client is also in. Requires file transfer to be enabled in Settings, and both sides on this version or newer.
 - Drag files the other way too — from a controlled machine back to the controller. While controlling a Mac from Windows, grab a file on the Mac and drag it back across the edge onto Windows: it becomes a real native drag on Windows that you can drop into any folder, app, or field. Requires both sides on this version or newer.
@@ -39,6 +69,8 @@ release will reuse them).
 - Updates: a stalled update check gives up after 20 seconds with a clear message, and .deb/.rpm installs are offered their own update package instead of the AppImage.
 - Background input: blocking clipboard/file handlers no longer occupy QUIC workers; reconnecting input stays local until the transport is ready and retries with full pairing credentials.
 - Clipboard images are encoded once, so a 4K screenshot fits the stream limit. Unchanged clipboard contents use the OS change counter instead of repeatedly reading and encoding the image.
+- Clipboard image sync compresses screenshots as PNG on the wire when that is smaller — a 4K screenshot drops from ~33 MB to a few hundred KB per copy. Older peers ignore the new format, so a mixed-version pair just pauses image sync until both sides update.
+- File transfers are now resilient and verified: each packet is retried a few times before giving up (one lost acknowledgement no longer aborts a multi-GB transfer), and the receiver checks a SHA-256 of the whole file when it finishes, dropping a corrupt transfer instead of landing a broken file. Checksum verification needs both sides on this version or newer.
 - macOS: display changes refresh both saved placement and native input coordinates. Same-resolution displays keep separate placements, and active sharing stays responsive to input while the window is hidden, including receive-only mode.
 - Windows input service: installation/repair configures automatic recovery after failures; status files are refreshed at most once per second unless state changes, and new input is skipped if attaching the current desktop fails.
 - LAN discovery cannot replace a paired device's transport certificate; an identity change now requires re-pairing.

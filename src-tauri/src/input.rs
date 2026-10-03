@@ -195,6 +195,58 @@ static MACOS_ACCESSIBILITY_PROMPTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_INPUT_DESKTOP_DEFAULT_CACHE: AtomicBool = AtomicBool::new(true);
 
+// Peer-mode direction arbitration: timestamp (ms) of the last authorized
+// remote input this machine injected. While that stamp is recent, the peer's
+// controller owns this machine's cursor — the local capture must not start a
+// crossing, keep forwarding, or otherwise fight the injection, and the arrival
+// of remote input hands any in-flight local control session back to local.
+static LAST_CONTROLLED_MS: AtomicU64 = AtomicU64::new(0);
+const CONTROLLED_ACTIVE_WINDOW_MS: u64 = 1500;
+
+fn mark_controlled_activity() {
+    LAST_CONTROLLED_MS.store(crate::now_ms(), Ordering::Relaxed);
+}
+
+fn controlled_active() -> bool {
+    crate::now_ms()
+        .saturating_sub(LAST_CONTROLLED_MS.load(Ordering::Relaxed))
+        < CONTROLLED_ACTIVE_WINDOW_MS
+}
+
+// Fullscreen guard (Windows): while a fullscreen app (game/video) is the
+// foreground window on this machine, edge crossings are paused — accidental
+// crossings are especially disruptive mid-game. Polled every
+// FULLSCREEN_GUARD_POLL_MS by the capture loop; read per crossing attempt.
+static FULLSCREEN_CROSSING_PAUSED: AtomicBool = AtomicBool::new(false);
+
+// 200ms keeps the window between a game entering fullscreen and the pause
+// taking effect well under a third of a second, at negligible CPU cost
+// (GetForegroundWindow + GetWindowRect + one monitor query per poll).
+const FULLSCREEN_GUARD_POLL_MS: u64 = 200;
+
+fn fullscreen_crossing_paused() -> bool {
+    FULLSCREEN_CROSSING_PAUSED.load(Ordering::Relaxed)
+}
+
+/// Pure fullscreen-rect test: the window rect must cover the monitor rect
+/// within a small tolerance (some fullscreen windows are 1px off).
+fn rect_covers_monitor(
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    monitor_left: f64,
+    monitor_top: f64,
+    monitor_right: f64,
+    monitor_bottom: f64,
+) -> bool {
+    const TOLERANCE: f64 = 2.0;
+    left <= monitor_left + TOLERANCE
+        && top <= monitor_top + TOLERANCE
+        && right >= monitor_right - TOLERANCE
+        && bottom >= monitor_bottom - TOLERANCE
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Edge {
     Left,
@@ -251,6 +303,10 @@ fn str_ref_is_empty(value: &&str) -> bool {
     value.is_empty()
 }
 
+fn input_event_slice_is_empty(value: &&[InputEvent]) -> bool {
+    value.is_empty()
+}
+
 /// Borrowing serialization mirror of [`InputPacket`]: identical named
 /// MessagePack bytes when every field is populated (guarded by a test), but
 /// building one clones none of the ~0.8KB of credential strings — send_packet
@@ -273,6 +329,11 @@ struct InputPacketRef<'a> {
     #[serde(skip_serializing_if = "str_ref_is_empty")]
     pair_secret: &'a str,
     event: &'a InputEvent,
+    // The wire format skips an EMPTY batch (older peers have none), but the
+    // mirror must still encode the same bytes when a batch exists — the
+    // round-trip test pins this.
+    #[serde(skip_serializing_if = "input_event_slice_is_empty")]
+    events: &'a [InputEvent],
     #[serde(skip_serializing_if = "Option::is_none")]
     held: Option<&'a HeldInputs>,
 }
@@ -296,6 +357,11 @@ struct InputPacket {
     #[serde(default)]
     pair_secret: String,
     event: InputEvent,
+    // Batched additional events (typed key presses arrive faster than the
+    // capture loop's send cadence). Processed strictly after `event`, in
+    // order, so down/up pairs stay intact. Older peers send none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    events: Vec<InputEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     held: Option<HeldInputs>,
 }
@@ -332,6 +398,7 @@ const ALL_MOUSE_BUTTONS: [MouseButton; 5] = [
 ];
 
 /// Controller side: what the controlled machine should currently hold.
+#[derive(Default)]
 struct SenderHeld {
     held: HeldInputs,
     last_attached: Option<Instant>,
@@ -368,6 +435,32 @@ impl SenderHeld {
     fn due(&self, now: Instant) -> bool {
         self.last_attached
             .is_none_or(|last| now.saturating_duration_since(last) >= HELD_REFRESH)
+    }
+
+    /// Track the packet's head event plus every batched event, and return the
+    /// held snapshot to attach to this packet: the final state whenever ANY
+    /// event changed it (so the receiver's reconciliation never releases a key
+    /// this very packet injected — an Alt+Q chord whose Q rides the batch must
+    /// not be reconciled away), otherwise the 250ms heartbeat cadence.
+    fn track_all(
+        &mut self,
+        head: &InputEvent,
+        batched: &[InputEvent],
+        now: Instant,
+    ) -> Option<HeldInputs> {
+        let before = self.held.clone();
+        self.track(head, now);
+        for event in batched {
+            self.track(event, now);
+        }
+        if self.held != before {
+            self.last_attached = Some(now);
+            return Some(self.held.clone());
+        }
+        self.due(now).then(|| {
+            self.last_attached = Some(now);
+            self.held.clone()
+        })
     }
 }
 
@@ -567,7 +660,7 @@ fn screen_switch_hotkey_matches_vk(
     let Ok(layout) = layout_state.try_lock() else {
         return false;
     };
-    if layout.machine_role != "server" {
+    if layout.machine_role != "server" && layout.machine_role != "peer" {
         return false;
     }
 
@@ -1041,10 +1134,17 @@ fn start_platform_capture(
     thread::spawn(move || {
         let display_snapshots = mac_display_snapshots();
         enable_macos_background_cursor_hide();
+        // Snapshot the corner-guard setting once; changes restart the input
+        // runtime (runtime_relevant_layout_changed) so no live re-read needed.
+        let corner_guard_size = layout_state
+            .lock()
+            .map(|layout| effective_corner_guard_size(&layout))
+            .unwrap_or(0);
         let context = Arc::new(MacCaptureContext {
             quic_transport,
             layout_state,
             native_layout,
+            corner_guard_size,
             active: Mutex::new(None),
             remote_active,
             main_window_visible,
@@ -1165,6 +1265,55 @@ fn start_platform_capture(
                 false,
             );
             drain_switch_request_macos(&context);
+            // Deliver key events queued while the last datagram was in flight.
+            {
+                let flush_batch = |device_id: String, events: Vec<InputEvent>| {
+                    let Some(first) = events.first() else {
+                        return true;
+                    };
+                    let Some(target) = context
+                        .active
+                        .lock()
+                        .ok()
+                        .and_then(|active| active.as_ref().map(|active| active.target.clone()))
+                    else {
+                        return false;
+                    };
+                    let _ = device_id;
+                    send_packet_batched(
+                        &context.quic_transport,
+                        &target,
+                        first.clone(),
+                        events.into_iter().skip(1).collect(),
+                        &context.layout_state,
+                        &context.input_events,
+                    )
+                };
+                let send_one = |event: InputEvent| {
+                    let Some(target) = context
+                        .active
+                        .lock()
+                        .ok()
+                        .and_then(|active| active.as_ref().map(|active| active.target.clone()))
+                    else {
+                        return false;
+                    };
+                    send_packet(
+                        &context.quic_transport,
+                        &target,
+                        event,
+                        &context.layout_state,
+                        &context.input_events,
+                    )
+                };
+                flush_key_batch(&flush_batch, &send_one);
+            }
+            // Peer arbitration: remote input arriving while the local user was
+            // mid-control ends that control session promptly (the per-event
+            // gate alone would wait for the user to touch an input).
+            if controlled_active() {
+                release_in_flight_local_control_macos(&context);
+            }
             // macOS disables a tap whose callback ran too long or that idled out.
             // Without re-enabling it the mouse and keyboard silently freeze until
             // the app restarts, which is the classic "works, then sticks after a
@@ -1263,10 +1412,17 @@ fn start_platform_capture(
 
     thread::spawn(move || {
         refresh_windows_input_desktop_cache();
+        // Snapshot the corner-guard setting once; changes restart the input
+        // runtime (runtime_relevant_layout_changed) so no live re-read needed.
+        let corner_guard_size = layout_state
+            .lock()
+            .map(|layout| effective_corner_guard_size(&layout))
+            .unwrap_or(0);
         let context = Arc::new(WindowsCaptureContext {
             quic_transport,
             layout_state,
             native_layout,
+            corner_guard_size,
             active: Mutex::new(None),
             remote_active,
             main_window_focused,
@@ -1375,7 +1531,68 @@ fn start_platform_capture(
                     release_windows_remote_control(&context, true);
                 }
             }
+            // Fullscreen guard: poll at most every FULLSCREEN_GUARD_POLL_MS
+            // (also reads the user's toggle, so settings apply without a
+            // restart).
+            update_fullscreen_guard(&context.layout_state);
             drain_switch_request_windows(&context);
+            // Peer arbitration: remote input arriving while the local user was
+            // mid-control ends that control session promptly (the per-event
+            // hook gate alone would wait for the user to touch an input).
+            if controlled_active() {
+                if context
+                    .active
+                    .lock()
+                    .map(|active| active.is_some())
+                    .unwrap_or(false)
+                {
+                    release_windows_remote_control(&context, false);
+                }
+            }
+            // Deliver any key events that queued while the last datagram was
+            // in flight (keyboard batching).
+            {
+                let flush_batch = |device_id: String, events: Vec<InputEvent>| {
+                    let Some(first) = events.first() else {
+                        return true;
+                    };
+                    let Some(target) = context
+                        .active
+                        .lock()
+                        .ok()
+                        .and_then(|active| active.as_ref().map(|active| active.target.clone()))
+                    else {
+                        return false;
+                    };
+                    let _ = device_id;
+                    send_packet_batched(
+                        &context.quic_transport,
+                        &target,
+                        first.clone(),
+                        events.into_iter().skip(1).collect(),
+                        &context.layout_state,
+                        &context.input_events,
+                    )
+                };
+                let send_one = |event: InputEvent| {
+                    let Some(target) = context
+                        .active
+                        .lock()
+                        .ok()
+                        .and_then(|active| active.as_ref().map(|active| active.target.clone()))
+                    else {
+                        return false;
+                    };
+                    send_packet(
+                        &context.quic_transport,
+                        &target,
+                        event,
+                        &context.layout_state,
+                        &context.input_events,
+                    )
+                };
+                flush_key_batch(&flush_batch, &send_one);
+            }
             if context.remote_active.load(Ordering::Relaxed) {
                 flush_pending_mouse_move(
                     &context.move_pending,
@@ -1617,7 +1834,7 @@ fn current_input_targets(
 /// Drops the cached target list so the next event rebuilds it — called when
 /// capture starts, so a fresh session can never act on the previous
 /// session's pairing context.
-fn invalidate_input_targets_cache() {
+pub(crate) fn invalidate_input_targets_cache() {
     if let Ok(mut cache) = INPUT_TARGETS_CACHE.lock() {
         *cache = None;
     }
@@ -1714,6 +1931,178 @@ fn input_send_failure_persistent(failing_since: &AtomicU64, now: u64) -> bool {
     }
 }
 
+// --- keyboard batching -----------------------------------------------------
+// Key events arrive far faster than one-datagram-per-event needs: a fast
+// typist hits 15-30 events/sec and auto-repeat more. Key events carry no
+// positional state (unlike mouse moves), so a small window of them can share
+// one datagram without hurting latency. The per-capture-context queue is
+// flushed by the capture loop each tick and drained on return-to-local.
+const KEY_BATCH_MAX: usize = 16;
+const KEY_BATCH_MAX_AGE_MS: u64 = 12;
+
+#[derive(Default)]
+struct KeyBatch {
+    target_device_id: String,
+    events: Vec<InputEvent>,
+    first_at: Option<Instant>,
+}
+
+static KEY_BATCH: Mutex<KeyBatch> = Mutex::new(KeyBatch {
+    target_device_id: String::new(),
+    events: Vec::new(),
+    first_at: None,
+});
+
+/// Queue a key event for batched sending. `flush` sends queued events as one
+/// batched datagram (plus the regular single-event path for target switches).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn queue_key_event(
+    target_device_id: &str,
+    event: InputEvent,
+    flush: &dyn Fn(String, Vec<InputEvent>) -> bool,
+    send_one: &dyn Fn(InputEvent) -> bool,
+) -> bool {
+    if let Ok(mut batch) = KEY_BATCH.lock() {
+        if !batch.events.is_empty()
+            && (batch.target_device_id != target_device_id
+                || batch.events.len() >= KEY_BATCH_MAX)
+        {
+            let device_id = std::mem::take(&mut batch.target_device_id);
+            let events = std::mem::take(&mut batch.events);
+            batch.first_at = None;
+            flush(device_id, events);
+        }
+        batch.target_device_id = target_device_id.to_string();
+        batch.first_at.get_or_insert_with(Instant::now);
+        batch.events.push(event);
+        return true;
+    }
+    send_one(event)
+}
+
+/// Send any queued key events as one batched datagram (called from the
+/// capture loop each tick and on control hand-back). A single queued event
+/// still rides the regular single-event path. Returns true when nothing is
+/// left queued.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn flush_key_batch(
+    flush: &dyn Fn(String, Vec<InputEvent>) -> bool,
+    send_one: &dyn Fn(InputEvent) -> bool,
+) -> bool {
+    let Ok(mut batch) = KEY_BATCH.lock() else {
+        return true;
+    };
+    let due = batch
+        .first_at
+        .map(|at| at.elapsed() >= Duration::from_millis(KEY_BATCH_MAX_AGE_MS))
+        .unwrap_or(false);
+    if batch.events.is_empty() || (!due && batch.events.len() < KEY_BATCH_MAX) {
+        return true;
+    }
+    let device_id = std::mem::take(&mut batch.target_device_id);
+    let events = std::mem::take(&mut batch.events);
+    batch.first_at = None;
+    if events.len() == 1 {
+        send_one(events.into_iter().next().expect("one event"))
+    } else {
+        flush(device_id, events)
+    }
+}
+
+/// Windows: is the foreground window a fullscreen app (covers its entire
+/// monitor, excluding the desktop shell)? Cheap UI queries, run at most every
+/// FULLSCREEN_GUARD_POLL_MS by the capture loop.
+#[cfg(target_os = "windows")]
+fn foreground_is_fullscreen() -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetShellWindow, GetWindowRect,
+    };
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() || hwnd == unsafe { GetShellWindow() } {
+        return false;
+    }
+
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return false;
+    }
+
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_null() {
+        return false;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return false;
+    }
+
+    rect_covers_monitor(
+        rect.left as f64,
+        rect.top as f64,
+        rect.right as f64,
+        rect.bottom as f64,
+        info.rcMonitor.left as f64,
+        info.rcMonitor.top as f64,
+        info.rcMonitor.right as f64,
+        info.rcMonitor.bottom as f64,
+    )
+}
+
+/// Poll the fullscreen state and reconcile the pause flag with the user's
+/// setting. Called from the capture loop every FULLSCREEN_GUARD_POLL_MS
+/// (Windows loop; macOS calls it from the tap callback before crossings).
+fn update_fullscreen_guard(layout_state: &Arc<Mutex<LayoutState>>) {
+    static LAST_POLL: Mutex<Option<Instant>> = Mutex::new(None);
+    let due = LAST_POLL
+        .lock()
+        .map(|mut last| {
+            let due = last
+                .map(|at| at.elapsed() >= Duration::from_millis(FULLSCREEN_GUARD_POLL_MS))
+                .unwrap_or(true);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        })
+        .unwrap_or(false);
+    if !due {
+        return;
+    }
+
+    let enabled = layout_state
+        .try_lock()
+        .map(|layout| layout.fullscreen_guard)
+        .unwrap_or(true);
+    let detected = enabled && foreground_is_fullscreen();
+    let previous = FULLSCREEN_CROSSING_PAUSED.swap(detected, Ordering::Relaxed);
+    if detected && !previous {
+        log::info!("fullscreen app is foreground; edge crossing paused");
+    } else if !detected && previous {
+        log::info!("fullscreen app gone; edge crossing resumed");
+    }
+}
+
+/// macOS: the CoreGraphics window-list scan in `macos_appkit` (raw FFI; any
+/// failure answers false, so the guard then just stays inactive).
+#[cfg(target_os = "macos")]
+fn foreground_is_fullscreen() -> bool {
+    macos_appkit::foreground_is_fullscreen()
+}
+
+/// Linux: no input backend yet, so the fullscreen guard has nothing to pause.
+#[cfg(target_os = "linux")]
+fn foreground_is_fullscreen() -> bool {
+    false
+}
+
 fn send_packet(
     quic_transport: &quic_transport::TransportHandle,
     target: &InputTarget,
@@ -1721,11 +2110,26 @@ fn send_packet(
     layout_state: &Arc<Mutex<LayoutState>>,
     input_events: &Arc<AtomicU64>,
 ) -> bool {
+    send_packet_batched(quic_transport, target, event, Vec::new(), layout_state, input_events)
+}
+
+/// Core send path. `batched` events ride the same datagram AFTER `event`, in
+/// order — used to coalesce key events that queued while the last datagram was
+/// in flight. The receiver processes them in wire order so down/up pairs stay
+/// intact.
+fn send_packet_batched(
+    quic_transport: &quic_transport::TransportHandle,
+    target: &InputTarget,
+    event: InputEvent,
+    batched: Vec<InputEvent>,
+    layout_state: &Arc<Mutex<LayoutState>>,
+    input_events: &Arc<AtomicU64>,
+) -> bool {
     let mut packet_context = input_packet_context(target, event);
     let held = SENDER_HELD
         .lock()
         .ok()
-        .and_then(|mut state| state.track(&packet_context.event, Instant::now()));
+        .and_then(|mut state| state.track_all(&packet_context.event, &batched, Instant::now()));
     let Some(peer) = packet_context.peer.take() else {
         return false;
     };
@@ -1761,6 +2165,7 @@ fn send_packet(
             ""
         },
         event: &packet_context.event,
+        events: &batched,
         held: held.as_ref(),
     };
 
@@ -1957,6 +2362,11 @@ fn mark_target_offline(
     }
 
     device.online = false;
+    invalidate_input_targets_cache();
+    log::info!(
+        "device {} marked offline after send failure ({_reason}); waiting for its announce to recover",
+        device.id
+    );
 }
 
 /// Handles one received input-plane datagram end to end. Structured for the
@@ -2006,6 +2416,11 @@ pub(crate) fn handle_input_datagram_with_sink(
             return false;
         }
         let held = packet.held.take();
+        // The packet's own event plus any batched ones, in wire order, so
+        // down/up pairs inside a batch stay intact.
+        let mut events = std::mem::take(&mut packet.events);
+        events.insert(0, packet.event.clone());
+        let event_count = events.len();
         let position_before = REMOTE_MOUSE_POSITION.load(Ordering::Relaxed);
         // Steady-state datagrams omit the pairing block (it rides ~once per
         // INPUT_FULL_CRED_REFRESH). A credentialled packet is authorized in
@@ -2013,7 +2428,7 @@ pub(crate) fn handle_input_datagram_with_sink(
         // admitted only while that authorization is still fresh, so a peer that
         // never proved the pairing secret from this address can never inject.
         let carries_credentials = !packet.pair_secret.trim().is_empty();
-        let command = {
+        let commands = {
             let Ok(layout) = layout_state.lock() else {
                 return false;
             };
@@ -2036,22 +2451,36 @@ pub(crate) fn handle_input_datagram_with_sink(
             let Ok(native_layout) = native_layout.lock() else {
                 return false;
             };
-            input_event_to_command(&layout, &native_layout, packet.event)
+            events
+                .iter()
+                .map(|event| input_event_to_command(&layout, &native_layout, event.clone()))
+                .collect::<Vec<_>>()
         };
-        let Some(command) = command else {
+        if commands.iter().all(|command| command.is_none()) {
             return true;
-        };
-        if let Ok(mut state) = RECEIVED_HELD.lock() {
-            state.track(&command, Instant::now());
         }
-        // An idle controller's heartbeat re-sends the current position; don't
-        // inject a move that goes nowhere.
-        let heartbeat_repeat = held.is_some()
-            && matches!(command, InputCommand::MouseMove { x, y, .. }
-                if pack_remote_position(x, y) == position_before);
-        if !heartbeat_repeat && sink(command) {
-            input_events.fetch_add(1, Ordering::Relaxed);
+        // Authorized remote input just drove (or is about to drive) this
+        // machine: extend the "being controlled" window that peer-mode
+        // arbitration and the local capture gates read.
+        mark_controlled_activity();
+        let mut injected = 0_usize;
+        for command in commands.into_iter().flatten() {
+            if let Ok(mut state) = RECEIVED_HELD.lock() {
+                state.track(&command, Instant::now());
+            }
+            // An idle controller's heartbeat re-sends the current position; don't
+            // inject a move that goes nowhere. Only the packet's own event can
+            // be a heartbeat (batched events are never position repeats).
+            let heartbeat_repeat = held.is_some()
+                && injected == 0
+                && matches!(command, InputCommand::MouseMove { x, y, .. }
+                    if pack_remote_position(x, y) == position_before);
+            if !heartbeat_repeat && sink(command) {
+                input_events.fetch_add(1, Ordering::Relaxed);
+            }
+            injected += 1;
         }
+        debug_assert!(injected <= event_count.max(1));
         if let Some(held) = held {
             reconcile_received_held(&held, sink);
         }
@@ -2205,15 +2634,25 @@ fn packet_authorized_fields(
     if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
         return false;
     }
-    if cluster_id != layout.cluster_id || pair_secret != layout.pair_secret {
+    if cluster_id != layout.cluster_id {
         return false;
     }
 
-    if layout.paired_controllers.iter().any(|controller| {
+    // The paired-controller whitelist (anchored on the stable transport public
+    // key) is the primary trust anchor for open pairing, where auto-paired
+    // peers never learn each other's secret. The shared pair secret remains as
+    // a fallback for peers paired through the confirmation-code flow.
+    let matched_controller = layout.paired_controllers.iter().find(|controller| {
         (!origin_transport_public_key.trim().is_empty()
             && controller.transport_public_key == origin_transport_public_key)
             || (!origin_device_id.trim().is_empty() && controller.id == origin_device_id)
-    }) {
+    });
+    if let Some(controller) = matched_controller {
+        // LRU bookkeeping for the whitelist cap: authorization is a use.
+        crate::touch_paired_controller_usage(&controller.transport_public_key, &controller.id);
+        return true;
+    }
+    if !pair_secret.trim().is_empty() && pair_secret == layout.pair_secret {
         return true;
     }
 
@@ -2764,6 +3203,9 @@ struct MacCaptureContext {
     quic_transport: quic_transport::TransportHandle,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    // Corner-guard dead-zone size in px (0 = disabled), snapshotted from the
+    // layout when capture starts.
+    corner_guard_size: u32,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
     main_window_visible: Arc<AtomicBool>,
@@ -2954,6 +3396,9 @@ struct WindowsCaptureContext {
     quic_transport: quic_transport::TransportHandle,
     layout_state: Arc<Mutex<LayoutState>>,
     native_layout: LayoutState,
+    // Corner-guard dead-zone size in px (0 = disabled), snapshotted from the
+    // layout when capture starts.
+    corner_guard_size: u32,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
     main_window_focused: Arc<AtomicBool>,
@@ -3289,9 +3734,9 @@ fn windows_hooks_look_removed() -> bool {
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-        WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
-        WM_XBUTTONUP,
+        CallNextHookEx, LLMHF_INJECTED, MSLLHOOKSTRUCT, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+        WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     };
 
     if code < 0 {
@@ -3308,6 +3753,26 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
 
     let event = unsafe { *(lparam as *const MSLLHOOKSTRUCT) };
     LAST_HOOK_EVENT_TICK.store(event.time, Ordering::Relaxed);
+    // Injected events (remote input this machine is receiving, our own
+    // synthetic cursor parks) pass straight through: never re-captured, never
+    // re-forwarded — that would echo the remote stream back to its sender.
+    if event.flags & LLMHF_INJECTED != 0 {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    // Peer arbitration: while a controller is actively driving this machine,
+    // physical local input stays local (and any in-flight local control
+    // session is handed back) instead of fighting the injected stream.
+    if controlled_active() {
+        if context
+            .active
+            .lock()
+            .map(|active| active.is_some())
+            .unwrap_or(false)
+        {
+            release_windows_remote_control(&context, false);
+        }
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
     let message = wparam as u32;
     let handled = match message {
         WM_MOUSEMOVE => handle_windows_mouse_move(&context, event.pt.x as f64, event.pt.y as f64),
@@ -3332,7 +3797,8 @@ unsafe extern "system" fn windows_mouse_proc(code: i32, wparam: usize, lparam: i
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam: isize) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        CallNextHookEx, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP,
     };
 
     if code < 0 {
@@ -3349,6 +3815,35 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
 
     let message = wparam as u32;
 
+    // Read the event and record its tick BEFORE any early return: the tick is
+    // how `windows_hooks_look_removed` distinguishes "hook removed" from
+    // "event deliberately passed through". Injected events and peer-arbitrated
+    // events prove the hook chain is alive just as much as forwarded ones —
+    // skipping the store here made pure-keyboard remote control false-positive
+    // the removal check every 2 seconds (release + unhook/reinstall storm).
+    let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
+    LAST_HOOK_EVENT_TICK.store(event.time, Ordering::Relaxed);
+
+    // Injected keys pass through (see the mouse hook note): the remote stream
+    // this machine is receiving must never be re-captured and forwarded.
+    if event.flags & LLKHF_INJECTED != 0 {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
+    // Peer arbitration: while a controller is actively driving this machine,
+    // physical local input stays local and any in-flight control session ends.
+    if controlled_active() {
+        if context
+            .active
+            .lock()
+            .map(|active| active.is_some())
+            .unwrap_or(false)
+        {
+            release_windows_remote_control(&context, false);
+        }
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+
     let active = context
         .active
         .lock()
@@ -3359,8 +3854,6 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
     };
 
     if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
-        let event = unsafe { *(lparam as *const KBDLLHOOKSTRUCT) };
-        LAST_HOOK_EVENT_TICK.store(event.time, Ordering::Relaxed);
         let key_code = event.vkCode as u16;
         let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
         if down && windows_event_matches_screen_switch_hotkey(&context, key_code) {
@@ -3368,13 +3861,44 @@ unsafe extern "system" fn windows_keyboard_proc(code: i32, wparam: usize, lparam
             release_windows_remote_control(&context, false);
             return 1;
         }
-        if send_packet(
-            &context.quic_transport,
-            &target,
+        let send_key = |event: InputEvent| {
+            send_packet(
+                &context.quic_transport,
+                &target,
+                event,
+                &context.layout_state,
+                &context.input_events,
+            )
+        };
+        let flush_batch = |device_id: String, events: Vec<InputEvent>| {
+            let Some(first) = events.first() else {
+                return true;
+            };
+            let Some(target) = context
+                .active
+                .lock()
+                .ok()
+                .and_then(|active| active.as_ref().map(|active| active.target.clone()))
+            else {
+                return false;
+            };
+            let _ = device_id;
+            send_packet_batched(
+                &context.quic_transport,
+                &target,
+                first.clone(),
+                events.into_iter().skip(1).collect(),
+                &context.layout_state,
+                &context.input_events,
+            )
+        };
+        let sent = queue_key_event(
+            &target.device_id,
             InputEvent::Key { key_code, down },
-            &context.layout_state,
-            &context.input_events,
-        ) {
+            &flush_batch,
+            &send_key,
+        );
+        if sent {
             track_forwarded_key(&context.pressed_keys, key_code, down);
         } else {
             return_to_local_after_send_failure_windows(&context, "key");
@@ -3474,6 +3998,7 @@ fn release_windows_remote_control(context: &WindowsCaptureContext, clear_clipboa
         .and_then(|mut active| active.take().map(|active| active.target));
 
     if let Some(target) = target {
+        log::info!("control session ended (was controlling device {})", target.device_id);
         release_forwarded_keys_windows(context, &target);
         release_remote_buttons(
             &context.quic_transport,
@@ -3564,7 +4089,7 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     // to cross so the cursor slides onto the controlled machine. Activate the
     // target we parked when we armed the catcher.
     if active.is_none() {
-        if let Some(device_id) = crate::windows_drop_catcher::take_handoff() {
+        if crate::windows_drop_catcher::take_handoff().is_some() {
             let pending = context
                 .pending_drag_cross
                 .lock()
@@ -3737,7 +4262,19 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
     }
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
-    if let Some(active_target) = crossing_target(&targets, x, y, dx, dy) {
+    // Read the corner-guard size live (settings apply instantly, no runtime
+    // restart); fall back to the startup snapshot while the lock is contended.
+    let corner_guard_size = context
+        .layout_state
+        .try_lock()
+        .map(|layout| effective_corner_guard_size(&layout))
+        .unwrap_or(context.corner_guard_size);
+    // Fullscreen guard: a fullscreen app (game) on THIS machine pauses
+    // outgoing crossings — accidental crossings are most disruptive there.
+    if fullscreen_crossing_paused() {
+        return false;
+    }
+    if let Some(active_target) = crossing_target(corner_guard_size, &targets, x, y, dx, dy) {
         let anchor = local_anchor_point(&active_target);
 
         // A left-button file drag reaching the edge: do NOT cross yet. Crossing
@@ -3794,15 +4331,95 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             &active_target,
             &context.layout_state,
         );
+        log::info!(
+            "control session started -> device {} (edge {:?})",
+            active_target.target.device_id,
+            active_target.target.edge
+        );
         *active = Some(active_target);
         if let Ok(mut anchor_state) = context.anchor.lock() {
             *anchor_state = Some(anchor);
         }
         context.just_crossed.store(true, Ordering::Relaxed);
+        maybe_lock_on_leave(&context.layout_state);
         return true;
     }
 
     false
+}
+
+/// Lock this machine's screen when the user walks away with the cursor, if the
+/// opt-in setting is on. Called only after a successful LOCAL-initiated
+// crossing — never when being controlled, returning, or roaming remotely.
+#[cfg(target_os = "windows")]
+fn maybe_lock_on_leave(layout_state: &Arc<Mutex<LayoutState>>) {
+    let lock = layout_state
+        .try_lock()
+        .map(|layout| layout.lock_on_leave)
+        .unwrap_or(false);
+    if !lock {
+        return;
+    }
+    // Small delay so the send thread isn't competing with the lock transition.
+    thread::spawn(|| {
+        thread::sleep(Duration::from_millis(300));
+        unsafe {
+            let _ = windows_sys::Win32::System::Shutdown::LockWorkStation();
+        }
+    });
+}
+
+/// macOS lock screen via the system Ctrl+Cmd+Q chord, posted locally with our
+/// self-marker so the capture tap passes it through instead of forwarding it.
+#[cfg(target_os = "macos")]
+fn maybe_lock_on_leave(layout_state: &Arc<Mutex<LayoutState>>) {
+    use core_graphics::event::{
+        CGEvent, CGEventFlags, CGEventTapLocation, EventField,
+    };
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    let lock = layout_state
+        .try_lock()
+        .map(|layout| layout.lock_on_leave)
+        .unwrap_or(false);
+    if !lock {
+        return;
+    }
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        // Mac keycodes: Command=55, Control=59, Q=12. The chord is posted as
+        // explicit modifier/key events with the chord flags on every event.
+        let chord_flags = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagControl;
+        let sequence: [(u16, bool); 6] = [
+            (55, true),  // Command down
+            (59, true),  // Control down
+            (12, true),  // Q down
+            (12, false), // Q up
+            (59, false), // Control up
+            (55, false), // Command up
+        ];
+        for (mac_code, down) in sequence {
+            let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
+                log::warn!("lock-on-leave: failed to create CGEventSource");
+                return;
+            };
+            match CGEvent::new_keyboard_event(source, mac_code, down) {
+                Ok(event) => {
+                    event.set_flags(chord_flags);
+                    event.set_integer_value_field(
+                        EventField::EVENT_SOURCE_USER_DATA,
+                        MACOS_SELF_EVENT_MARKER,
+                    );
+                    event.post(CGEventTapLocation::HID);
+                }
+                Err(_) => {
+                    log::warn!("lock-on-leave: failed to build keyboard event {mac_code}");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Is the physical left mouse button currently held? Used to tell a file drag
@@ -4044,6 +4661,29 @@ fn send_macos_mouse_button(
     sent
 }
 
+/// Peer arbitration (macOS): hand any in-flight local control session back to
+/// local input because a controller just started (or is still) driving this
+/// Mac. Mirrors the capture-loop exit cleanup, without the final cursor state
+/// changes unless we were actually mid-control.
+#[cfg(target_os = "macos")]
+fn release_in_flight_local_control_macos(context: &MacCaptureContext) {
+    let released = {
+        let active = context.active.lock().ok().and_then(|mut active| active.take());
+        match active {
+            Some(active) => {
+                release_held_remote_inputs_macos(context, &active.target);
+                true
+            }
+            None => false,
+        }
+    };
+    if released {
+        set_macos_cursor_decoupled(false);
+        set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+        show_macos_cursor_if_needed(context);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn handle_macos_event(
     context: &MacCaptureContext,
@@ -4063,6 +4703,14 @@ fn handle_macos_event(
             "[diag] event tap disabled by {:?} — mouse/key events are now DROPPED until re-enabled",
             event_type
         );
+        return CallbackResult::Keep;
+    }
+
+    // Peer arbitration: while a controller is actively driving this Mac, its
+    // (self-marked) injected stream passes through untouched and the local
+    // capture never forwards or crosses into the peer.
+    if controlled_active() {
+        release_in_flight_local_control_macos(context);
         return CallbackResult::Keep;
     }
 
@@ -4179,12 +4827,42 @@ fn handle_macos_event(
             let mac_code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
             if let Some(key_code) = mac_key_to_windows_vk(mac_code) {
                 let down = matches!(event_type, CGEventType::KeyDown);
-                let sent = send_packet(
-                    &context.quic_transport,
-                    &target,
+                let send_key = |event: InputEvent| {
+                    send_packet(
+                        &context.quic_transport,
+                        &target,
+                        event,
+                        &context.layout_state,
+                        &context.input_events,
+                    )
+                };
+                let flush_batch = |device_id: String, events: Vec<InputEvent>| {
+                    let Some(first) = events.first() else {
+                        return true;
+                    };
+                    let Some(target) = context
+                        .active
+                        .lock()
+                        .ok()
+                        .and_then(|active| active.as_ref().map(|active| active.target.clone()))
+                    else {
+                        return false;
+                    };
+                    let _ = device_id;
+                    send_packet_batched(
+                        &context.quic_transport,
+                        &target,
+                        first.clone(),
+                        events.into_iter().skip(1).collect(),
+                        &context.layout_state,
+                        &context.input_events,
+                    )
+                };
+                let sent = queue_key_event(
+                    &target.device_id,
                     InputEvent::Key { key_code, down },
-                    &context.layout_state,
-                    &context.input_events,
+                    &flush_batch,
+                    &send_key,
                 );
                 if sent {
                     track_forwarded_key(&context.pressed_keys, key_code, down);
@@ -4394,7 +5072,23 @@ fn handle_macos_mouse_move(
             }
         }
     }
-    if let Some(active_target) = crossing_target(&targets, location.x, location.y, dx, dy) {
+    // Read the corner-guard size live (settings apply instantly, no runtime
+    // restart); fall back to the startup snapshot while the lock is contended.
+    let corner_guard_size = context
+        .layout_state
+        .try_lock()
+        .map(|layout| effective_corner_guard_size(&layout))
+        .unwrap_or(context.corner_guard_size);
+    // Fullscreen guard: a fullscreen app (game) on THIS machine pauses
+    // outgoing crossings, matching the Windows side. The detection is
+    // rate-limited inside update_fullscreen_guard.
+    update_fullscreen_guard(&context.layout_state);
+    if fullscreen_crossing_paused() {
+        return CallbackResult::Keep;
+    }
+    if let Some(active_target) =
+        crossing_target(corner_guard_size, &targets, location.x, location.y, dx, dy)
+    {
         let anchor = local_anchor_point(&active_target);
         dismiss_macos_dock_ui_if_up();
         // Hide BEFORE the anchor warp: when MyKVM is hidden/minimized it runs as a
@@ -4439,6 +5133,7 @@ fn handle_macos_mouse_move(
         }
         context.just_crossed.store(true, Ordering::Relaxed);
         context.local_left_held.store(left_drag, Ordering::Relaxed);
+        maybe_lock_on_leave(&context.layout_state);
         if left_drag {
             // The crossing happened mid-left-drag: if a drag session started
             // during this button hold and it carries files, arm an edge drop.
@@ -4932,6 +5627,175 @@ pub(crate) mod macos_appkit {
         paths
     }
 
+    // --- Fullscreen detection (CoreGraphics window list, raw FFI) ----------
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetActiveDisplayList(
+            max_displays: u32,
+            active_displays: *mut u32,
+            display_count: *mut u32,
+        ) -> i32;
+        fn CGDisplayBounds(display: u32) -> CGRect;
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> *const c_void;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+        fn CFDictionaryGetValueIfPresent(
+            dictionary: *const c_void,
+            key: *const c_void,
+            value: *mut *const c_void,
+        ) -> u8;
+        fn CFNumberGetValue(number: *const c_void, number_type: isize, value_ptr: *mut f64) -> u8;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
+    const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 16;
+    const K_CG_NULL_WINDOW_ID: u32 = 0;
+    const K_CF_NUMBER_FLOAT64_TYPE: isize = 6;
+
+    unsafe fn window_bounds_f64(bounds: *const c_void, field: &str) -> Option<f64> {
+        if bounds.is_null() {
+            return None;
+        }
+        let field_key = ns_string(field);
+        if field_key.is_null() {
+            return None;
+        }
+        let mut field_value: *const c_void = std::ptr::null();
+        if CFDictionaryGetValueIfPresent(bounds, field_key, &mut field_value) == 0
+            || field_value.is_null()
+        {
+            return None;
+        }
+        let mut out = 0_f64;
+        if CFNumberGetValue(field_value, K_CF_NUMBER_FLOAT64_TYPE, &mut out) == 0 {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// True when some on-screen, non-desktop, layer-0 window covers one of the
+    /// active displays (same ±2px tolerance as the Windows side). A true macOS
+    /// fullscreen window spans the entire display; an ordinary maximized window
+    /// leaves the menu bar visible, so it does not match. Every failure path
+    /// answers false — this only ever suppresses crossings, never causes them.
+    pub(crate) fn foreground_is_fullscreen() -> bool {
+        unsafe {
+            let _pool = PoolGuard(objc_autoreleasePoolPush());
+
+            // Active display bounds (covers multi-monitor layouts).
+            let mut display_ids = [0_u32; 8];
+            let mut display_count = 0_u32;
+            if CGGetActiveDisplayList(8, display_ids.as_mut_ptr(), &mut display_count) != 0
+                || display_count == 0
+            {
+                return false;
+            }
+            let displays: Vec<(f64, f64, f64, f64)> = display_ids[..display_count as usize]
+                .iter()
+                .map(|&display| {
+                    let bounds = CGDisplayBounds(display);
+                    (
+                        bounds.origin.x,
+                        bounds.origin.y,
+                        bounds.origin.x + bounds.size.width,
+                        bounds.origin.y + bounds.size.height,
+                    )
+                })
+                .collect();
+            if displays.is_empty() {
+                return false;
+            }
+
+            // On-screen windows, oldest backing first. Keys in the window-info
+            // dictionary are CFStrings; fresh NSString instances compare equal
+            // through CFEqual (toll-free bridging), so no exported constants
+            // are needed.
+            let windows = CGWindowListCopyWindowInfo(
+                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+                K_CG_NULL_WINDOW_ID,
+            );
+            if windows.is_null() {
+                return false;
+            }
+            let layer_key = ns_string("kCGWindowLayer");
+            let bounds_key = ns_string("kCGWindowBounds");
+            let count = CFArrayGetCount(windows);
+            let mut fullscreen = false;
+            for index in 0..count {
+                let window = CFArrayGetValueAtIndex(windows, index);
+                if window.is_null() || layer_key.is_null() || bounds_key.is_null() {
+                    continue;
+                }
+                let mut layer_value: *const c_void = std::ptr::null();
+                if CFDictionaryGetValueIfPresent(window, layer_key, &mut layer_value) == 0
+                    || layer_value.is_null()
+                {
+                    continue;
+                }
+                let mut layer = 1_f64;
+                if CFNumberGetValue(layer_value, K_CF_NUMBER_FLOAT64_TYPE, &mut layer) == 0
+                    || layer != 0.0
+                {
+                    continue;
+                }
+                let mut bounds_value: *const c_void = std::ptr::null();
+                if CFDictionaryGetValueIfPresent(window, bounds_key, &mut bounds_value) == 0 {
+                    continue;
+                }
+                let (Some(left), Some(top), Some(width), Some(height)) = (
+                    window_bounds_f64(bounds_value, "X"),
+                    window_bounds_f64(bounds_value, "Y"),
+                    window_bounds_f64(bounds_value, "Width"),
+                    window_bounds_f64(bounds_value, "Height"),
+                ) else {
+                    continue;
+                };
+                let (right, bottom) = (left + width, top + height);
+                if displays
+                    .iter()
+                    .any(|&(display_left, display_top, display_right, display_bottom)| {
+                        super::rect_covers_monitor(
+                            left,
+                            top,
+                            right,
+                            bottom,
+                            display_left,
+                            display_top,
+                            display_right,
+                            display_bottom,
+                        )
+                    })
+                {
+                    fullscreen = true;
+                    break;
+                }
+            }
+            CFRelease(windows);
+            fullscreen
+        }
+    }
+
     /// True while Mission Control, App Exposé, Launchpad or the Spaces strip is
     /// up: those are all Dock UI, and the Dock is only ever frontmost while one
     /// of them is showing.
@@ -4964,6 +5828,7 @@ pub(crate) mod macos_appkit {
 }
 
 fn crossing_target(
+    corner_guard_size: u32,
     targets: &[InputTarget],
     x: f64,
     y: f64,
@@ -4977,7 +5842,8 @@ fn crossing_target(
             // emits online + input-ready devices and the target cache
             // refreshes within INPUT_TARGETS_TTL, so the check only re-took
             // the layout lock per target per event to learn the same answer.
-            crossing_layout_point(target, x, y, dx, dy).map(|point| (target, point))
+            crossing_layout_point(target, corner_guard_size, x, y, dx, dy)
+                .map(|point| (target, point))
         })
         .map(|(target, (mapped_x, mapped_y))| {
             let entry_dx = dx * target.layout_local_screen.width.max(1) as f64
@@ -5017,12 +5883,21 @@ fn crossing_target(
 
 fn crossing_layout_point(
     target: &InputTarget,
+    corner_guard_size: u32,
     x: f64,
     y: f64,
     dx: f64,
     dy: f64,
 ) -> Option<(f64, f64)> {
-    if is_crossing_screen(&target.local_screen, target.edge, x, y, dx, dy) {
+    if is_crossing_screen(
+        &target.local_screen,
+        target.edge,
+        x,
+        y,
+        dx,
+        dy,
+        corner_guard_size,
+    ) {
         return Some(native_to_layout_point(target, x, y));
     }
 
@@ -5038,6 +5913,7 @@ fn crossing_layout_point(
         mapped.1,
         mapped_dx,
         mapped_dy,
+        corner_guard_size,
     ) {
         return Some(mapped);
     }
@@ -5057,7 +5933,72 @@ fn native_to_layout_point(target: &InputTarget, x: f64, y: f64) -> (f64, f64) {
     )
 }
 
-fn is_crossing_screen(screen: &Screen, edge: Edge, x: f64, y: f64, dx: f64, dy: f64) -> bool {
+/// Upper bound for the corner-guard dead zone (settings clamp to this too).
+pub(crate) const CORNER_GUARD_MAX_PX: u32 = 200;
+
+/// Corner-guard size actually in force for a capture session: 0 disables the
+/// guard entirely, otherwise the configured size clamped to the maximum.
+pub(crate) fn effective_corner_guard_size(layout: &LayoutState) -> u32 {
+    if layout.corner_guard {
+        layout.corner_guard_size.min(CORNER_GUARD_MAX_PX)
+    } else {
+        0
+    }
+}
+
+/// True when the cursor sits inside a corner dead-zone of the local screen for
+/// the edge being crossed: crossing a vertical edge (Left/Right) checks the
+/// cursor's distance to the top/bottom corners; crossing a horizontal edge
+/// (Top/Bottom) checks the distance to the left/right corners. The corner
+/// guard keeps corner clicks (window close buttons, Start menu) from throwing
+/// the cursor onto another machine; sliding along the edge out of the corner
+/// crosses normally.
+fn point_in_corner_zone(screen: &Screen, edge: Edge, x: f64, y: f64, size: f64) -> bool {
+    // Local crossing positions are global; convert to screen-relative first so
+    // screens with a non-zero origin (virtual desktop coords) work too.
+    point_in_corner_zone_relative(
+        screen.width,
+        screen.height,
+        edge,
+        x - screen.x as f64,
+        y - screen.y as f64,
+        size,
+    )
+}
+
+/// Corner-zone test against screen-RELATIVE coordinates (0..width, 0..height).
+/// Used by the return path, where `active.x/y` are already relative to the
+/// remote entry screen.
+fn point_in_corner_zone_relative(
+    width: i32,
+    height: i32,
+    edge: Edge,
+    x: f64,
+    y: f64,
+    size: f64,
+) -> bool {
+    if size <= 0.0 {
+        return false;
+    }
+    match edge {
+        Edge::Left | Edge::Right => y < size || y > height as f64 - size,
+        Edge::Top | Edge::Bottom => x < size || x > width as f64 - size,
+    }
+}
+
+fn is_crossing_screen(
+    screen: &Screen,
+    edge: Edge,
+    x: f64,
+    y: f64,
+    dx: f64,
+    dy: f64,
+    corner_guard_size: u32,
+) -> bool {
+    if point_in_corner_zone(screen, edge, x, y, f64::from(corner_guard_size)) {
+        return false;
+    }
+
     let left = screen.x as f64;
     let right = (screen.x + screen.width) as f64;
     let top = screen.y as f64;
@@ -5124,9 +6065,14 @@ fn update_active_remote_screen(
     // Runs per move while the cursor pushes an outer edge: never block the
     // tap/hook on the layout lock. Without the screens this event only
     // clamps; the next one roams, and returning to local does not need them.
-    let screens = layout_state
+    let (screens, corner_guard_size) = layout_state
         .try_lock()
-        .map(|layout| remote_device_screens(&layout, &active.target.device_id))
+        .map(|layout| {
+            (
+                remote_device_screens(&layout, &active.target.device_id),
+                effective_corner_guard_size(&layout),
+            )
+        })
         .unwrap_or_default();
 
     // Position of the cursor in the remote device's shared layout space.
@@ -5147,7 +6093,7 @@ fn update_active_remote_screen(
     // Off the edge with no neighbor there. Only the entry screen borders the
     // local machine, so only it can hand control back; every other outer edge
     // just clamps the cursor in place.
-    let returned_to_local = active.current_screen_id == active.target.screen_id
+    let exiting_to_local = active.current_screen_id == active.target.screen_id
         && exited_entry_edge(
             active.target.edge,
             &active.current_screen,
@@ -5156,11 +6102,27 @@ fn update_active_remote_screen(
             dx,
             dy,
         );
-    if returned_to_local {
+    if exiting_to_local {
+        // Corner guard applies to the RETURN trip too: an exit through the
+        // entry screen's corner zone stays on the remote — slide along the
+        // edge out of the corner to return (screen-switch hotkeys always
+        // work). The cursor is pinned back onto the entry edge meanwhile.
+        if point_in_corner_zone_relative(
+            active.current_screen.width,
+            active.current_screen.height,
+            active.target.edge,
+            active.x,
+            active.y,
+            f64::from(corner_guard_size),
+        ) {
+            pin_active_to_entry_edge(active);
+            return false;
+        }
         pin_active_to_entry_edge(active);
+        return true;
     }
 
-    returned_to_local
+    false
 }
 
 fn should_ignore_initial_anchor_warp_delta(edge: Edge, dx: f64, dy: f64) -> bool {
@@ -6666,6 +7628,18 @@ fn mac_key_to_windows_vk_pairs() -> &'static [(u16, u16)] {
     ]
 }
 
+/// Stamp our marker on a posted event so the capture tap passes it through.
+/// Peer mode: the local capture must never re-capture the injected remote
+/// stream (it would echo straight back to the controller). Same marker the
+/// local-consumption posts already carry.
+#[cfg(target_os = "macos")]
+fn tag_injected_macos_event(event: &core_graphics::event::CGEvent) {
+    event.set_integer_value_field(
+        core_graphics::event::EventField::EVENT_SOURCE_USER_DATA,
+        MACOS_SELF_EVENT_MARKER,
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
     use core_graphics::{
@@ -6693,6 +7667,7 @@ fn inject_mouse_move(x: i32, y: i32, drag_button: Option<MouseButton>) {
 
     if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
         if let Ok(event) = CGEvent::new_mouse_event(source, event_type, point, mouse_button) {
+            tag_injected_macos_event(&event);
             event.post(CGEventTapLocation::HID);
         }
     }
@@ -7210,6 +8185,7 @@ fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
             EventField::MOUSE_EVENT_CLICK_STATE,
             macos_click_state(button, down, x, y),
         );
+        tag_injected_macos_event(&event);
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -7227,6 +8203,7 @@ fn inject_scroll(delta_x: i32, delta_y: i32) {
     if let Ok(event) =
         CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, delta_y, delta_x, 0)
     {
+        tag_injected_macos_event(&event);
         event.post(CGEventTapLocation::HID);
     }
 }
@@ -7375,6 +8352,7 @@ fn inject_key(key_code: u16, down: bool) {
             // nothing on the Mac" bug.
             flags |= mac_function_section_flags(mac_code);
             event.set_flags(flags);
+            tag_injected_macos_event(&event);
             event.post(CGEventTapLocation::HID);
         }
         Err(_) => log::warn!("inject_key: failed to build keyboard event for mac code {mac_code}"),
@@ -7862,12 +8840,14 @@ mod tests {
 
     #[test]
     fn bottom_push_never_crosses_top_neighbour() {
-        assert!(crossing_target(&[top_neighbour_target()], 800.0, 1049.0, 0.0, 3.0).is_none());
+        assert!(
+            crossing_target(0, &[top_neighbour_target()], 800.0, 1049.0, 0.0, 3.0).is_none()
+        );
     }
 
     #[test]
     fn top_push_crosses_top_neighbour() {
-        let active = crossing_target(&[top_neighbour_target()], 800.0, 0.0, 0.0, -3.0)
+        let active = crossing_target(0, &[top_neighbour_target()], 800.0, 0.0, 0.0, -3.0)
             .expect("an upward push at the top edge crosses");
         assert_eq!(active.target.edge, Edge::Top);
     }
@@ -7875,7 +8855,9 @@ mod tests {
     #[test]
     fn targetless_stacked_display_stays_local() {
         // Bottom of the 1080x1920 portrait display at x=1680.., pushed down.
-        assert!(crossing_target(&[top_neighbour_target()], 2000.0, 1919.0, 0.0, 3.0).is_none());
+        assert!(
+            crossing_target(0, &[top_neighbour_target()], 2000.0, 1919.0, 0.0, 3.0).is_none()
+        );
     }
 
     fn target_for_coordinate_tests() -> InputTarget {
@@ -7919,6 +8901,7 @@ mod tests {
                     name: "Local".into(),
                     platform: "macos".into(),
                     host: "192.168.66.92".into(),
+                    mac: String::new(),
                     transport_port: 47833,
                     quic_port: 47834,
                     transport_public_key: "local-public-key".into(),
@@ -7937,6 +8920,7 @@ mod tests {
                     name: "Client".into(),
                     platform: "windows".into(),
                     host: "10.0.0.2".into(),
+                    mac: "aabbccddeeff".into(),
                     transport_port: 52000,
                     quic_port: 52001,
                     transport_public_key: "peer-public-key".into(),
@@ -7967,6 +8951,12 @@ mod tests {
             paired_controllers: Vec::new(),
             clipboard_sync: false,
             file_transfer_enabled: true,
+            auto_pairing: true,
+            lock_on_leave: false,
+            fullscreen_guard: false,
+            clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
+            corner_guard: false,
+            corner_guard_size: 0,
             language: "cn".into(),
             theme_mode: "system".into(),
             performance_monitor: false,
@@ -7989,6 +8979,7 @@ mod tests {
             name: "Client".into(),
             platform: "windows".into(),
             host: "10.0.0.2".into(),
+            mac: "aabbccddeeff".into(),
             transport_port: 47833,
             quic_port: 47834,
             transport_public_key: "peer-public-key".into(),
@@ -8458,7 +9449,7 @@ mod tests {
 
     #[test]
     fn hotkey_return_uses_recorded_point_then_local_screen_center() {
-        let active = crossing_target(&[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
+        let active = crossing_target(0, &[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
         .expect("target should be active");
 
         assert_eq!(
@@ -8524,6 +9515,142 @@ mod tests {
     }
 
     #[test]
+    fn return_corner_guard_blocks_corner_exit_and_pins_to_edge() {
+        let mut layout = layout_for_target_tests();
+        layout.corner_guard = true;
+        layout.corner_guard_size = 32;
+        let layout_state = Arc::new(Mutex::new(layout));
+        let entry = screen(
+            "peer-device",
+            "peer-device-local-display-1",
+            1920,
+            0,
+            1920,
+            1080,
+        );
+        let target = InputTarget {
+            device_id: "peer-device".into(),
+            origin_device_id: "peer-local-192-168-66-92".into(),
+            cluster_id: "cluster-test".into(),
+            pair_secret: "secret-test".into(),
+            target_addr: "10.0.0.2:47834".into(),
+            target_platform: "windows".into(),
+            transport_public_key: "peer-public-key".into(),
+            protocol_version: quic_transport::PROTOCOL_VERSION,
+            screen_id: "local-display-1".into(),
+            local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            layout_local_screen: screen("local-device", "local-display-1", 0, 0, 1920, 1080),
+            remote_screen: entry.clone(),
+            edge: Edge::Right,
+            modifier_map: None,
+        };
+        let mut current_screen = entry.clone();
+        current_screen.id = "local-display-1".into();
+        let mut active = ActiveTarget {
+            target,
+            current_screen,
+            current_screen_id: "local-display-1".into(),
+            x: -5.0,
+            y: 10.0,
+        };
+
+        // Pushing out of the entry edge inside the top-right corner zone (y=10
+        // < 32): the return is refused and the cursor is pinned to the edge.
+        assert!(!update_active_remote_screen(
+            &mut active,
+            -40.0,
+            0.0,
+            &layout_state
+        ));
+        assert_eq!(active.x, 0.0, "blocked exit pins the cursor to the edge");
+        assert_eq!(active.y, 10.0);
+
+        // Sliding down out of the corner zone: the return goes through.
+        active.x = -5.0;
+        active.y = 400.0;
+        assert!(update_active_remote_screen(
+            &mut active,
+            -40.0,
+            0.0,
+            &layout_state
+        ));
+    }
+
+    #[test]
+    fn sender_held_track_all_covers_batched_events() {
+        let mut state = SenderHeld::default();
+
+        // A chord whose Q rides the batch: the attached snapshot must include
+        // BOTH keys, or the receiver's reconciliation releases Q immediately
+        // (the WeChat IME Alt+Q voice-hotkey regression).
+        let attached =
+            state.track_all(&InputEvent::Key { key_code: 0x12, down: true },
+                &[InputEvent::Key { key_code: 0x51, down: true }],
+                Instant::now());
+        let attached = attached.expect("state changed: snapshot must attach");
+        assert!(attached.keys.contains(&0x12) && attached.keys.contains(&0x51));
+
+        // A batch whose net effect is nothing (down+up): state unchanged, but
+        // the receiver already saw both events — nothing may stick.
+        state.track_all(
+            &InputEvent::Key { key_code: 0x51, down: true },
+            &[InputEvent::Key { key_code: 0x51, down: false }],
+            Instant::now(),
+        );
+        assert!(!state.held.keys.contains(&0x51), "the up must clear the key");
+
+        // Releasing the chord clears it and attaches the empty snapshot.
+        let attached = state.track_all(
+            &InputEvent::Key { key_code: 0x12, down: false },
+            &[],
+            Instant::now(),
+        );
+        assert_eq!(attached, Some(HeldInputs::default()));
+
+        // Mouse moves mutate nothing: no snapshot attaches (heartbeat cadence
+        // governs those).
+        let attached = state.track_all(
+            &InputEvent::MouseMove { screen_id: "s".into(), x: 1, y: 1 },
+            &[],
+            Instant::now(),
+        );
+        assert_eq!(attached, None);
+    }
+
+    #[test]
+    fn fullscreen_rect_detection_with_tolerance() {
+        // A 1920x1080 monitor at origin: a window covering it exactly is
+        // fullscreen.
+        assert!(rect_covers_monitor(0.0, 0.0, 1920.0, 1080.0, 0.0, 0.0, 1920.0, 1080.0));
+        // Borderless windows are sometimes a pixel off — within tolerance.
+        assert!(rect_covers_monitor(-1.0, -1.0, 1921.0, 1081.0, 0.0, 0.0, 1920.0, 1080.0));
+        // A windowed app (taskbar leaves the bottom short) is not.
+        assert!(!rect_covers_monitor(0.0, 0.0, 1920.0, 1040.0, 0.0, 0.0, 1920.0, 1080.0));
+        // A window on a secondary monitor arrangement is judged against ITS
+        // monitor, not the origin.
+        assert!(rect_covers_monitor(
+            -1920.0,
+            0.0,
+            0.0,
+            1080.0,
+            -1920.0,
+            0.0,
+            0.0,
+            1080.0
+        ));
+        assert!(!rect_covers_monitor(
+            -1900.0,
+            0.0,
+            20.0,
+            1080.0,
+            -1920.0,
+            0.0,
+            0.0,
+            1080.0
+        ));
+    }
+
+    #[test]
     fn input_packet_round_trips_as_messagepack() {
         let packet = InputPacket {
             protocol: INPUT_PROTOCOL.into(),
@@ -8539,6 +9666,7 @@ mod tests {
                 x: 320,
                 y: 240,
             },
+            events: Vec::new(),
             held: None,
         };
         let payload = rmp_serde::to_vec_named(&packet).expect("encode input packet");
@@ -8597,6 +9725,7 @@ mod tests {
                 x: 320,
                 y: 240,
             },
+            events: Vec::new(),
             held: None,
         };
         let mirror = InputPacketRef {
@@ -8609,6 +9738,7 @@ mod tests {
             cluster_id: &packet.cluster_id,
             pair_secret: &packet.pair_secret,
             event: &packet.event,
+            events: &packet.events,
             held: None,
         };
 
@@ -8637,6 +9767,7 @@ mod tests {
             cluster_id: "cluster-test",
             pair_secret: "secret-test",
             event: &event,
+            events: &[],
             held: None,
         };
         let lean = InputPacketRef {
@@ -8649,6 +9780,7 @@ mod tests {
             cluster_id: "",
             pair_secret: "",
             event: &event,
+            events: &[],
             held: None,
         };
 
@@ -8818,6 +9950,7 @@ mod tests {
             cluster_id: "",
             pair_secret: "",
             event: &event,
+            events: &[],
             held,
         };
         let with = rmp_serde::to_vec_named(&packet(Some(&held))).expect("encode");
@@ -8872,6 +10005,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
+            last_used_ms: 0,
         }];
         let mut packet = InputPacket {
             protocol: INPUT_PROTOCOL.into(),
@@ -8887,17 +10021,28 @@ mod tests {
                 x: 1,
                 y: 1,
             },
+            events: Vec::new(),
             held: None,
         };
 
-        assert!(!packet_authorized(&layout, &packet));
+        // Open-pairing semantics: a whitelisted origin is trusted even with a
+        // wrong secret (auto-paired peers never learn each other's secret).
+        assert!(packet_authorized(&layout, &packet));
         packet.pair_secret = layout.pair_secret.clone();
         assert!(packet_authorized(&layout, &packet));
         packet.origin_transport_public_key = "attacker-key".into();
         packet.origin_device_id = "attacker".into();
-        assert!(!packet_authorized(&layout, &packet));
+        // Not on the whitelist, but the correct secret is the confirmation-
+        // code-era fallback and still authorizes.
+        assert!(packet_authorized(&layout, &packet));
+        packet.pair_secret = "wrong".into();
+        assert!(
+            !packet_authorized(&layout, &packet),
+            "no whitelist match and a wrong secret — rejected"
+        );
         packet.origin_transport_public_key.clear();
         packet.origin_device_id = "server".into();
+        packet.pair_secret = "wrong".into();
         assert!(packet_authorized(&layout, &packet));
     }
 
@@ -8914,6 +10059,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
+            last_used_ms: 0,
         }];
         let packet = InputPacket {
             protocol: INPUT_PROTOCOL.into(),
@@ -8929,11 +10075,15 @@ mod tests {
                 x: 1,
                 y: 1,
             },
+            events: Vec::new(),
             held: None,
         };
 
         assert!(packet_authorized(&layout, &packet));
 
+        // With a second controller the len==1 legacy fallback is gone; a
+        // rotated key with an unknown id is only covered by the secret
+        // fallback, so a wrong secret must be rejected.
         layout.paired_controllers.push(crate::PairedController {
             id: "peer-other-server".into(),
             name: "Other".into(),
@@ -8943,8 +10093,11 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 2,
+            last_used_ms: 0,
         });
-        assert!(!packet_authorized(&layout, &packet));
+        let mut rotated = packet;
+        rotated.pair_secret = "wrong".into();
+        assert!(!packet_authorized(&layout, &rotated));
     }
 
     #[test]
@@ -8991,6 +10144,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
+            last_used_ms: 0,
         }];
         let payload = rmp_serde::to_vec_named(&InputPacket {
             protocol: INPUT_PROTOCOL.into(),
@@ -9006,6 +10160,7 @@ mod tests {
                 x: 100,
                 y: 200,
             },
+            events: Vec::new(),
             held: None,
         })
         .unwrap();
@@ -9057,6 +10212,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
+            last_used_ms: 0,
         }];
         let layout_state = Arc::new(Mutex::new(layout.clone()));
         let input_events = Arc::new(AtomicU64::new(0));
@@ -9129,6 +10285,7 @@ mod tests {
             protocol_version: quic_transport::PROTOCOL_VERSION,
             cluster_id: layout.cluster_id.clone(),
             paired_at_ms: 1,
+            last_used_ms: 0,
         }];
         let mut packet = InputControlPacket {
             protocol: INPUT_CONTROL_PROTOCOL.into(),
@@ -9141,12 +10298,29 @@ mod tests {
             command: InputControlCommand::SecureAttention,
         };
 
-        assert!(!control_packet_authorized(&layout, &packet));
+        assert!(
+            control_packet_authorized(&layout, &packet),
+            "a whitelisted origin is trusted even with a wrong secret"
+        );
         packet.pair_secret = layout.pair_secret.clone();
         assert!(control_packet_authorized(&layout, &packet));
         packet.origin_transport_public_key = "attacker-key".into();
         packet.origin_device_id = "attacker".into();
-        assert!(!control_packet_authorized(&layout, &packet));
+        // The correct secret alone still authorizes (confirmation-code-era
+        // fallback for peers outside the whitelist).
+        assert!(control_packet_authorized(&layout, &packet));
+        packet.pair_secret = "wrong".into();
+        assert!(
+            !control_packet_authorized(&layout, &packet),
+            "neither the whitelist nor the secret matches — rejected"
+        );
+        packet.origin_transport_public_key.clear();
+        packet.origin_device_id = "server".into();
+        packet.pair_secret = "wrong".into();
+        assert!(
+            control_packet_authorized(&layout, &packet),
+            "a whitelisted origin (id match) is trusted even with a wrong secret"
+        );
     }
 
     #[test]
@@ -9171,7 +10345,7 @@ mod tests {
 
         // Native width 1920, so the cursor must reach the edge pixel x=1919
         // (CROSSING_MARGIN=1) before a crossing is accepted.
-        let mapped = crossing_layout_point(&target, 1919.0, 500.0, 5.0, 0.0)
+        let mapped = crossing_layout_point(&target, 0, 1919.0, 500.0, 5.0, 0.0)
             .expect("native edge should cross");
 
         assert!(mapped.0 > -9404.0);
@@ -9181,8 +10355,7 @@ mod tests {
     #[test]
     fn fast_crossing_carries_entry_delta_into_remote() {
         let target = target_for_coordinate_tests();
-        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
-        let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0)
+        let active = crossing_target(0, &[target], 1919.0, 500.0, 40.0, 0.0)
             .expect("fast edge movement should cross");
 
         assert!(
@@ -9195,7 +10368,82 @@ mod tests {
     fn crossing_rejects_raw_layout_coordinates() {
         let target = target_for_coordinate_tests();
 
-        assert!(crossing_layout_point(&target, -9401.0, -8500.0, 5.0, 0.0).is_none());
+        assert!(crossing_layout_point(&target, 0, -9401.0, -8500.0, 5.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn corner_guard_blocks_right_edge_crossing_at_top_and_bottom_corners() {
+        // Mid-edge is unaffected by the guard.
+        assert!(
+            crossing_target(32, &[target_for_coordinate_tests()], 1919.0, 500.0, 40.0, 0.0)
+                .is_some(),
+            "crossing the right edge away from the corners still works"
+        );
+        // Top-right corner zone (local screen is 1920x1080 at 0,0; size 32).
+        assert!(
+            crossing_target(32, &[target_for_coordinate_tests()], 1919.0, 10.0, 40.0, 0.0)
+                .is_none(),
+            "a right-edge push inside the top-right corner must not cross"
+        );
+        // Bottom-right corner zone.
+        assert!(
+            crossing_target(32, &[target_for_coordinate_tests()], 1919.0, 1070.0, 40.0, 0.0)
+                .is_none(),
+            "a right-edge push inside the bottom-right corner must not cross"
+        );
+        // Just outside the corner zone crosses again.
+        assert!(
+            crossing_target(32, &[target_for_coordinate_tests()], 1919.0, 40.0, 40.0, 0.0)
+                .is_some(),
+            "sliding out of the corner zone resumes normal crossing"
+        );
+    }
+
+    #[test]
+    fn corner_guard_blocks_top_edge_crossing_at_left_and_right_corners() {
+        // Top neighbour: local screen 1680x1050, crossing the Top edge.
+        assert!(
+            crossing_target(32, &[top_neighbour_target()], 800.0, 0.0, 0.0, -3.0).is_some(),
+            "crossing the top edge away from the corners still works"
+        );
+        assert!(
+            crossing_target(32, &[top_neighbour_target()], 10.0, 0.0, 0.0, -3.0).is_none(),
+            "an upward push inside the top-left corner must not cross"
+        );
+        assert!(
+            crossing_target(32, &[top_neighbour_target()], 1670.0, 0.0, 0.0, -3.0).is_none(),
+            "an upward push inside the top-right corner must not cross"
+        );
+    }
+
+    #[test]
+    fn corner_guard_disabled_allows_corner_crossing() {
+        // size 0 (disabled) restores the legacy behavior everywhere.
+        assert!(
+            crossing_target(0, &[target_for_coordinate_tests()], 1919.0, 10.0, 40.0, 0.0)
+                .is_some(),
+            "with the guard disabled a corner push crosses as before"
+        );
+    }
+
+    #[test]
+    fn effective_corner_guard_size_clamps_and_honors_the_toggle() {
+        let mut layout = layout_for_target_tests();
+        layout.corner_guard = true;
+        layout.corner_guard_size = 500;
+        assert_eq!(
+            effective_corner_guard_size(&layout),
+            CORNER_GUARD_MAX_PX,
+            "oversized settings clamp to the maximum"
+        );
+        layout.corner_guard_size = 64;
+        assert_eq!(effective_corner_guard_size(&layout), 64);
+        layout.corner_guard = false;
+        assert_eq!(
+            effective_corner_guard_size(&layout),
+            0,
+            "turning the guard off disables it regardless of size"
+        );
     }
 
     #[test]
@@ -9224,11 +10472,11 @@ mod tests {
             modifier_map: None,
         };
 
-        assert!(crossing_layout_point(&target, 1918.0, 600.0, 5.0, 0.0).is_none());
+        assert!(crossing_layout_point(&target, 0, 1918.0, 600.0, 5.0, 0.0).is_none());
 
         // Native width 3840, so the edge pixel is x=3839; the cursor must reach
         // it (CROSSING_MARGIN=1) before crossing.
-        let mapped = crossing_layout_point(&target, 3839.0, 1200.0, 5.0, 0.0)
+        let mapped = crossing_layout_point(&target, 0, 3839.0, 1200.0, 5.0, 0.0)
             .expect("native edge should cross");
 
         assert!(mapped.0 > 1916.0);
@@ -9261,7 +10509,7 @@ mod tests {
             modifier_map: None,
         };
 
-        assert!(crossing_layout_point(&target, 3838.0, 1200.0, 900.0, 0.0).is_none());
+        assert!(crossing_layout_point(&target, 0, 3838.0, 1200.0, 900.0, 0.0).is_none());
     }
 
     #[test]

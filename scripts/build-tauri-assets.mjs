@@ -49,18 +49,17 @@ run('cargo', [
   target,
 ])
 
+// Honor CARGO_TARGET_DIR (set by scripts/run-tauri-dev.ps1 / CI caches) so the
+// sidecar is copied from wherever cargo actually placed it.
+const cargoTargetRoot = process.env.CARGO_TARGET_DIR || join(root, 'src-tauri', 'target')
 const source = join(
-  root,
-  'src-tauri',
-  'target',
+  cargoTargetRoot,
   target,
   'release',
   'mykvm-input-helper.exe',
 )
 const fallbackSource = join(
-  root,
-  'src-tauri',
-  'target',
+  cargoTargetRoot,
   'release',
   'mykvm-input-helper.exe',
 )

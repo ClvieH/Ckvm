@@ -183,10 +183,15 @@ fn helper_ready() -> bool {
 }
 
 fn headless_receive_enabled(layout: &LayoutState) -> bool {
-    layout.machine_role == "client"
-        && layout.input_mode == "receive"
+    // Peer machines are receive-capable too: the service-level headless
+    // receiver covers them the same way it covers clients (lock screen /
+    // logged-out control). A peer runs with input_mode "both" — the headless
+    // runtime is receive-only, which is exactly right while the GUI is away.
+    // Open pairing removes the pair-secret requirement: the controller
+    // whitelist alone identifies trusted senders.
+    (layout.machine_role == "client" || layout.machine_role == "peer")
+        && (layout.input_mode == "receive" || layout.input_mode == "both")
         && !layout.cluster_id.trim().is_empty()
-        && !layout.pair_secret.trim().is_empty()
         && !layout.paired_controllers.is_empty()
 }
 

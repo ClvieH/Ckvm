@@ -14,6 +14,8 @@ export interface LanPeer {
   pairingRequired: boolean
   host: string
   ip: string
+  // NIC MAC (colonless hex) for Wake-on-LAN; empty on older peers.
+  mac: string
   transportPort: number
   quicPort: number
   transportPublicKey: string

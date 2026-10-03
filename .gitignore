@@ -20,6 +20,11 @@ src-tauri/target
 backups/
 tmp/
 
+# Local build artifacts and assistant-tool state (not part of the source tree)
+portable/
+.mimosa/
+.zcode/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

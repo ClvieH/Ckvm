@@ -47,7 +47,7 @@ const MAX_HEALTH_PEERS: usize = 64;
 const MAX_CONCURRENT_STREAMS: usize = 8;
 
 type DatagramHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>;
-type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> bool + Send + Sync + 'static>;
+type StreamHandler = Arc<dyn Fn(Vec<u8>, SocketAddr) -> String + Send + Sync + 'static>;
 
 #[derive(Clone, Debug)]
 pub struct PeerEndpoint {
@@ -187,6 +187,17 @@ impl TransportHandle {
         peer: PeerEndpoint,
         payload: Vec<u8>,
     ) -> Result<(), String> {
+        self.send_stream_expect_ack_reply(peer, payload).map(|_| ())
+    }
+
+    /// Like `send_stream_expect_ack`, but returns the receiver's raw reply so
+    /// callers can negotiate (e.g. "ok:<offset>" for file resume). The reply
+    /// is already validated ("ok"/"ok:<offset>" accepted, others rejected).
+    pub fn send_stream_expect_ack_reply(
+        &self,
+        peer: PeerEndpoint,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
         if payload.len() > MAX_STREAM_BYTES {
             return Err(format!(
                 "QUIC stream payload is too large: {} bytes",
@@ -236,7 +247,7 @@ enum TransportCommand {
     SendStream {
         peer: PeerEndpoint,
         payload: Vec<u8>,
-        result: mpsc::Sender<Result<(), String>>,
+        result: mpsc::Sender<Result<Vec<u8>, String>>,
     },
     Shutdown {
         ack: mpsc::Sender<()>,
@@ -762,9 +773,9 @@ fn spawn_stream_reader(
                         match payload {
                             Ok(payload) => {
                                 // Clipboard tools, image decoding and file writes are blocking.
-                                let accepted =
+                                let reply =
                                     tokio::task::block_in_place(|| on_stream(payload, remote));
-                                let ack: &[u8] = if accepted { b"ok" } else { b"reject" };
+                                let ack = reply.as_bytes();
                                 let _ = send.write_all(ack).await;
                                 let _ = send.finish();
                             }
@@ -872,7 +883,7 @@ async fn send_stream_task(
     health: &HealthMap,
     peer: PeerEndpoint,
     payload: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let key = peer_key(&peer)?;
     let existing = {
         let Ok(map) = connections.lock() else {
@@ -925,7 +936,7 @@ fn forget_connection(connections: &ConnectionMap, key: &PeerKey, connection: &qu
 async fn send_stream_on_connection(
     connection: quinn::Connection,
     payload: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     // The ack also waits for the payload tail to land and for the receiver to
     // apply it (image decode, pasteboard write): budget ~2 MB/s on top of 500 ms.
     let ack_timeout = Duration::from_millis(500 + (payload.len() / 2048) as u64);
@@ -939,14 +950,19 @@ async fn send_stream_on_connection(
     send.finish()
         .map_err(|error| format!("failed to finish QUIC stream: {error}"))?;
     match tokio::time::timeout(ack_timeout, recv.read_to_end(64)).await {
-        Ok(Ok(bytes)) => verify_stream_ack(&bytes),
+        Ok(Ok(bytes)) => {
+            verify_stream_ack(&bytes)?;
+            Ok(bytes)
+        }
         Ok(Err(error)) => Err(format!("failed to read QUIC stream ack: {error}")),
         Err(_) => Err("QUIC stream ack timed out".into()),
     }
 }
 
 fn verify_stream_ack(bytes: &[u8]) -> Result<(), String> {
-    if bytes == b"ok" {
+    // "ok" (legacy) and "ok:<offset>" (resume negotiation) both accept;
+    // anything else is a rejection carrying its reason.
+    if bytes == b"ok" || bytes.starts_with(b"ok:") {
         Ok(())
     } else {
         Err(format!(
@@ -1141,7 +1157,7 @@ mod tests {
                     Duration::from_secs(5),
                     |released| !*released,
                 );
-                true
+                "ok".to_string()
             }),
         )
         .unwrap();
@@ -1149,7 +1165,7 @@ mod tests {
             free_port(),
             dir.join("sender"),
             Arc::new(|_, _| {}),
-            Arc::new(|_, _| true),
+            Arc::new(|_, _| "ok".to_string()),
         )
         .unwrap();
         let peer = sender.peer(
@@ -1221,14 +1237,14 @@ mod tests {
             Arc::new(move |payload, _| {
                 let _ = input_tx.send(payload);
             }),
-            Arc::new(|_, _| false),
+            Arc::new(|_, _| "reject".to_string()),
         )
         .unwrap();
         let sender = start(
             free_port(),
             dir.join("sender"),
             Arc::new(|_, _| {}),
-            Arc::new(|_, _| true),
+            Arc::new(|_, _| "ok".to_string()),
         )
         .unwrap();
         let peer = sender.peer(
@@ -1274,7 +1290,7 @@ mod tests {
             port,
             dir.clone(),
             Arc::new(|_, _| {}),
-            Arc::new(|_, _| true),
+            Arc::new(|_, _| "ok".to_string()),
         )
         .expect("start transport");
         let bound_port = handle.port();
