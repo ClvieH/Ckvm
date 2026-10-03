@@ -584,6 +584,17 @@ ubuntu-22.04 单 job：Node 22 → Linux 桌面依赖（libwebkit2gtk-4.1-dev �
 
 **验证**：cargo test 170+5 全绿；tsc/eslint/vitest（24）全绿。**全部锚点仅本地提交，未推送**（等用户命令）。便携包仍为 10-03 04:15 版（按约定整条路线完成前不打包）。
 
+### 第八轮：工程债专项收官 + 升级报告书（2026-10-03 晚）
+
+| 项 | 实现 | 锚点 |
+|---|---|---|
+| **5.4 钩子活性** | 鼠标 proc 的 tick 存储提前到 context/desktop 检查之前（与键盘 proc 不变量一致，封死锁屏/teardown 期误判窗口）；决策抽纯函数 `hook_liveness_removed` 并加回归测试（30 分钟事件流/2s 边界/tick 回绕/零事件态）；路线图设想的 send-flag 方案弃用——系统-vs-钩子比较天然覆盖空闲期 | 5612e3a |
+| **5.2 前端测试** | `format.ts` 提取（formatFileTransferBytes/formatScreenCount/normalizeEdgeSwitchHotkeyInput + formatQueueResumeCopy），React-free 可测；前端套件 3 文件 30 项 | cff6a2d |
+| **5.3 打包脚本** | `scripts/build-portable.ps1`：构建→拷贝→portable.ini→**exe 接线日志串校验**（防双 .setup() 回归再犯）→zip；当次运行即产出 19:15 便携包（7.5MB） | 本次 |
+| **报告书** | `docs/UPGRADE_REPORT.zh-CN.md`：八轮总账、功能增量、模块/测试资产、验证记录、提交台账、遗留声明、部署清单 | 本次 |
+
+**路线图状态**：四阶段 + 工程债全部执行完毕（4.1 Linux 延期立项）；便携包按最终代码重建（19:15 版），「整条路线完成才打包」条件达成。
+
 ## 11. 本机构建验证记录（Windows 10 x64，2026-10-02）
 
 **bate 分支（当前基线）**：
