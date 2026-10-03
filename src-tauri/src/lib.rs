@@ -10340,6 +10340,25 @@ fn ensure_windows_firewall_rule() {
         .stderr(std::process::Stdio::null())
         .status();
 
+    // Also drop every other inbound rule scoped to THIS executable. When a
+    // user once clicks "cancel" on the Windows firewall prompt, Windows
+    // records a BLOCK rule for the exe — and a block rule silently wins over
+    // any allow rule we add afterwards, which left LAN peers unable to reach
+    // us with no visible error. Deleting by program (our own binary only,
+    // always safe) clears those leftovers; the allow rule below is re-added.
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("program={exe}"),
+            "dir=in",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
     let status = Command::new("netsh")
         .args([
             "advfirewall",
