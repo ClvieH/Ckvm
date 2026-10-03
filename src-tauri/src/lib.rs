@@ -9745,9 +9745,15 @@ fn pairing_status(
     layout: &LayoutState,
     pairing_challenge: &Mutex<Option<PairingChallenge>>,
 ) -> PairingStatus {
-    if layout.machine_role != "client" {
+    // Clients AND peers receive pairing challenges (a server initiates). The
+    // peer branch matters for manual pairing with auto-pairing off: without
+    // it, the challenge was created with a code the frontend could never see
+    // (the pairing modal stayed blank in peer mode).
+    let receives_pairing = layout.machine_role == "client" || layout.machine_role == "peer";
+    if !receives_pairing {
         return idle_pairing_status();
     }
+    let client_wording = layout.machine_role == "client";
 
     let now = Instant::now();
     if let Ok(mut challenge) = pairing_challenge.lock() {
@@ -9766,7 +9772,11 @@ fn pairing_status(
                 requester_name: challenge.requester_name.clone(),
                 requester_ip: challenge.requester_ip.clone(),
                 expires_at_ms: challenge.expires_at_ms,
-                detail: "服务端正在请求配对，请在服务端输入此验证码。".into(),
+                detail: if client_wording {
+                    "服务端正在请求配对，请在服务端输入此验证码。".into()
+                } else {
+                    "对端正在请求配对，请在对方输入此验证码。".into()
+                },
             };
         }
     }
@@ -9778,7 +9788,11 @@ fn pairing_status(
             requester_name: String::new(),
             requester_ip: String::new(),
             expires_at_ms: 0,
-            detail: "客户端已配对，只对白名单服务端响应。".into(),
+            detail: if client_wording {
+                "客户端已配对，只对白名单服务端响应。".into()
+            } else {
+                "已配对，只对白名单对端响应。".into()
+            },
         };
     }
 
@@ -9788,7 +9802,11 @@ fn pairing_status(
         requester_name: String::new(),
         requester_ip: String::new(),
         expires_at_ms: 0,
-        detail: "客户端等待服务端发起配对。".into(),
+        detail: if client_wording {
+            "客户端等待服务端发起配对。".into()
+        } else {
+            "等待对端发起配对。".into()
+        },
     }
 }
 
@@ -10958,6 +10976,39 @@ mod tests {
 
         // The already-paired client must show this code, not "paired": the
         // window popped up with nothing to type on the server.
+        let status = pairing_status(&layout, &challenge);
+        assert_eq!(status.state, "requested");
+        assert_eq!(status.code, code);
+    }
+
+    #[test]
+    fn peer_mode_pairing_status_reports_the_challenge_code() {
+        // Manual pairing between peers (auto-pairing off): the receiving peer
+        // creates a challenge, and pairing_status must surface its code — the
+        // frontend modal is already peer-ready and used to sit blank.
+        let mut layout = test_layout();
+        layout.machine_role = "peer".into();
+        layout.auto_pairing = false;
+        layout.paired_controllers.clear();
+        let challenge = Arc::new(Mutex::new(None));
+        let mut requester = test_peer();
+        requester.id = "peer-two".into();
+        requester.machine_role = "peer".into();
+
+        assert!(begin_pairing_challenge(
+            &challenge,
+            &layout,
+            &requester,
+            requester.ip.clone(),
+        ));
+        let code = challenge
+            .lock()
+            .expect("challenge lock")
+            .as_ref()
+            .expect("challenge")
+            .code
+            .clone();
+
         let status = pairing_status(&layout, &challenge);
         assert_eq!(status.state, "requested");
         assert_eq!(status.code, code);
