@@ -1354,8 +1354,13 @@ function App() {
       updateInputServiceStatus(await installInputService());
       setInputServiceAction(null);
     } catch (error: unknown) {
+      const raw = error instanceof Error ? error.message : "";
       setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.updateRuntime,
+        raw.includes("cancelled or blocked")
+          ? ui.errors.inputServiceUacDeclined
+          : error instanceof Error
+            ? error.message
+            : ui.errors.updateRuntime,
       );
     } finally {
       setIsInputServicePending(false);
@@ -1409,9 +1414,13 @@ function App() {
           : current,
       );
     } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.scanLan,
-      );
+      // A user-cancelled scan already closed the modal on click; its early
+      // resolution is expected, not an error worth a banner.
+      if (error instanceof Error && !error.message.includes("scan")) {
+        setErrorMessage(error.message);
+      } else if (!(error instanceof Error)) {
+        setErrorMessage(ui.errors.scanLan);
+      }
     } finally {
       clearInterval(countdownTimer);
       setScanCountdown(0);
@@ -1420,8 +1429,11 @@ function App() {
   }
 
   function cancelScanLan() {
-    // The backend sweep loop exits before its next round (~1.4s), which
-    // resolves the pending scanLanPeers call and closes the modal.
+    // Close the modal right away (the click is the user's intent), then tell
+    // the backend to stop; its loop exits before the next round (~1.4s) and
+    // the pending scanLanPeers call resolves into the snapshot update.
+    setScanCountdown(0);
+    setIsScanningLan(false);
     void cancelLanScan();
   }
 

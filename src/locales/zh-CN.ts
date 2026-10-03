@@ -282,6 +282,7 @@ export const zhCN = {
     peerWithoutScreens: "在线，但没有上报屏幕信息。",
     connectedWithoutScreens: "已连接，但没有拿到屏幕信息。",
     probeFailed: "没有收到 mykvm 响应。请确认对端已安装并正在运行 MyKVM、两端在同一网络，且对端防火墙已放行 UDP 47833-47837。",
+    inputServiceUacDeclined: "管理员授权被拒绝或被 Windows 拦截，服务未安装。如未弹出授权窗口，请检查 UAC 设置后重试。",
     pairingCodeRequired: "请输入客户端显示的 6 位验证码。",
     pairingFailed: "配对失败。",
     wakeFailed: "唤醒失败。",

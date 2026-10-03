@@ -3180,9 +3180,11 @@ async fn scan_lan_peers(
 }
 
 /// Frontend cancel for a windowed scan: the sweep loop exits before its next
-/// round, so the command resolves within ~1.4s of the click.
+/// round, so the command resolves within ~1.4s of the click. Async so the
+/// cancel can never queue behind anything on the main thread while the
+/// blocking sweep occupies a pool thread.
 #[tauri::command]
-fn cancel_lan_scan() {
+async fn cancel_lan_scan() {
     LAN_SCAN_CANCEL.store(true, Ordering::Relaxed);
 }
 
@@ -9382,7 +9384,7 @@ fn probe_for_peer(local_peer: &LanPeer, host: &str, base_port: u16) -> Result<La
     Err(format!(
         "no mykvm peer answered at {host} ({port_hint}); make sure MyKVM is \
          installed AND running on that device, both machines are on the same \
-         network, and its firewall allows inbound UDP {port_hint}"
+         network, and its firewall allows inbound {port_hint}"
     ))
 }
 

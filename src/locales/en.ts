@@ -282,6 +282,7 @@ export const en = {
     peerWithoutScreens: "is online, but did not report screen data.",
     connectedWithoutScreens: "Connected, but no screen data was reported.",
     probeFailed: "No MyKVM response. Make sure MyKVM is installed and running on that device, both machines are on the same network, and its firewall allows inbound UDP 47833-47837.",
+    inputServiceUacDeclined: "Administrator approval was declined or blocked by Windows, so the service was not installed. If no prompt appeared, check your UAC settings and retry.",
     pairingCodeRequired: "Enter the 6-digit code shown on the client.",
     pairingFailed: "Pairing failed.",
     wakeFailed: "Wake-on-LAN failed.",
