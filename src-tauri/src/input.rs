@@ -8998,6 +8998,7 @@ mod tests {
             fullscreen_guard: false,
             clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
             drag_native_drop: crate::default_drag_native_drop(),
+            preview_enabled: false,
             corner_guard: false,
             corner_guard_size: 0,
             language: "cn".into(),

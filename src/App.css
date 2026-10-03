@@ -2375,6 +2375,19 @@
   white-space: nowrap;
 }
 
+.preview-modal {
+  max-width: 720px;
+}
+
+.preview-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  margin-top: 12px;
+}
+
 .queue-resume-banner {
   position: fixed;
   left: 50%;

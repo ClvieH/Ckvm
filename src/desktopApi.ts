@@ -377,6 +377,14 @@ export async function clearTransferHistory(): Promise<void> {
   await invoke('clear_transfer_history')
 }
 
+export async function captureRemotePreview(deviceId: string): Promise<string> {
+  if (!isTauri()) {
+    return ''
+  }
+
+  return invoke<string>('capture_remote_preview', { deviceId })
+}
+
 export async function resendTransferHistoryEntry(
   id: number,
 ): Promise<void> {

@@ -65,4 +65,4 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gd
 # The #[implement] macro expands to `windows_core::` paths, so the crate must be
 # a direct dependency (matches the version `windows` 0.61 already pulls in).
 windows-core = "0.61"
-image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }

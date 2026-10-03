@@ -34,6 +34,7 @@ function makeLayout(devices: Device[]): LayoutState {
     machineRole: 'server',
     clipboardHistoryShortcut: 'ctrl+shift+v',
     dragNativeDrop: true,
+    previewEnabled: false,
     clusterId: 'cluster-test',
     pairSecret: 'secret-test',
     pairedControllers: [],

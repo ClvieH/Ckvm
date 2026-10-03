@@ -46,6 +46,7 @@ import {
   clearTransferHistory,
   resendTransferHistoryEntry,
   readPendingTransferQueue,
+  captureRemotePreview,
   dismissPendingTransferQueue,
   resumePendingTransferQueue,
   setAutostart,
@@ -228,6 +229,9 @@ function App() {
   >([]);
   const [queueResume, setQueueResume] =
     useState<PendingQueueSummary | null>(null);
+  const [previewBase64, setPreviewBase64] = useState<string | null>(null);
+  const [previewDeviceName, setPreviewDeviceName] = useState("");
+  const [isFetchingPreview, setIsFetchingPreview] = useState(false);
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
   const [isInputServicePending, setIsInputServicePending] = useState(false);
@@ -1562,6 +1566,13 @@ function App() {
     }));
   }
 
+  function setPreviewEnabled(previewEnabled: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      previewEnabled,
+    }));
+  }
+
   function setCornerGuard(cornerGuard: boolean) {
     updateLayout((layoutState) => ({
       ...layoutState,
@@ -1653,6 +1664,16 @@ function App() {
   function handleDismissQueue() {
     void dismissPendingTransferQueue();
     setQueueResume(null);
+  }
+
+  function handleFetchPreview(device: Device) {
+    setIsFetchingPreview(true);
+    setPreviewDeviceName(device.name);
+    setPreviewBase64(null);
+    void captureRemotePreview(device.id)
+      .then((base64) => setPreviewBase64(base64))
+      .catch((error) => setFileTransferMessage(String(error)))
+      .finally(() => setIsFetchingPreview(false));
   }
 
   useEffect(() => {
@@ -2509,6 +2530,15 @@ function App() {
         <button
           type="button"
           className="secondary-button compact-button"
+          onClick={() => handleFetchPreview(device)}
+          disabled={!device.online || isFetchingPreview}
+          title={layout?.previewEnabled ? undefined : ui.settings.previewEnabledCopy}
+        >
+          {ui.devices.preview}
+        </button>
+        <button
+          type="button"
+          className="secondary-button compact-button"
           onClick={() => void handleWakeDevice(device)}
           disabled={device.mac.trim().length === 0}
           title={
@@ -2628,6 +2658,46 @@ function App() {
             >
               {ui.devices.queueResumeDismiss}
             </button>
+          </div>
+        </div>
+      ) : null}
+      {isFetchingPreview || previewBase64 ? (
+        <div
+          className="pairing-modal-backdrop"
+          role="presentation"
+          onClick={() => {
+            setPreviewBase64(null);
+            setIsFetchingPreview(false);
+          }}
+        >
+          <div
+            className="pairing-modal preview-modal"
+            role="dialog"
+            aria-label={ui.devices.previewTitle}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              className="pairing-close-button"
+              onClick={() => {
+                setPreviewBase64(null);
+                setIsFetchingPreview(false);
+              }}
+              aria-label={ui.common.close}
+            >
+              <WindowCloseIcon />
+            </button>
+            <p className="eyebrow">{ui.devices.previewEyebrow}</p>
+            <h2>{previewDeviceName}</h2>
+            {previewBase64 ? (
+              <img
+                className="preview-image"
+                src={`data:image/jpeg;base64,${previewBase64}`}
+                alt={ui.devices.previewTitle}
+              />
+            ) : (
+              <p className="muted-copy">{ui.devices.previewLoading}</p>
+            )}
           </div>
         </div>
       ) : null}
@@ -3418,6 +3488,33 @@ function App() {
                       type="button"
                       className={!layout.dragNativeDrop ? "active" : ""}
                       onClick={() => setDragNativeDrop(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.previewEnabled}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.previewEnabledCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.previewEnabled ? "active" : ""}
+                      onClick={() => setPreviewEnabled(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.previewEnabled ? "active" : ""}
+                      onClick={() => setPreviewEnabled(false)}
                     >
                       {ui.common.disabled}
                     </button>

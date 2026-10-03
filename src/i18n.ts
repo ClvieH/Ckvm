@@ -152,6 +152,9 @@ export const TEXT = {
       historyHotkeyRecording: "按下组合键…",
       historyHotkeyDisabled: "已停用",
       dragNativeDrop: "拖拽落点跟随光标",
+      previewEnabled: "屏幕预览",
+      previewEnabledCopy:
+        "允许在设备列表查看对端屏幕缩略图，同时允许对端查看本机屏幕。默认关闭；两端都开启才可用。",
       dragNativeDropCopy:
         "Windows 间贴边拖拽文件时，在对端以真实拖拽会话跟随光标，释放在哪个文件夹就落到哪里；关闭后退回到传输目录。",
       cornerGuard: "角落防误切",
@@ -239,6 +242,10 @@ export const TEXT = {
       transferSent: "发送",
       transferReceived: "接收",
       transferResend: "重发",
+      preview: "预览",
+      previewEyebrow: "Preview",
+      previewTitle: "屏幕预览",
+      previewLoading: "正在请求对端屏幕画面…",
       queueResumeCopy: "上次有 {count} 个文件未传完（目标 {device}），是否继续？",
       queueResumeContinue: "继续传输",
       queueResumeDismiss: "忽略",
@@ -440,6 +447,9 @@ export const TEXT = {
       historyHotkeyRecording: "Press a shortcut…",
       historyHotkeyDisabled: "Disabled",
       dragNativeDrop: "Drop files under the cursor",
+      previewEnabled: "Screen preview",
+      previewEnabledCopy:
+        "Show a remote screen thumbnail in the device list and let the peer see yours. Off by default; both ends must enable it.",
       dragNativeDropCopy:
         "Edge drags between Windows machines open a real drag session on the receiver that follows the cursor — release over any folder to drop there. Off = land in the Transfers folder.",
       cornerGuard: "Corner Guard",
@@ -527,6 +537,10 @@ export const TEXT = {
       transferSent: "Sent",
       transferReceived: "Received",
       transferResend: "Resend",
+      preview: "Preview",
+      previewEyebrow: "Preview",
+      previewTitle: "Screen preview",
+      previewLoading: "Fetching the remote screen…",
       queueResumeCopy: "The last session left {count} file(s) unfinished (target: {device}). Continue?",
       queueResumeContinue: "Resume",
       queueResumeDismiss: "Ignore",

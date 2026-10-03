@@ -30,6 +30,7 @@ mod file_transfer;
 mod input;
 mod performance;
 mod quic_transport;
+mod screen_preview;
 pub mod shared_input;
 #[cfg(target_os = "windows")]
 pub mod windows_drag;
@@ -391,6 +392,10 @@ struct LayoutState {
     // back automatically when the peer refuses drag-control.
     #[serde(default = "default_drag_native_drop")]
     drag_native_drop: bool,
+    // Serving a screen preview to a paired peer (and asking for one in the
+    // UI). Off by default: it ships pixels over the network, so it is opt-in.
+    #[serde(default)]
+    preview_enabled: bool,
     #[serde(default = "default_language")]
     language: String,
     #[serde(default = "default_theme_mode")]
@@ -910,6 +915,13 @@ impl AppRuntime {
             ) {
                 transport_packets_for_stream.fetch_add(1, Ordering::Relaxed);
                 return "ok".to_string();
+            }
+
+            // Screen preview: a paired peer asking for a one-shot thumbnail.
+            // Served only when THIS machine's preview_enabled is on; the reply
+            // rides the ack channel as "ok:<base64 jpeg>".
+            if let Some(reply) = handle_preview_request(&payload, &layout, &current_peer.id) {
+                return reply;
             }
 
             if handle_file_transfer_packet(
@@ -4279,6 +4291,7 @@ pub fn run() {
             clear_transfer_history,
             resend_transfer_history_entry,
             read_pending_transfer_queue,
+            capture_remote_preview,
             dismiss_pending_transfer_queue,
             resume_pending_transfer_queue,
             sync_window_chrome,
@@ -5713,6 +5726,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         fullscreen_guard: default_fullscreen_guard(),
         clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
         drag_native_drop: crate::default_drag_native_drop(),
+        preview_enabled: false,
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -5764,6 +5778,7 @@ fn detect_fallback_layout() -> LayoutState {
         fullscreen_guard: default_fullscreen_guard(),
         clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
         drag_native_drop: crate::default_drag_native_drop(),
+        preview_enabled: false,
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -6080,6 +6095,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
             &saved_layout.clipboard_history_shortcut,
         ),
         drag_native_drop: saved_layout.drag_native_drop,
+        preview_enabled: saved_layout.preview_enabled,
         corner_guard: saved_layout.corner_guard,
         corner_guard_size: saved_layout
             .corner_guard_size
@@ -7233,6 +7249,10 @@ pub fn default_clipboard_history_shortcut() -> String {
 
 fn default_drag_native_drop() -> bool {
     true
+}
+
+fn default_preview_enabled() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9741,6 +9761,93 @@ fn handle_pairing_stream_packet(
 /// `begin_pairing_challenge` lets a known controller re-pair (rotated key, or
 /// the two machines swapped roles), and answering "paired" with an empty code
 /// popped the window up with no code to type on the server.
+/// Serve a preview request from a paired peer: same trust checks as file
+/// transfer, gated on this machine's `preview_enabled`. Returns the reply
+/// string ("ok:<base64>") or None when the payload is not a preview request.
+fn handle_preview_request(
+    payload: &[u8],
+    layout: &LayoutState,
+    local_peer_id: &str,
+) -> Option<String> {
+    let packet = decode_wire_packet::<screen_preview::PreviewRequestPacket>(payload)?;
+    if packet.protocol != screen_preview::PREVIEW_PROTOCOL {
+        return None;
+    }
+    if !layout.preview_enabled
+        || layout.cluster_id.trim().is_empty()
+        || packet.cluster_id != layout.cluster_id
+        || packet.target_id != local_peer_id
+        || packet.origin_id == local_peer_id
+    {
+        return Some("reject".into());
+    }
+    let paired = layout
+        .paired_controllers
+        .iter()
+        .any(|controller| controller.id == packet.origin_id)
+        || packet.pair_secret == layout.pair_secret;
+    if !paired {
+        return Some("reject".into());
+    }
+    match screen_preview::capture_jpeg_base64(packet.max_width) {
+        Ok(image) => {
+            log::info!(
+                "screen preview served to {} ({}x{})",
+                packet.origin_id,
+                image.width,
+                image.height
+            );
+            Some(format!("ok:{}", image.base64))
+        }
+        Err(error) => {
+            log::warn!("screen preview capture failed: {error}");
+            Some("reject".into())
+        }
+    }
+}
+
+/// Ask a paired peer for a one-shot screen thumbnail (needs preview_enabled on
+/// BOTH ends: here to show it, there to serve it).
+#[tauri::command]
+fn capture_remote_preview(
+    device_id: String,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<String, String> {
+    let layout = state.layout_snapshot();
+    if !layout.preview_enabled {
+        return Err("请先在两端设置中开启屏幕预览。".into());
+    }
+    state.start_discovery()?;
+    let mut local_peer = local_peer_from_layout(&layout);
+    let quic_transport = state
+        .quic_transport_handle()
+        .ok_or_else(|| "QUIC transport is not ready.".to_string())?;
+    apply_transport_to_peer(&mut local_peer, &quic_transport);
+    let peers = active_peer_snapshot(&state.peers);
+    let target = file_transfer_target_for_device(&layout, &peers, &device_id)?;
+    let request = screen_preview::preview_request_packet(
+        &local_peer.id,
+        &target.device_id,
+        &target.cluster_id,
+        &target.pair_secret,
+    );
+    let payload = encode_wire_packet(&request)?;
+    let peer = quic_transport.peer(
+        target.addr.clone(),
+        target.transport_public_key.clone(),
+        target.protocol_version,
+    );
+    let reply = quic_transport
+        .send_stream_expect_ack_reply(peer, payload)
+        .map_err(|error| format!("屏幕预览请求失败: {error}"))?;
+    let reply = String::from_utf8_lossy(&reply);
+    let encoded = reply
+        .strip_prefix("ok:")
+        .filter(|value| *value != "reject")
+        .ok_or_else(|| "对端拒绝了预览请求（未开启或拒绝配对）。".to_string())?;
+    Ok(encoded.to_string())
+}
+
 fn pairing_status(
     layout: &LayoutState,
     pairing_challenge: &Mutex<Option<PairingChallenge>>,
@@ -10639,6 +10746,7 @@ mod tests {
             fullscreen_guard: false,
             clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
             drag_native_drop: crate::default_drag_native_drop(),
+            preview_enabled: false,
             corner_guard: false,
             corner_guard_size: 0,
             language: "cn".into(),
