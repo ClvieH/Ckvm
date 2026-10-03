@@ -66,6 +66,12 @@ import type {
   PendingQueueSummary,
 } from "./desktopApi";
 import { APP_VERSION, REPOSITORY_URL } from "./constants";
+import {
+  formatFileTransferBytes,
+  formatQueueResumeCopy,
+  formatScreenCount,
+  normalizeEdgeSwitchHotkeyInput,
+} from "./format";
 import { TEXT } from "./i18n";
 import type { AppText } from "./i18n";
 import {
@@ -2639,9 +2645,11 @@ function App() {
       {queueResume ? (
         <div className="queue-resume-banner" role="status">
           <span>
-            {ui.devices.queueResumeCopy
-              .replace("{count}", String(queueResume.remaining))
-              .replace("{device}", queueResume.deviceName)}
+            {formatQueueResumeCopy(
+              ui.devices.queueResumeCopy,
+              queueResume.remaining,
+              queueResume.deviceName,
+            )}
           </span>
           <div className="queue-resume-actions">
             <button
@@ -4231,11 +4239,6 @@ function clampCornerGuardSize(value: number) {
   return Math.round(Math.min(200, Math.max(0, value)));
 }
 
-function normalizeEdgeSwitchHotkeyInput(value: string) {
-  const normalized = value.trim().toLowerCase().replace(/\s+/g, "");
-  return normalized.length === 0 ? "alt+shift+k" : normalized;
-}
-
 function renderHotkeyTags(displayHotkey: string, platform = "") {
   const parts = displayHotkey
     .split("+")
@@ -4619,12 +4622,6 @@ function createScreensFromPeer(
   });
 }
 
-function formatScreenCount(count: number, language: AppLanguage) {
-  return language === "en"
-    ? `${count} ${count === 1 ? "screen" : "screens"}`
-    : `${count} 屏`;
-}
-
 function fileTransferTargetIdAtPosition(
   position?: FileDropPosition | null,
   fallbackTargetId?: string | null,
@@ -4670,21 +4667,6 @@ function formatFileTransferSummary(
   }
 
   return `${summary.fileCount} 个文件${TEXT.cn.devices.fileTransferSent}到 ${summary.targetName} · ${size}`;
-}
-
-function formatFileTransferBytes(bytes: number) {
-  const gib = 1024 * 1024 * 1024;
-  const mib = 1024 * 1024;
-  if (bytes >= gib) {
-    return `${(bytes / gib).toFixed(1)} GiB`;
-  }
-  if (bytes >= mib) {
-    return `${(bytes / mib).toFixed(1)} MiB`;
-  }
-  if (bytes >= 1024) {
-    return `${(bytes / 1024).toFixed(1)} KiB`;
-  }
-  return `${bytes} B`;
 }
 
 function updateStatusLabel(status: UpdateStatus, ui: AppText) {
