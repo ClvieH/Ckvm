@@ -385,6 +385,12 @@ struct LayoutState {
     // disables the popup hotkey entirely.
     #[serde(default = "default_clipboard_history_shortcut")]
     clipboard_history_shortcut: String,
+    // Win→Win edge drags open a native OLE session on the receiver so files
+    // drop into the folder under the cursor. Off = the older stage-and-move
+    // behavior (files land in the Transfers folder). The native path falls
+    // back automatically when the peer refuses drag-control.
+    #[serde(default = "default_drag_native_drop")]
+    drag_native_drop: bool,
     #[serde(default = "default_language")]
     language: String,
     #[serde(default = "default_theme_mode")]
@@ -4168,6 +4174,51 @@ pub fn run() {
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect();
                         let state = handle.state::<AppRuntime>();
+                        // Win controller → Win controlled, native path: open a
+                        // real OLE drag session on the receiver so the files
+                        // drop into the folder under the cursor. The local
+                        // drag already ended at the edge (inject_end_drag), so
+                        // the input hook's forwarded button-up is what fires
+                        // the drop signal. Fall back to the stage-and-move
+                        // transfer when the peer doesn't answer drag-control
+                        // (older build) or refuses the session.
+                        let native_drop = state.layout_snapshot().drag_native_drop;
+                        if native_drop {
+                            match send_ole_drag_start(state.inner(), &device_id, &paths) {
+                                Ok(stream) => {
+                                    controller_drag_started(&device_id);
+                                    log::info!(
+                                        "native drag session opened toward {device_id}; streaming file(s)"
+                                    );
+                                    match stream_ole_drag_files(state.inner(), stream) {
+                                        Ok(count) => log::info!(
+                                            "native drag streamed {count} file(s); waiting for the drop"
+                                        ),
+                                        Err(error) => {
+                                            log::warn!("native drag streaming failed: {error}");
+                                            // Still in flight (the user has not
+                                            // released yet)? Kill the session —
+                                            // a half-streamed drag must never
+                                            // drop partial bytes.
+                                            if controller_drag_device().as_deref() == Some(device_id.as_str()) {
+                                                controller_drag_cleared();
+                                                if let Err(cancel_error) =
+                                                    send_ole_drag_signal(state.inner(), &device_id, "cancel")
+                                                {
+                                                    log::warn!("native drag cancel failed: {cancel_error}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                                Err(error) => {
+                                    log::info!(
+                                        "native drag start refused ({error}); falling back to transfer"
+                                    );
+                                }
+                            }
+                        }
                         match send_files_to_device_inner(
                             state.inner(),
                             &device_id,
@@ -5661,6 +5712,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         lock_on_leave: default_lock_on_leave(),
         fullscreen_guard: default_fullscreen_guard(),
         clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
+        drag_native_drop: crate::default_drag_native_drop(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -5711,6 +5763,7 @@ fn detect_fallback_layout() -> LayoutState {
         lock_on_leave: default_lock_on_leave(),
         fullscreen_guard: default_fullscreen_guard(),
         clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
+        drag_native_drop: crate::default_drag_native_drop(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -6026,6 +6079,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         clipboard_history_shortcut: normalize_clipboard_history_shortcut(
             &saved_layout.clipboard_history_shortcut,
         ),
+        drag_native_drop: saved_layout.drag_native_drop,
         corner_guard: saved_layout.corner_guard,
         corner_guard_size: saved_layout
             .corner_guard_size
@@ -7177,6 +7231,10 @@ pub fn default_clipboard_history_shortcut() -> String {
     "ctrl+shift+v".into()
 }
 
+fn default_drag_native_drop() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClipboardHistoryEntry {
@@ -7761,9 +7819,8 @@ struct DragControlFile {
 }
 
 /// Windows target: what a sent drag start still has to stream (edge drag-drop
-/// path, macOS controller only): each file under the transfer
+/// path, macOS or Windows controller): each file under the transfer
 /// id announced in the start, so the peer feeds it to its drag session.
-#[cfg(target_os = "macos")]
 struct OleDragStream {
     quic_transport: quic_transport::TransportHandle,
     origin_id: String,
@@ -7773,7 +7830,6 @@ struct OleDragStream {
 
 /// Announce a native drag to `device_id` (acknowledged before returning), so
 /// that a drop or cancel sent afterwards can never overtake it.
-#[cfg(target_os = "macos")]
 fn send_ole_drag_start(
     state: &AppRuntime,
     device_id: &str,
@@ -7836,7 +7892,6 @@ fn send_ole_drag_start(
     })
 }
 
-#[cfg(target_os = "macos")]
 fn stream_ole_drag_files(state: &AppRuntime, stream: OleDragStream) -> Result<usize, String> {
     let OleDragStream {
         quic_transport,
@@ -7860,6 +7915,7 @@ fn stream_ole_drag_files(state: &AppRuntime, stream: OleDragStream) -> Result<us
             transfer_id,
             DropMode::TransfersFolder,
             Some(&reporter),
+            None,
         )?;
         state
             .transport_packets
@@ -7869,7 +7925,6 @@ fn stream_ole_drag_files(state: &AppRuntime, stream: OleDragStream) -> Result<us
 }
 
 /// Windows target: signal drop or cancel for an in-flight OLE drag session.
-#[cfg(target_os = "macos")]
 fn send_ole_drag_signal(state: &AppRuntime, device_id: &str, kind: &str) -> Result<(), String> {
     let layout = state.layout_snapshot();
     let mut local_peer = local_peer_from_layout(&layout);
@@ -7914,6 +7969,34 @@ pub(crate) fn send_drag_pull(
     cluster_id: String,
     pair_secret: String,
 ) {
+    send_drag_signal(
+        quic_transport,
+        origin_id,
+        target_device_id,
+        target_addr,
+        target_pubkey,
+        target_version,
+        cluster_id,
+        pair_secret,
+        "pull",
+    );
+}
+
+/// Fire-and-forget drag-control message ("pull" / "drop" / "cancel") from the
+/// controller. Spawned on a thread so input hot paths never block on the
+/// round-trip.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) fn send_drag_signal(
+    quic_transport: &quic_transport::TransportHandle,
+    origin_id: String,
+    target_device_id: String,
+    target_addr: String,
+    target_pubkey: String,
+    target_version: u16,
+    cluster_id: String,
+    pair_secret: String,
+    kind: &str,
+) {
     if target_pubkey.trim().is_empty()
         || target_addr.trim().is_empty()
         || cluster_id.trim().is_empty()
@@ -7922,11 +8005,13 @@ pub(crate) fn send_drag_pull(
         return;
     }
     let quic_transport = quic_transport.clone();
+    let kind = kind.to_string();
     thread::spawn(move || {
         let label = target_device_id.clone();
+        let kind_label = kind.clone();
         let packet = DragControlPacket {
             protocol: DRAG_CONTROL_PROTOCOL.into(),
-            kind: "pull".into(),
+            kind,
             origin_id,
             target_id: target_device_id,
             cluster_id,
@@ -7938,10 +8023,35 @@ pub(crate) fn send_drag_pull(
         };
         let peer = quic_transport.peer(target_addr, target_pubkey, target_version);
         match quic_transport.send_stream_expect_ack(peer, payload) {
-            Ok(_) => log::info!("drag pull sent to {label}"),
-            Err(error) => log::warn!("drag pull send failed: {error}"),
+            Ok(_) => log::info!("drag {kind_label} sent to {label}"),
+            Err(error) => log::warn!("drag {kind_label} send failed: {error}"),
         }
     });
+}
+
+// Controller-originated native drag (Win controller → Win controlled): the
+// in-flight slot ties the drop-catcher hand-off to the button-up the input
+// hook forwards later, so the release can drop the receiver's OLE session in
+// the folder under the cursor.
+static CONTROLLER_DRAG_DEVICE: Mutex<Option<String>> = Mutex::new(None);
+
+pub(crate) fn controller_drag_started(device_id: &str) {
+    if let Ok(mut slot) = CONTROLLER_DRAG_DEVICE.lock() {
+        *slot = Some(device_id.to_string());
+    }
+}
+
+pub(crate) fn controller_drag_device() -> Option<String> {
+    CONTROLLER_DRAG_DEVICE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+pub(crate) fn controller_drag_cleared() {
+    if let Ok(mut slot) = CONTROLLER_DRAG_DEVICE.lock() {
+        *slot = None;
+    }
 }
 
 /// Client side: apply an incoming drag-control message. Returns true if the
@@ -10510,6 +10620,7 @@ mod tests {
             lock_on_leave: false,
             fullscreen_guard: false,
             clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
+            drag_native_drop: crate::default_drag_native_drop(),
             corner_guard: false,
             corner_guard_size: 0,
             language: "cn".into(),

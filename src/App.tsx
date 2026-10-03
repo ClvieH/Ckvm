@@ -1555,6 +1555,13 @@ function App() {
     }));
   }
 
+  function setDragNativeDrop(dragNativeDrop: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      dragNativeDrop,
+    }));
+  }
+
   function setCornerGuard(cornerGuard: boolean) {
     updateLayout((layoutState) => ({
       ...layoutState,
@@ -3384,6 +3391,33 @@ function App() {
                       type="button"
                       className={!layout.fullscreenGuard ? "active" : ""}
                       onClick={() => setFullscreenGuard(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-control-row">
+                  <span>
+                    {ui.settings.dragNativeDrop}
+                    <span className="info-tooltip-host" tabIndex={0}>
+                      ⓘ
+                      <span className="info-tooltip">
+                        {ui.settings.dragNativeDropCopy}
+                      </span>
+                    </span>
+                  </span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.dragNativeDrop ? "active" : ""}
+                      onClick={() => setDragNativeDrop(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.dragNativeDrop ? "active" : ""}
+                      onClick={() => setDragNativeDrop(false)}
                     >
                       {ui.common.disabled}
                     </button>

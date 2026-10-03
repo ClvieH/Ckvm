@@ -91,6 +91,9 @@ export interface LayoutState {
   fullscreenGuard: boolean
   // Global hotkey opening the clipboard-history popup ("" disables it).
   clipboardHistoryShortcut: string
+  // Win→Win edge drags open a native OLE session on the receiver so files
+  // drop into the folder under the cursor (off = Transfers folder).
+  dragNativeDrop: boolean
   // Corner guard: refuse edge crossings starting inside a dead zone around the
   // local screen's four corners (window close buttons, Start menu...).
   cornerGuard: boolean

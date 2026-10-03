@@ -27,6 +27,7 @@ export const defaultLayout: LayoutState = {
   lockOnLeave: false,
   fullscreenGuard: true,
   clipboardHistoryShortcut: 'ctrl+shift+v',
+  dragNativeDrop: true,
   cornerGuard: true,
   cornerGuardSize: 32,
   language: 'cn',

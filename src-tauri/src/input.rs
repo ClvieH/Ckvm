@@ -4173,6 +4173,25 @@ fn handle_windows_mouse_move(context: &WindowsCaptureContext, x: f64, y: f64) ->
             if crate::windows_drop_catcher::hold_consumed() && windows_left_button_down() {
                 crate::windows_drop_catcher::inject_left_up();
             }
+            // Crossed back while OUR OWN native drag was in flight toward the
+            // machine we just left: cancel its OLE session — the user brought
+            // the drag back home, so no drop may happen over there.
+            if let Some(device_id) = crate::controller_drag_device() {
+                if device_id == target.device_id {
+                    crate::controller_drag_cleared();
+                    crate::send_drag_signal(
+                        &context.quic_transport,
+                        target.origin_device_id.clone(),
+                        target.device_id.clone(),
+                        target.target_addr.clone(),
+                        target.transport_public_key.clone(),
+                        target.protocol_version,
+                        target.cluster_id.clone(),
+                        target.pair_secret.clone(),
+                        "cancel",
+                    );
+                }
+            }
             // Crossed back while the left button was held: ask the controlled
             // machine to hand any file drag it has to us as a native OLE drag,
             // and clear LEFT so release_remote_buttons below won't send a
@@ -4469,7 +4488,30 @@ fn handle_windows_mouse_button(context: &WindowsCaptureContext, message: u32, mo
     };
     let (button, down) = match message {
         WM_LBUTTONDOWN => (MouseButton::Left, true),
-        WM_LBUTTONUP => (MouseButton::Left, false),
+        WM_LBUTTONUP => {
+            // Win→Win native drag: the local drag was ended at the edge
+            // (inject_end_drag), so the user's release over the remote screen
+            // IS this button-up. Drop the receiver's OLE session now so the
+            // files land in the folder under the cursor — before the
+            // button-up itself is forwarded.
+            if let Some(device_id) = crate::controller_drag_device() {
+                if device_id == active_target.target.device_id {
+                    crate::controller_drag_cleared();
+                    crate::send_drag_signal(
+                        &context.quic_transport,
+                        active_target.target.origin_device_id.clone(),
+                        active_target.target.device_id.clone(),
+                        active_target.target.target_addr.clone(),
+                        active_target.target.transport_public_key.clone(),
+                        active_target.target.protocol_version,
+                        active_target.target.cluster_id.clone(),
+                        active_target.target.pair_secret.clone(),
+                        "drop",
+                    );
+                }
+            }
+            (MouseButton::Left, false)
+        }
         WM_RBUTTONDOWN => (MouseButton::Right, true),
         WM_RBUTTONUP => (MouseButton::Right, false),
         WM_MBUTTONDOWN => (MouseButton::Middle, true),
@@ -8955,6 +8997,7 @@ mod tests {
             lock_on_leave: false,
             fullscreen_guard: false,
             clipboard_history_shortcut: crate::default_clipboard_history_shortcut(),
+            drag_native_drop: crate::default_drag_native_drop(),
             corner_guard: false,
             corner_guard_size: 0,
             language: "cn".into(),

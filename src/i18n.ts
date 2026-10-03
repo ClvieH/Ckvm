@@ -151,6 +151,9 @@ export const TEXT = {
       historyHotkey: "历史呼出快捷键",
       historyHotkeyRecording: "按下组合键…",
       historyHotkeyDisabled: "已停用",
+      dragNativeDrop: "拖拽落点跟随光标",
+      dragNativeDropCopy:
+        "Windows 间贴边拖拽文件时，在对端以真实拖拽会话跟随光标，释放在哪个文件夹就落到哪里；关闭后退回到传输目录。",
       cornerGuard: "角落防误切",
       cornerGuardCopy:
         "鼠标移到屏幕四角时不切换到相邻屏幕，避免点关闭按钮等角部操作误穿越；沿边缘移出角落即可正常切换。",
@@ -436,6 +439,9 @@ export const TEXT = {
       historyHotkey: "History popup hotkey",
       historyHotkeyRecording: "Press a shortcut…",
       historyHotkeyDisabled: "Disabled",
+      dragNativeDrop: "Drop files under the cursor",
+      dragNativeDropCopy:
+        "Edge drags between Windows machines open a real drag session on the receiver that follows the cursor — release over any folder to drop there. Off = land in the Transfers folder.",
       cornerGuard: "Corner Guard",
       cornerGuardCopy:
         "Keeps the cursor from crossing at the screen's four corners, so clicking a window's close button never throws it onto another machine; slide along the edge out of the corner to cross normally.",

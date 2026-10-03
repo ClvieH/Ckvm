@@ -33,6 +33,7 @@ function makeLayout(devices: Device[]): LayoutState {
     inputMode: 'control',
     machineRole: 'server',
     clipboardHistoryShortcut: 'ctrl+shift+v',
+    dragNativeDrop: true,
     clusterId: 'cluster-test',
     pairSecret: 'secret-test',
     pairedControllers: [],
